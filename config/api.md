@@ -54,8 +54,8 @@ An error reply is a JSON object whose `error` says what went wrong.
 | POST | [`/api/collections/{collection}/docs/{doc_id}`](#post-apicollectionscollectiondocsdoc_id) | Create or replace a document | browser session or API key, anyone signed in |
 | POST | [`/api/collections/{collection}/docs/{doc_id}/delete`](#post-apicollectionscollectiondocsdoc_iddelete) | Delete a document | browser session or API key, anyone signed in |
 | POST | [`/api/collections/{collection}/docs/{doc_id}/move`](#post-apicollectionscollectiondocsdoc_idmove) | Move a document to another collection | browser session or API key, anyone signed in |
-| GET | [`/api/keyring`](#get-apikeyring) | Your wrapped master key | browser session or API key, anyone signed in |
-| POST | [`/api/keyring`](#post-apikeyring) | Set or change your passphrase | browser session or API key, anyone signed in |
+| GET | [`/api/keyring`](#get-apikeyring) | Your wrapped master key | browser session only, anyone signed in |
+| POST | [`/api/keyring`](#post-apikeyring) | Set or change your passphrase | browser session only, anyone signed in |
 
 ### GET /api/changes
 
@@ -233,7 +233,7 @@ Live documents by id. Deleted ones are left out; GET /api/changes reports them.
 | `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
 | `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
 | `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
-| `include_body` | query | string | no | one of `true` | Add each document's ciphertext. |
+| `include_body` | query | string | no | one of `true` | Add each document's ciphertext. A page with bodies stops early at 8 MiB of them; follow next. |
 
 **Reply 200**: Success
 
@@ -372,8 +372,8 @@ The master key sealed under a key derived from your passphrase (Argon2id), store
 
 |  |  |
 |---|---|
-| Who may call | browser session or API key, anyone signed in |
-| Errors | 401, 404, 429, 503 |
+| Who may call | browser session only, anyone signed in |
+| Errors | 401, 403, 404, 429, 503 |
 
 **Reply 200**: Success
 
@@ -391,7 +391,7 @@ Stores a new wrapped master key. Documents are not re-encrypted: they stay under
 
 |  |  |
 |---|---|
-| Who may call | browser session or API key, anyone signed in |
+| Who may call | browser session only, anyone signed in |
 | Errors | 400, 401, 403, 409, 429, 503 |
 
 **Request body**

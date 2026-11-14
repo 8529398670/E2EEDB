@@ -54,6 +54,11 @@ type APIKey struct {
 	// document routes and nothing else (security.RestrictScopedKeys), and is
 	// always role user. nil is the whole account, as keys have always been.
 	Scope *KeyScope `json:"scope,omitempty"`
+	// MintedByKey is the API key whose way in made this one: a session that
+	// signed in through that key's login link, or the key itself. Revoking,
+	// deleting or expiring that key, or one above it, stops this one too
+	// (KeyLineageLive), so a leaked key cannot leave a successor behind.
+	MintedByKey string `json:"minted_by_key,omitempty"`
 	// Set by DeleteAPIKey. A deleted key is dead and out of every listing,
 	// but RestoreAPIKey can bring it back for RestoreWindow.
 	SoftDelete
@@ -182,20 +187,47 @@ func NarrowRole( account_role string , key_role string ) ( result string ) {
 // than an oversight: a CI job nobody will remember to re-key is worse served
 // by a credential that dies silently at 3am. It has to be asked for
 // explicitly; the default comes from configuration.
-func IssueAPIKey( store *db.Store , user_id uint64 , name string , role string , ttl time.Duration ) ( credential string , key *APIKey , err error ) {
-	credential , key , err = issueAPIKey( store , user_id , name , role , ttl , 0 , nil )
+func IssueAPIKey( store *db.Store , user_id uint64 , name string , role string , ttl time.Duration , options ...IssueOption ) ( credential string , key *APIKey , err error ) {
+	credential , key , err = issueAPIKey( store , user_id , name , role , ttl , 0 , nil , options )
 	return
+}
+
+// IssueOption adds to what a new key records.
+type IssueOption func( key *APIKey )
+
+// MintedBy records the API key the request asking came through, directly or
+// by a session it signed in (security.Actor.Lineage). "" is none.
+func MintedBy( key_id string ) IssueOption {
+	return func( key *APIKey ) { key.MintedByKey = key_id }
+}
+
+// keyLineageMax bounds the walk up MintedByKey: a key made by a session made
+// by a key, and so on. Deeper than this is refused rather than followed.
+const keyLineageMax = 16
+
+// KeyLineageLive is whether key_id, and every key it was made through, is
+// still live. "" (made by no key) is live. A key purged from the database
+// counts as dead, so a session or key made through it stops working once
+// its row is gone too.
+func KeyLineageLive( get func( bucket string , key []byte , out any ) error , key_id string ) ( live bool ) {
+	for hops := 0 ; key_id != "" ; hops++ {
+		if hops >= keyLineageMax { return false }
+		found := &APIKey{}
+		if get( db.BucketAPIKeys , []byte( key_id ) , found ) != nil || found.Live() == false { return false }
+		key_id = found.MintedByKey
+	}
+	return true
 }
 
 // IssueScopedAPIKey mints a key limited to scope (see APIKey.Scope). It is
 // always role user. Whether the collection exists is the caller's to check:
 // the documents live in another database.
-func IssueScopedAPIKey( store *db.Store , user_id uint64 , name string , scope KeyScope , ttl time.Duration ) ( credential string , key *APIKey , err error ) {
+func IssueScopedAPIKey( store *db.Store , user_id uint64 , name string , scope KeyScope , ttl time.Duration , options ...IssueOption ) ( credential string , key *APIKey , err error ) {
 	if scope.Born == 0 {
 		err = ErrScopeBorn
 		return
 	}
-	credential , key , err = issueAPIKey( store , user_id , name , RoleUser , ttl , 0 , &scope )
+	credential , key , err = issueAPIKey( store , user_id , name , RoleUser , ttl , 0 , &scope , options )
 	return
 }
 
@@ -209,18 +241,18 @@ func IssueScopedAPIKey( store *db.Store , user_id uint64 , name string , scope K
 //
 // Your own account is simply your own key. The rules are checked inside the
 // issuing transaction, so ownership cannot move between the check and the key.
-func IssueAPIKeyFor( store *db.Store , actor_id uint64 , user_id uint64 , name string , role string , ttl time.Duration ) ( credential string , key *APIKey , err error ) {
+func IssueAPIKeyFor( store *db.Store , actor_id uint64 , user_id uint64 , name string , role string , ttl time.Duration , options ...IssueOption ) ( credential string , key *APIKey , err error ) {
 	if actor_id == user_id {
-		credential , key , err = IssueAPIKey( store , user_id , name , role , ttl )
+		credential , key , err = IssueAPIKey( store , user_id , name , role , ttl , options... )
 		return
 	}
-	credential , key , err = issueAPIKey( store , user_id , name , role , ttl , actor_id , nil )
+	credential , key , err = issueAPIKey( store , user_id , name , role , ttl , actor_id , nil , options )
 	return
 }
 
 // issueAPIKey is both of the above. A created_by of zero means the key is its
 // owner's own, or came from a shell, and no ladder applies.
-func issueAPIKey( store *db.Store , user_id uint64 , name string , role string , ttl time.Duration , created_by uint64 , scope *KeyScope ) ( credential string , key *APIKey , err error ) {
+func issueAPIKey( store *db.Store , user_id uint64 , name string , role string , ttl time.Duration , created_by uint64 , scope *KeyScope , options []IssueOption ) ( credential string , key *APIKey , err error ) {
 	// The owner is loaded inside the transaction below rather than taking the
 	// caller's word for the role. Every route into this function -- the HTTP
 	// API, the control socket, the CLI -- then gets the same ceiling without
@@ -242,6 +274,9 @@ func issueAPIKey( store *db.Store , user_id uint64 , name string , role string ,
 		CreatedBy:  created_by,
 		Scope:      scope,
 	}
+	for _ , option := range options {
+		option( key )
+	}
 	if ttl > 0 {
 		expires := now.Add( ttl )
 		key.ExpiresAt = &expires
@@ -255,6 +290,12 @@ func issueAPIKey( store *db.Store , user_id uint64 , name string , role string ,
 		owner := &User{}
 		if tx_err = tx.Get( db.BucketUsers , encryption.Uint64ToBytes( user_id ) , owner ); tx_err != nil { return }
 		if tx_err = mayActOnTx( tx , created_by , owner ); tx_err != nil { return }
+		// Checked here, in the same transaction as the insert, so a key
+		// revoked meanwhile cannot still leave a successor.
+		if KeyLineageLive( tx.Get , key.MintedByKey ) == false {
+			tx_err = ErrAPIKeyDead
+			return
+		}
 		if owner.Disabled() {
 			tx_err = ErrAPIKeyDisabled
 			return
@@ -328,6 +369,7 @@ func LoadAPIKey( store *db.Store , credential string ) ( key *APIKey , user *Use
 
 	if encryption.ConstantTimeEqual( found.SecretHash , encryption.Sha256Hex( secret ) ) == false { return }
 	if found.Live() == false { return }
+	if KeyLineageLive( store.Get , found.MintedByKey ) == false { return }
 
 	loaded_user , err := GetUser( store , found.UserID )
 	if err != nil || loaded_user.Disabled() { return }

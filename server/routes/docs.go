@@ -527,13 +527,19 @@ func ( handlers *Handlers ) deleteCollection( c fiber.Ctx , in *deleteCollection
 type listDocsRequest struct {
 	collectionPath
 	Page
-	IncludeBody string `json:"include_body,omitempty" query:"include_body" jsonschema:"enum=true" jsonschema_description:"Add each document's ciphertext." error:"include_body must be true"`
+	IncludeBody string `json:"include_body,omitempty" query:"include_body" jsonschema:"enum=true" jsonschema_description:"Add each document's ciphertext. A page with bodies stops early at 8 MiB of them; follow next." error:"include_body must be true"`
 }
 
 type listDocsReply struct {
 	Docs []docListRow `json:"docs"`
 	Paged
 }
+
+// listBodyBytes caps the ciphertext one page of documents with bodies
+// carries. Without it, limit=1000 of the largest documents is gigabytes in
+// memory for one request, which even a read-only access key could ask for.
+// A page that reaches it ends early, and next says where to carry on.
+const listBodyBytes = 8 << 20
 
 // listDocs is one page of a collection's documents, by id. ?include_body=true
 // adds each one's ciphertext, so a client can fetch a collection in pages
@@ -550,7 +556,7 @@ func ( handlers *Handlers ) listDocs( c fiber.Ctx , in *listDocsRequest ) ( repl
 		return
 	}
 	with_bodies := in.IncludeBody == "true"
-	docs , total , err := handlers.Docs.List( docOwner( c ) , in.Collection , in.Offset , pageLimit( in.Page ) , with_bodies )
+	docs , total , err := handlers.Docs.List( docOwner( c ) , in.Collection , in.Offset , pageLimit( in.Page ) , with_bodies , listBodyBytes )
 	if err != nil { return }
 	rows := make( []docListRow , 0 , len( docs ) )
 	for _ , doc := range docs {
@@ -619,7 +625,9 @@ func ( handlers *Handlers ) setDoc( c fiber.Ctx , in *setDocRequest ) ( reply *d
 		err = refused
 		return
 	}
-	doc , set_err := handlers.Docs.Set( docOwner( c ) , in.Collection , in.DocID , body , in.IfVersion , handlers.docLimits() )
+	limits := handlers.docLimits()
+	limits.NoAutoCreate = docScope( c ) != nil
+	doc , set_err := handlers.Docs.Set( docOwner( c ) , in.Collection , in.DocID , body , in.IfVersion , limits )
 	if set_err != nil {
 		err = handlers.docRefusal( set_err )
 		return
@@ -768,9 +776,12 @@ type keyringReply struct {
 }
 
 // getKeyring is the caller's wrapped master key, for unlocking with a
-// passphrase. It is useless without the passphrase; see README.md.
+// passphrase. It is useless without the passphrase; see README.md. Only a
+// browser session reaches it: an API key that was never given the master key
+// must not be able to take the keyring away and guess the passphrase offline,
+// and services hold the raw key instead.
 //
-// @route("GET /api/keyring", summary="Your wrapped master key", tag="Documents", errors=(404,),
+// @route("GET /api/keyring", summary="Your wrapped master key", tag="Documents", errors=(404,), access=SESSION_ONLY,
 //     description="The master key sealed under a key derived from your passphrase (Argon2id), stored as the "
 //         "client wrote it. Useless without the passphrase. 404 when no passphrase has been set.",
 // )
@@ -796,8 +807,10 @@ type setKeyringReply struct {
 }
 
 // setKeyring stores a new wrapped master key: a passphrase set or changed.
+// Browser sessions only, like getKeyring, so an API key cannot replace it
+// and lock the owner's passphrase out.
 //
-// @route("POST /api/keyring", summary="Set or change your passphrase", tag="Documents", errors=(409,),
+// @route("POST /api/keyring", summary="Set or change your passphrase", tag="Documents", errors=(409,), access=SESSION_ONLY,
 //     description="Stores a new wrapped master key. Documents are not re-encrypted: they stay under the same "
 //         "master key.",
 // )

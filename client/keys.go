@@ -11,6 +11,7 @@ import (
 	errors "errors"
 	fmt "fmt"
 	http "net/http"
+	url "net/url"
 	strconv "strconv"
 )
 
@@ -212,19 +213,23 @@ func ( client *Client ) sealForSharing( ctx context.Context , key *CollectionKey
 			} `json:"docs"`
 			Next *int `json:"next"`
 		}
-		path := "/api/collections/" + key.collection + "/docs?include_body=true&" + pageQuery( offset , 200 )
+		path := "/api/collections/" + url.PathEscape( key.collection ) + "/docs?include_body=true&" + pageQuery( offset , 200 )
 		if err = client.call( ctx , http.MethodGet , path , nil , &reply ); err != nil { return }
 		for _ , row := range reply.Docs {
 			envelope , decode_err := b64.DecodeString( row.Body )
 			if decode_err != nil { return ErrCorrupt }
 			if EnvelopeKind( envelope ) != EnvelopeMaster { continue }
 			if client.key == nil { return errNoMaster }
-			plaintext , open_err := client.key.Open( row.Collection , row.ID , envelope )
+			// Only ever this collection's documents: a server listing one
+			// from elsewhere would otherwise get it sealed again under the
+			// keys being shared.
+			if row.Collection != key.collection { return ErrCorrupt }
+			plaintext , open_err := client.key.Open( key.collection , row.ID , envelope )
 			if open_err != nil { return open_err }
 			sealed , seal_err := key.Seal( row.ID , plaintext )
 			if seal_err != nil { return seal_err }
 			request := map[string]any{ "body": b64.EncodeToString( sealed ) , "if_version": row.Version }
-			if err = client.call( ctx , http.MethodPost , docPath( row.Collection , row.ID ) , request , nil ); err != nil {
+			if err = client.call( ctx , http.MethodPost , docPath( key.collection , row.ID ) , request , nil ); err != nil {
 				if errors.Is( err , ErrConflict ) {
 					// Written meanwhile, as a collection envelope.
 					err = nil

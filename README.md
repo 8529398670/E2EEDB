@@ -88,8 +88,11 @@ loses the documents. Nobody can recover them, the server included.
 
 A **passphrase** is optional. Setting one stores the master key, sealed under
 an Argon2id hash of the passphrase, as the account's keyring on the server.
-The browser (or `client.NewFromPassphrase`) fetches the keyring and opens it.
-Changing the passphrase replaces the keyring and never re-encrypts documents.
+The browser fetches the keyring and opens it. Changing the passphrase replaces
+the keyring and never re-encrypts documents. Only a signed-in browser reaches
+the keyring (`/api/keyring`). An API key gets 403, even the account's own full
+key, so a script that was never given the master key cannot take the keyring
+away to guess the passphrase, or replace it. Services hold the raw key.
 
 ### Collection keys and access keys
 
@@ -163,7 +166,6 @@ _ , err = store.MoveCollection( ctx , "invoices" , folder.ID , "" ) // nest invo
 _ , err = store.Delete( ctx , "invoices" , meta.ID )
 
 changes , err := store.Changes( ctx , since , 500 )  // sync: keep changes.NextSince
-err = store.SetPassphrase( ctx , "a long passphrase" )
 ```
 
 Errors: `ErrNotFound`, `*ConflictError` (`ErrConflict`, with the current

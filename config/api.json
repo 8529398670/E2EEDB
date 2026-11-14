@@ -5284,7 +5284,7 @@
             }
           },
           {
-            "description": "Add each document's ciphertext.",
+            "description": "Add each document's ciphertext. A page with bodies stops early at 8 MiB of them; follow next.",
             "in": "query",
             "name": "include_body",
             "schema": {
@@ -5873,6 +5873,9 @@
           "401": {
             "$ref": "#/components/responses/E401"
           },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
           "404": {
             "$ref": "#/components/responses/E404"
           },
@@ -5886,9 +5889,6 @@
         "security": [
           {
             "sessionCookie": []
-          },
-          {
-            "apiKey": []
           }
         ],
         "summary": "Your wrapped master key",
@@ -5979,9 +5979,6 @@
         "security": [
           {
             "sessionCookie": []
-          },
-          {
-            "apiKey": []
           }
         ],
         "summary": "Set or change your passphrase",

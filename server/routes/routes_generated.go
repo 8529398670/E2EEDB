@@ -335,14 +335,16 @@ func ( handlers *Handlers ) mountDeclared( app *fiber.App ) {
 		Summary: "Your wrapped master key",
 		Description: "The master key sealed under a key derived from your passphrase (Argon2id), stored as the client wrote it. Useless without the passphrase. 404 when no passphrase has been set.",
 		Tag: "Documents",
-		Errors: []int{ 401 , 404 },
-	} , handlers.getKeyring , handlers.Guard.RequireLogin )
+		Access: apidoc.SessionOnly,
+		Errors: []int{ 401 , 403 , 404 },
+	} , handlers.getKeyring , handlers.Guard.RequireLogin , handlers.Guard.RequireSession )
 	apidoc.Mount( app , "POST" , "/api/keyring" , apidoc.Op{
 		Summary: "Set or change your passphrase",
 		Description: "Stores a new wrapped master key. Documents are not re-encrypted: they stay under the same master key.",
 		Tag: "Documents",
+		Access: apidoc.SessionOnly,
 		Errors: []int{ 400 , 401 , 403 , 409 },
-	} , handlers.setKeyring , handlers.Guard.RequireLogin )
+	} , handlers.setKeyring , handlers.Guard.RequireLogin , handlers.Guard.RequireSession )
 	apidoc.Mount( app , "GET" , "/api/keys" , apidoc.Op{
 		Summary: "Your API keys",
 		Tag: "API keys",

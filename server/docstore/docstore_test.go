@@ -84,11 +84,11 @@ func TestListCollectionsAndChanges( t *testing.T ) {
 	store.Set( 1 , "tasks" , "x" , envelope( 1 , 100 ) , nil , limits )
 	store.Delete( 1 , "notes" , "b" , nil )
 
-	docs , total , err := store.List( 1 , "notes" , 0 , 1 , false )
+	docs , total , err := store.List( 1 , "notes" , 0 , 1 , false , 0 )
 	if err != nil || total != 2 || len( docs ) != 1 || docs[ 0 ].ID != "a" || docs[ 0 ].Body != nil {
 		t.Fatalf( "list page 1: %+v total %d %v" , docs , total , err )
 	}
-	docs , _ , _ = store.List( 1 , "notes" , 1 , 1 , true )
+	docs , _ , _ = store.List( 1 , "notes" , 1 , 1 , true , 0 )
 	if len( docs ) != 1 || docs[ 0 ].ID != "c" || len( docs[ 0 ].Body ) != 60 { t.Fatalf( "list page 2 with bodies: %+v" , docs ) }
 
 	collections , total , _ := store.Collections( 1 , 0 , 10 )
@@ -181,4 +181,18 @@ func TestValidation( t *testing.T ) {
 	if ValidEnvelope( []byte( `{"plain":"json","that":"is long enough to pass a length check alone"}` ) ) {
 		t.Error( "plaintext JSON must not pass as an envelope" )
 	}
+}
+
+// A page with bodies ends early at max_bytes, but always holds one document.
+func TestListByteBudget( t *testing.T ) {
+	store , _ := open( t )
+	for _ , id := range []string{ "a" , "b" , "c" } {
+		if _ , err := store.Set( 1 , "notes" , id , envelope( 1 , 600 ) , nil , limits ); err != nil { t.Fatal( err ) }
+	}
+	docs , total , err := store.List( 1 , "notes" , 0 , 100 , true , 1000 )
+	if err != nil || total != 3 || len( docs ) != 1 { t.Fatalf( "budgeted page: %d of %d, %v" , len( docs ) , total , err ) }
+	docs , _ , _ = store.List( 1 , "notes" , 0 , 100 , true , 100 )
+	if len( docs ) != 1 { t.Fatalf( "a page smaller than one document still holds it: %d" , len( docs ) ) }
+	docs , _ , _ = store.List( 1 , "notes" , 0 , 100 , false , 1000 )
+	if len( docs ) != 3 { t.Fatalf( "metadata only is not budgeted: %d" , len( docs ) ) }
 }

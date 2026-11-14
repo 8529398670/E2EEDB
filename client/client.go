@@ -8,8 +8,8 @@
 //	_ , err = store.Get( ctx , "invoices" , meta.ID , &invoice )
 //
 // Every account has one master key. Services hold it directly; a person can
-// also unlock it with a passphrase (SetPassphrase, NewFromPassphrase), which
-// is what the browser viewer does. Each collection also has its own keys,
+// also unlock it with a passphrase in the browser, whose keyring only a
+// signed-in browser reaches (WrapKey and UnwrapKey are its format). Each collection also has its own keys,
 // wrapped in a lockbox the server stores: the master key opens every one,
 // and an access token (NewScoped) opens one collection and the collections
 // under it, read-only or read and write. The server sees collection names,
@@ -152,22 +152,6 @@ func New( baseURL string , apiKey string , masterKey string , options ...Option 
 	return
 }
 
-// NewFromPassphrase makes a client whose master key comes from the account's
-// keyring on the server, opened with passphrase. A wrong passphrase is
-// ErrWrongKey; no keyring yet is ErrNotFound.
-func NewFromPassphrase( ctx context.Context , baseURL string , apiKey string , passphrase string , options ...Option ) ( client *Client , err error ) {
-	client = newClient( baseURL , apiKey , nil , options )
-	ring , err := client.keyring( ctx )
-	if err != nil {
-		client = nil
-		return
-	}
-	if client.key , err = UnwrapKey( ring.Keyring , passphrase ); err != nil {
-		client = nil
-	}
-	return
-}
-
 // NewScoped makes a client from an access token (NewAccessToken; the
 // browser's Share dialog makes them): it reaches one collection and the
 // collections under it, and writes only if the token carries the write key.
@@ -278,14 +262,18 @@ func ( client *Client ) Get( ctx context.Context , collection string , id string
 	}
 	if err = client.call( ctx , http.MethodGet , docPath( collection , id ) , nil , &reply ); err != nil { return }
 	meta = reply.Meta
-	err = client.open( ctx , meta , reply.Body , out )
+	err = client.open( ctx , collection , id , meta , reply.Body , out )
 	return
 }
 
-func ( client *Client ) open( ctx context.Context , meta Meta , body string , out any ) ( err error ) {
+// open decrypts body as collection/id: where it was asked for, never where
+// the server's reply says it is, so a server cannot answer with a document
+// from somewhere else. A reply naming another place is ErrCorrupt.
+func ( client *Client ) open( ctx context.Context , collection string , id string , meta Meta , body string , out any ) ( err error ) {
+	if meta.Collection != collection || meta.ID != id { return ErrCorrupt }
 	envelope , err := b64.DecodeString( body )
 	if err != nil { return ErrCorrupt }
-	plaintext , err := client.openEnvelope( ctx , meta.Collection , meta.ID , envelope )
+	plaintext , err := client.openEnvelope( ctx , collection , id , envelope )
 	if err != nil { return }
 	err = json.Unmarshal( plaintext , out )
 	return
@@ -355,7 +343,7 @@ func ( client *Client ) Each( ctx context.Context , collection string , fn func(
 		if err = client.call( ctx , http.MethodGet , path , nil , &reply ); err != nil { return }
 		for _ , row := range reply.Docs {
 			var data json.RawMessage
-			if err = client.open( ctx , row.Meta , row.Body , &data ); err != nil { return }
+			if err = client.open( ctx , collection , row.ID , row.Meta , row.Body , &data ); err != nil { return }
 			if err = fn( row.Meta , data ); err != nil { return }
 		}
 		offset = -1
@@ -484,39 +472,6 @@ func ( client *Client ) Changes( ctx context.Context , since int64 , limit int )
 	return
 }
 
-type keyringReply struct {
-	Keyring string `json:"keyring"`
-	Version int64  `json:"version"`
-}
-
-func ( client *Client ) keyring( ctx context.Context ) ( ring keyringReply , err error ) {
-	err = client.call( ctx , http.MethodGet , "/api/keyring" , nil , &ring )
-	return
-}
-
-// SetPassphrase lets the account's master key be unlocked with passphrase
-// (in the browser viewer, or with NewFromPassphrase), replacing any earlier
-// passphrase. Documents are not re-encrypted. Choose a long passphrase: the
-// server holds the wrapped key, so a weak passphrase is only as strong as
-// Argon2id makes guessing it.
-func ( client *Client ) SetPassphrase( ctx context.Context , passphrase string ) ( err error ) {
-	if client.key == nil { return errNoMaster }
-	text , err := client.key.WrapKey( passphrase )
-	if err != nil { return }
-	var current int64
-	ring , err := client.keyring( ctx )
-	switch {
-	case err == nil:
-		current = ring.Version
-	case errors.Is( err , ErrNotFound ):
-		err = nil
-	default:
-		return
-	}
-	err = client.call( ctx , http.MethodPost , "/api/keyring" , map[string]any{ "keyring": text , "if_version": current } , nil )
-	return
-}
-
 func pageQuery( offset int , limit int ) string {
 	return "offset=" + strconv.Itoa( offset ) + "&limit=" + strconv.Itoa( limit )
 }
@@ -557,7 +512,7 @@ func ( client *Client ) call( ctx context.Context , method string , path string 
 	switch {
 	case response.StatusCode == http.StatusConflict && refusal.Error == "version_conflict":
 		err = &ConflictError{ Current: refusal.CurrentVersion , Live: refusal.Live }
-	case response.StatusCode == http.StatusNotFound && strings.HasPrefix( path , "/api/" ) && ( refusal.Error == "no such document" || refusal.Error == "no keyring" ):
+	case response.StatusCode == http.StatusNotFound && strings.HasPrefix( path , "/api/" ) && refusal.Error == "no such document":
 		err = ErrNotFound
 	case refusal.Error == "doc_too_large":
 		err = ErrTooLarge

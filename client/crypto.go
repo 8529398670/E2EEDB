@@ -77,7 +77,7 @@ type Key struct {
 
 // GenerateKey makes a new random master key, base64-encoded. Keep it secret
 // and keep a copy: nothing, the server included, can recover documents
-// without it (or a passphrase set with SetPassphrase).
+// without it (or a passphrase set in the browser).
 func GenerateKey() ( encoded string , err error ) {
 	raw := make( []byte , KeySize )
 	if _ , err = rand.Read( raw ); err != nil { return }
@@ -193,7 +193,9 @@ func passphraseKey( passphrase string , salt []byte , ops uint64 , mem uint64 ) 
 }
 
 // WrapKey seals the master key under a passphrase, as the keyring text the
-// server stores.
+// server stores. The server takes a keyring only from a signed-in browser
+// (POST /api/keyring is session-only); this is the same format, for tools
+// and tests.
 func ( key *Key ) WrapKey( passphrase string ) ( text string , err error ) {
 	salt := make( []byte , saltSize )
 	nonce := make( []byte , nonceSize )

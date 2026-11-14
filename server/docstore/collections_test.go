@@ -189,3 +189,24 @@ func TestFoldersAreApartAndCapped( t *testing.T ) {
 	if _ , err := store.CreateCollection( 1 , "three" , CollectionChange{} , few ); errors.Is( err , ErrTooMany ) == false { t.Fatalf( "cap: %v" , err ) }
 	if _ , err := store.Set( 1 , "three" , "a" , envelope( 1 , 60 ) , nil , few ); errors.Is( err , ErrTooMany ) == false { t.Fatalf( "cap on auto folder: %v" , err ) }
 }
+
+// A scoped key's write (NoAutoCreate) into a folder that is gone -- deleted
+// between its scope check and its write -- must not make it again at the top
+// level, where the key could never have made it.
+func TestNoAutoCreate( t *testing.T ) {
+	store , _ := open( t )
+	scoped := limits
+	scoped.NoAutoCreate = true
+	if _ , err := store.Set( 1 , "reports" , "x" , envelope( 1 , 60 ) , nil , scoped ); errors.Is( err , ErrNoCollection ) == false {
+		t.Fatalf( "scoped write into a missing folder: %v" , err )
+	}
+	if _ , err := store.GetCollection( 1 , "reports" ); err == nil {
+		t.Fatal( "the folder was made anyway" )
+	}
+	if _ , err := store.Set( 1 , "reports" , "x" , envelope( 1 , 60 ) , nil , limits ); err != nil {
+		t.Fatalf( "an unscoped write still makes it: %v" , err )
+	}
+	if _ , err := store.Set( 1 , "reports" , "y" , envelope( 1 , 60 ) , nil , scoped ); err != nil {
+		t.Fatalf( "a scoped write into an existing folder: %v" , err )
+	}
+}

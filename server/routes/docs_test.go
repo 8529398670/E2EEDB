@@ -128,13 +128,25 @@ func TestDocsFromABrowserNeedTheCSRFToken( t *testing.T ) {
 
 func TestKeyringRoutes( t *testing.T ) {
 	fixture := newAuthFixture( t )
-	key := issueKey( t , fixture , fixture.alice , models.RoleUser )
-	if status , _ := fixture.withKey( t , key , http.MethodGet , "/api/keyring" , nil ); status != 404 { t.Fatalf( "no keyring yet: %d" , status ) }
-	status , reply := fixture.withKey( t , key , http.MethodPost , "/api/keyring" , fiber.Map{ "keyring": `{"v":1}` , "if_version": 0 } )
+	alice := fixture.signIn( t , fixture.alice.ID )
+	if status , _ := alice.do( t , http.MethodGet , "/api/keyring" , nil ); status != 404 { t.Fatalf( "no keyring yet: %d" , status ) }
+	status , reply := send( t , alice , "/api/keyring" , fiber.Map{ "keyring": `{"v":1}` , "if_version": 0 } )
 	if status != 200 || reply[ "version" ] != float64( 1 ) { t.Fatalf( "set: %d %v" , status , reply ) }
-	if status , _ = fixture.withKey( t , key , http.MethodPost , "/api/keyring" , fiber.Map{ "keyring": `{"v":1}` , "if_version": 0 } ); status != 409 { t.Fatalf( "second create: %d" , status ) }
-	status , reply = fixture.withKey( t , key , http.MethodGet , "/api/keyring" , nil )
+	if status , _ = send( t , alice , "/api/keyring" , fiber.Map{ "keyring": `{"v":1}` , "if_version": 0 } ); status != 409 { t.Fatalf( "second create: %d" , status ) }
+	status , reply = alice.do( t , http.MethodGet , "/api/keyring" , nil )
 	if status != 200 || reply[ "keyring" ] != `{"v":1}` { t.Fatalf( "get: %d %v" , status , reply ) }
-	other := issueKey( t , fixture , fixture.owner , models.RoleAdmin )
-	if status , _ = fixture.withKey( t , other , http.MethodGet , "/api/keyring" , nil ); status != 404 { t.Fatalf( "another account read the keyring: %d" , status ) }
+	owner := fixture.signIn( t , fixture.owner.ID )
+	if status , _ = owner.do( t , http.MethodGet , "/api/keyring" , nil ); status != 404 { t.Fatalf( "another account read the keyring: %d" , status ) }
+}
+
+// An API key never reaches the keyring, the account's own full key
+// included: it must not take the wrapped master key away to guess the
+// passphrase offline, or replace it and lock the passphrase out.
+func TestKeyringRefusesAPIKeys( t *testing.T ) {
+	fixture := newAuthFixture( t )
+	alice := fixture.signIn( t , fixture.alice.ID )
+	if status , reply := send( t , alice , "/api/keyring" , fiber.Map{ "keyring": `{"v":1}` , "if_version": 0 } ); status != 200 { t.Fatalf( "set: %d %v" , status , reply ) }
+	key := issueKey( t , fixture , fixture.alice , models.RoleUser )
+	if status , _ := fixture.withKey( t , key , http.MethodGet , "/api/keyring" , nil ); status != 403 { t.Fatalf( "a key read the keyring: %d" , status ) }
+	if status , _ := fixture.withKey( t , key , http.MethodPost , "/api/keyring" , fiber.Map{ "keyring": `{"v":2}` , "if_version": 1 } ); status != 403 { t.Fatalf( "a key replaced the keyring: %d" , status ) }
 }

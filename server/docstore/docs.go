@@ -83,6 +83,11 @@ type Limits struct {
 	QuotaBytes     int64
 	MaxCollections int
 	MaxDepth       int
+	// NoAutoCreate makes a write into a collection id with no folder
+	// ErrNoCollection instead of making one at the top level. A scoped key's
+	// writes set it: its scope was checked before the write's transaction,
+	// and a folder deleted in between must not come back outside it.
+	NoAutoCreate bool
 }
 
 // Defaults for the folder limits left at zero.
@@ -235,8 +240,12 @@ func ( store *Store ) Get( user_id uint64 , collection string , id string ) ( do
 }
 
 // List is one page of a collection's live documents, by id, and how many
-// there are in all. with_bodies includes the ciphertext.
-func ( store *Store ) List( user_id uint64 , collection string , offset int , limit int , with_bodies bool ) ( docs []Doc , total int , err error ) {
+// there are in all. with_bodies includes the ciphertext. max_bytes, when
+// above zero, ends the page early once its bodies add up to that much (it
+// always holds at least one document), so one request cannot pull limit
+// times the largest document into memory; the caller's next page carries on
+// from where it stopped.
+func ( store *Store ) List( user_id uint64 , collection string , offset int , limit int , with_bodies bool , max_bytes int ) ( docs []Doc , total int , err error ) {
 	err = store.db.QueryRow( `SELECT COUNT(*) FROM docs WHERE user_id = ? AND collection = ? AND deleted = 0` ,
 		user_id , collection ).Scan( &total )
 	if err != nil { return }
@@ -248,10 +257,13 @@ func ( store *Store ) List( user_id uint64 , collection string , offset int , li
 	if err != nil { return }
 	defer rows.Close()
 	docs = []Doc{}
+	used := 0
 	for rows.Next() {
 		doc := Doc{ Collection: collection }
 		var updated int64
 		if err = rows.Scan( &doc.ID , &doc.Version , &doc.Seq , &updated , &doc.Size , &doc.Body ); err != nil { return }
+		if with_bodies && max_bytes > 0 && len( docs ) > 0 && used + doc.Size > max_bytes { break }
+		used += doc.Size
 		doc.UpdatedAt = fromMillis( updated )
 		docs = append( docs , doc )
 	}

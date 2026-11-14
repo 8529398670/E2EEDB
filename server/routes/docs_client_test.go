@@ -78,15 +78,6 @@ func TestGoClientEndToEnd( t *testing.T ) {
 	other_key , _ := client.GenerateKey()
 	other , _ := client.New( base , api_key , other_key )
 	if _ , err = other.Get( ctx , "invoices" , "x" , &back ); errors.Is( err , client.ErrWrongKey ) == false { t.Fatalf( "other key: %v" , err ) }
-
-	// A passphrase unlocks the same master key from anywhere with the API key.
-	if err = store.SetPassphrase( ctx , "a long enough passphrase" ); err != nil { t.Fatal( err ) }
-	if err = store.SetPassphrase( ctx , "changed it" ); err != nil { t.Fatal( err ) }
-	unlocked , err := client.NewFromPassphrase( ctx , base , api_key , "changed it" )
-	if err != nil || unlocked.Key().Export() != master { t.Fatalf( "passphrase unlock: %v" , err ) }
-	if _ , err = client.NewFromPassphrase( ctx , base , api_key , "a long enough passphrase" ); errors.Is( err , client.ErrWrongKey ) == false {
-		t.Fatalf( "the old passphrase still works: %v" , err )
-	}
 }
 
 func containsText( body []byte , text string ) bool {

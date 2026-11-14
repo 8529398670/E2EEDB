@@ -68,6 +68,20 @@ func ( actor *Actor ) KeyID() ( result string ) {
 	return
 }
 
+// Lineage is the API key behind this request, directly or through the
+// session one of its login links signed in, or "". Whatever the request
+// makes that is a way in -- a login link, an API key -- records it, so
+// revoking that key stops those too (models.KeyLineageLive).
+func ( actor *Actor ) Lineage() ( result string ) {
+	switch {
+	case actor.APIKey != nil:
+		result = actor.APIKey.ID
+	case actor.Session != nil:
+		result = actor.Session.MintedByKey
+	}
+	return
+}
+
 func ( actor *Actor ) Method() ( result string ) {
 	result = MethodSession
 	if actor.ViaAPIKey() {

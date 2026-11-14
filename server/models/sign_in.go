@@ -118,6 +118,10 @@ func FinishChallenge( store *db.Store , credential string , code string , sessio
 			tx_err = ErrChallengeInvalid
 			return
 		}
+		if KeyLineageLive( tx.Get , challenge.MintedByKey ) == false {
+			tx_err = ErrChallengeInvalid
+			return
+		}
 		if method , tx_err = checkCode( user , code , secret_key ); tx_err != nil { return }
 		if tx_err = tx.Put( db.BucketUsers , key , user ); tx_err != nil { return }
 		if tx_err = tx.Delete( db.BucketSignInChallenges , []byte( challenge_id ) ); tx_err != nil { return }

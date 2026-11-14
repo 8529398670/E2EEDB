@@ -285,9 +285,9 @@ func ( handlers *Handlers ) createMyAPIKey( c fiber.Ctx , in *createMyAPIKeyRequ
 			err = refused
 			return
 		}
-		credential , key , issue_err = models.IssueScopedAPIKey( handlers.Store , user.ID , in.Name , scope , ttl )
+		credential , key , issue_err = models.IssueScopedAPIKey( handlers.Store , user.ID , in.Name , scope , ttl , models.MintedBy( security.ActorFrom( c ).Lineage() ) )
 	} else {
-		credential , key , issue_err = models.IssueAPIKey( handlers.Store , user.ID , in.Name , role , ttl )
+		credential , key , issue_err = models.IssueAPIKey( handlers.Store , user.ID , in.Name , role , ttl , models.MintedBy( security.ActorFrom( c ).Lineage() ) )
 	}
 	switch {
 	case errors.Is( issue_err , models.ErrAPIKeyRole ):
@@ -359,7 +359,7 @@ func ( handlers *Handlers ) createAPIKeyForUser( c fiber.Ctx , in *createUserAPI
 	}
 
 	actor := security.UserFrom( c )
-	credential , key , issue_err := models.IssueAPIKeyFor( handlers.Store , actor.ID , in.UserID , in.Name , keyRole( in.Role ) , ttl )
+	credential , key , issue_err := models.IssueAPIKeyFor( handlers.Store , actor.ID , in.UserID , in.Name , keyRole( in.Role ) , ttl , models.MintedBy( security.ActorFrom( c ).Lineage() ) )
 	switch {
 	case errors.Is( issue_err , db.ErrNotFound ):
 		err = refuse( fiber.StatusNotFound , "no such user" )

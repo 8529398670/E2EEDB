@@ -101,6 +101,10 @@ func LoadSession( store *db.Store , credential string ) ( session *Session , use
 		return
 	}
 
+	// A session signed in through a key's login link lasts only while that
+	// key does: revoked, deleted, expired or purged, it ends this too.
+	if KeyLineageLive( store.Get , found.MintedByKey ) == false { return }
+
 	loaded_user , err := GetUser( store , found.UserID )
 	if err != nil || loaded_user.Disabled() { return }
 

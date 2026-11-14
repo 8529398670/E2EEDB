@@ -344,6 +344,10 @@ func RedeemLoginToken( store *db.Store , credential string , rules SignInRules )
 		current.UsedAt = &now
 		if tx_err = tx.Put( db.BucketLoginTokens , []byte( token_id ) , current ); tx_err != nil { return }
 
+		if KeyLineageLive( tx.Get , current.MintedByKey ) == false {
+			tx_err = ErrLoginTokenInvalid
+			return
+		}
 		rules.MintedByKey = current.MintedByKey
 		signed , tx_err = startSignInTx( tx , owner , rules )
 		return
@@ -407,6 +411,9 @@ func deletePendingLoginTokens( tx *db.Tx , user_id uint64 ) ( removed int , err 
 // two-factor code, and every invite link it made is switched off. Restoring a
 // deleted key brings none of them back.
 //
+// Every API key made through this key (APIKey.MintedByKey), directly or by a
+// session it signed in, is revoked the same way, down the chain.
+//
 // Sessions made through an invite link the key made stay: those are the
 // accounts of the people who joined, not a way into an existing one.
 func VoidLinksMintedByKeyTx( tx *db.Tx , key_id string ) ( voided int , err error ) {
@@ -432,6 +439,29 @@ func VoidLinksMintedByKeyTx( tx *db.Tx , key_id string ) ( voided int , err erro
 		} )
 	voided += waiting
 	if err != nil { return }
+	// Keys made through this one (APIKey.MintedByKey) are revoked too, and
+	// what they made in turn. KeyLineageLive already refuses all of it; this
+	// makes the API keys list say so.
+	children := []*APIKey{}
+	err = tx.ForEach( db.BucketAPIKeys ,
+		func() any { return &APIKey{} } ,
+		func( key []byte , item any ) bool {
+			if child := item.( *APIKey ); child.MintedByKey == key_id && child.ID != key_id {
+				children = append( children , child )
+			}
+			return true
+		} )
+	if err != nil { return }
+	for _ , child := range children {
+		if child.RevokedAt == nil {
+			now := time.Now().UTC()
+			child.RevokedAt = &now
+			if err = tx.Put( db.BucketAPIKeys , []byte( child.ID ) , child ); err != nil { return }
+		}
+		more , child_err := VoidLinksMintedByKeyTx( tx , child.ID )
+		voided += 1 + more
+		if child_err != nil { return voided , child_err }
+	}
 	return
 }
 

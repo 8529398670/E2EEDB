@@ -354,6 +354,10 @@ func version0() *int64 {
 func ensureCollection( tx *sql.Tx , user_id uint64 , id string , limits Limits , now time.Time ) ( created bool , err error ) {
 	_ , found , err := readCollection( tx , user_id , id )
 	if err != nil || found { return }
+	if limits.NoAutoCreate {
+		err = ErrNoCollection
+		return
+	}
 	if err = checkCount( tx , user_id , limits ); err != nil { return }
 	names , err := siblingNames( tx , user_id , "" , "" )
 	if err != nil { return }
