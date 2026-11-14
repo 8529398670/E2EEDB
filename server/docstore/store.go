@@ -1,0 +1,221 @@
+// Package docstore is the end-to-end encrypted document store: a SQLite file
+// (<app dir>/docs.db) apart from the bolt database, holding documents clients
+// encrypted with keys this server never sees.
+//
+// What it stores per document is only what routing and sync need: the account
+// it belongs to, its collection id and its own id, a version, a change sequence
+// number, when it last changed, its size, and the ciphertext. It never parses
+// the ciphertext beyond checking its first byte names the envelope format (see
+// ValidEnvelope), and it has no key that could open it. That is why this
+// package imports no crypto: the server's own key (server/encryption) has
+// nothing to do here, and rotating it leaves docs.db alone.
+//
+// SQLite runs in WAL mode, so readers never wait on the writer. Every write is
+// one IMMEDIATE transaction, which takes the write lock up front: the checks a
+// write makes (its expected version, the account's quota) and the write itself
+// see the same state.
+package docstore
+
+import (
+	sql "database/sql"
+	errors "errors"
+	fmt "fmt"
+	os "os"
+	strings "strings"
+
+	_ "modernc.org/sqlite"
+)
+
+// Store is one open docs.db.
+type Store struct {
+	db   *sql.DB
+	path string
+}
+
+// Errors a caller tells apart.
+var (
+	ErrNotFound    = errors.New( "no such document" )
+	ErrConflict    = errors.New( "version_conflict" )
+	ErrTooLarge    = errors.New( "doc_too_large" )
+	ErrQuota       = errors.New( "quota_exceeded" )
+	ErrSyncExpired = errors.New( "sync_expired" )
+)
+
+// ConflictError is ErrConflict with what is there now, so a client can show it
+// or retry. Current is 0 and Live false when there is no live document.
+type ConflictError struct {
+	Current int64
+	Live    bool
+}
+
+func ( conflict *ConflictError ) Error() string { return ErrConflict.Error() }
+func ( conflict *ConflictError ) Unwrap() error { return ErrConflict }
+
+// dsn opens path in WAL mode. busy_timeout lets a second writer wait for the
+// first rather than fail, and _txlock=immediate makes BeginTx take the write
+// lock at once, which only writes use (reads run outside a transaction).
+func dsn( path string , read_only bool ) ( result string ) {
+	result = "file:" + path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_txlock=immediate"
+	if read_only {
+		result += "&mode=ro"
+	}
+	return
+}
+
+// Open opens or creates the store at path and brings its schema up to date.
+// The file is created 0600, like the bolt database beside it.
+func Open( path string ) ( store *Store , err error ) {
+	file , err := os.OpenFile( path , os.O_RDWR | os.O_CREATE , 0o600 )
+	if err != nil { return }
+	file.Close()
+	handle , err := sql.Open( "sqlite" , dsn( path , false ) )
+	if err != nil { return }
+	store = &Store{ db: handle , path: path }
+	if err = store.migrate(); err != nil {
+		handle.Close()
+		store = nil
+	}
+	return
+}
+
+// Close closes the store.
+func ( store *Store ) Close() ( err error ) {
+	err = store.db.Close()
+	return
+}
+
+// Ping is whether the store answers, for /api/ready.
+func ( store *Store ) Ping() ( err error ) {
+	var version int
+	err = store.db.QueryRow( "PRAGMA user_version" ).Scan( &version )
+	if err == nil && version != len( migrations ) {
+		err = fmt.Errorf( "docs.db is at schema %d, this build expects %d" , version , len( migrations ) )
+	}
+	return
+}
+
+// Snapshot writes a consistent copy of the store at path to out, whether or
+// not a server has it open: VACUUM INTO reads one snapshot of the database,
+// WAL included, and writes a self-contained file. out must not exist. A store
+// that was never created (no docs.db yet) answers os.ErrNotExist.
+func Snapshot( path string , out string ) ( err error ) {
+	if _ , err = os.Stat( path ); err != nil { return }
+	handle , err := sql.Open( "sqlite" , dsn( path , true ) )
+	if err != nil { return }
+	defer handle.Close()
+	_ , err = handle.Exec( "VACUUM INTO '" + strings.ReplaceAll( out , "'" , "''" ) + "'" )
+	if err == nil {
+		err = os.Chmod( out , 0o600 )
+	}
+	return
+}
+
+// migrations are the schema, one step per version: PRAGMA user_version is how
+// many have run. Append; never edit one that has shipped.
+var migrations = []string{
+	`CREATE TABLE docs (
+		user_id    INTEGER NOT NULL,
+		collection TEXT    NOT NULL,
+		doc_id     TEXT    NOT NULL,
+		version    INTEGER NOT NULL,
+		seq        INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		deleted    INTEGER NOT NULL DEFAULT 0,
+		size       INTEGER NOT NULL,
+		body       BLOB,
+		PRIMARY KEY ( user_id , collection , doc_id )
+	) WITHOUT ROWID;
+	CREATE INDEX docs_by_seq ON docs ( user_id , seq );
+	CREATE TABLE keyrings (
+		user_id    INTEGER PRIMARY KEY,
+		body       TEXT    NOT NULL,
+		version    INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	);
+	CREATE TABLE meta (
+		key   TEXT PRIMARY KEY,
+		value INTEGER NOT NULL
+	);
+	INSERT INTO meta ( key , value ) VALUES ( 'seq' , 0 ) , ( 'horizon' , 0 );`,
+
+	// 2: folders. Every collection that holds a document becomes a top-level
+	// folder named after itself.
+	`CREATE TABLE collections (
+		user_id    INTEGER NOT NULL,
+		id         TEXT    NOT NULL,
+		name       TEXT    NOT NULL,
+		parent     TEXT    NOT NULL DEFAULT '',
+		position   INTEGER NOT NULL,
+		version    INTEGER NOT NULL,
+		seq        INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY ( user_id , id )
+	) WITHOUT ROWID;
+	CREATE INDEX collections_by_parent ON collections ( user_id , parent , position );
+	CREATE TABLE trees (
+		user_id INTEGER PRIMARY KEY,
+		seq     INTEGER NOT NULL
+	);
+	INSERT INTO collections ( user_id , id , name , parent , position , version , seq , updated_at )
+		SELECT user_id , collection , collection , '' ,
+			ROW_NUMBER() OVER ( PARTITION BY user_id ORDER BY collection ) - 1 , 1 , 0 , MAX( updated_at )
+		FROM docs WHERE deleted = 0 GROUP BY user_id , collection;`,
+
+	// 3: collection keys. lock is the collection's lockbox, opaque text the
+	// client wraps (README.md, "Crypto format"); "" for none yet.
+	`ALTER TABLE collections ADD COLUMN lock TEXT NOT NULL DEFAULT '';`,
+
+	// 4: who made a folder, and which folder this is. by_key is the id of
+	// the scoped API key that created it ("" when the account itself did),
+	// so a client can refuse to write into a folder someone it shared with
+	// made. born is random and never changes: it tells a folder from a later
+	// one that reuses its id, so a scoped key minted for one never reaches
+	// the other.
+	`ALTER TABLE collections ADD COLUMN by_key TEXT NOT NULL DEFAULT '';
+	ALTER TABLE collections ADD COLUMN born INTEGER NOT NULL DEFAULT 0;
+	UPDATE collections SET born = ( random() & 9223372036854775807 ) | 1;`,
+}
+
+func ( store *Store ) migrate() ( err error ) {
+	var version int
+	if err = store.db.QueryRow( "PRAGMA user_version" ).Scan( &version ); err != nil { return }
+	if version > len( migrations ) {
+		err = fmt.Errorf( "docs.db is at schema %d, newer than this build (%d)" , version , len( migrations ) )
+		return
+	}
+	for ; version < len( migrations ) ; version++ {
+		err = store.write( func( tx *sql.Tx ) ( step_err error ) {
+			if _ , step_err = tx.Exec( migrations[ version ] ); step_err != nil { return }
+			_ , step_err = tx.Exec( fmt.Sprintf( "PRAGMA user_version = %d" , version + 1 ) )
+			return
+		} )
+		if err != nil {
+			err = fmt.Errorf( "docs.db migration %d: %w" , version + 1 , err )
+			return
+		}
+	}
+	return
+}
+
+// write runs fn in one IMMEDIATE transaction, committed when fn returns nil.
+func ( store *Store ) write( fn func( tx *sql.Tx ) error ) ( err error ) {
+	tx , err := store.db.Begin()
+	if err != nil { return }
+	if err = fn( tx ); err != nil {
+		tx.Rollback()
+		return
+	}
+	err = tx.Commit()
+	return
+}
+
+// nextSeq is the next change number, shared by every account: one counter is
+// simpler than one each, and a client only ever compares its own numbers.
+func nextSeq( tx *sql.Tx ) ( seq int64 , err error ) {
+	err = tx.QueryRow( "UPDATE meta SET value = value + 1 WHERE key = 'seq' RETURNING value" ).Scan( &seq )
+	return
+}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- E2EEDB: a database cylinder with a keyhole, on the app's accent blue. -->
+  <rect width="64" height="64" rx="14" fill="#1f5fd6"/>
+  <path fill="#fff" d="M12 17c0-5 9-8 20-8s20 3 20 8v30c0 5-9 8-20 8s-20-3-20-8z"/>
+  <ellipse cx="32" cy="17" rx="16" ry="4.5" fill="#1f5fd6" opacity=".35"/>
+  <path fill="#1f5fd6" d="M32 26a6 6 0 0 0-3.2 11.1L27 47h10l-1.8-9.9A6 6 0 0 0 32 26z"/>
+</svg>

@@ -1,0 +1,10 @@
+# Written by the skill that scaffolded this app; `webserver-upgrade` reads and
+# updates it. Commit it: it is how an update knows where this app started.
+skill: go-webserver
+commit: 3731d9aa6fac8e200416447326d1e9db690ab18f
+project_name: "E2EEDB"
+slug: e2eedb
+module_path: github.com/8529398670/E2EEDB
+port: 26862
+features: [api_keys, two_factor, backups]
+pruned: [files, invite_links, mcp, metrics, passwords, webhooks]

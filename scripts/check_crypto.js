@@ -1,0 +1,99 @@
+#!/usr/bin/env node
+// Holds the browser's crypto (static/js/docs_crypto.js, on the vendored
+// plain-JS libsodium) to the format the Go client pins in
+// client/testdata/vectors.json: v1 documents, the passphrase keyring, and v2
+// collection keys, lockboxes, signed documents and access tokens. Run by the
+// tests, or on its own: node scripts/check_crypto.js
+const fs = require( "fs" );
+const path = require( "path" );
+const vm = require( "vm" );
+
+const root = path.join( __dirname , ".." );
+const vectors = JSON.parse( fs.readFileSync( path.join( root , "client" , "testdata" , "vectors.json" ) , "utf8" ) );
+
+// The vendored loader, told (as the page tells it) not to try WebAssembly.
+const module_object = { instantiateWasm() { module_object.onAbort( "no WebAssembly" ); return {}; } };
+const page = { libsodium_mod: module_object , crypto: require( "crypto" ).webcrypto , TextDecoder , console };
+page.window = page;
+page.self = page;
+vm.createContext( page );
+// Byte arrays must be the context's own: libsodium checks instanceof.
+const Bytes = vm.runInContext( "Uint8Array" , page );
+page.TextEncoder = class { encode( text ) { return new Bytes( Buffer.from( text , "utf8" ) ); } };
+vm.runInContext( fs.readFileSync( path.join( root , "static" , "vendor" , "sodium.js" ) , "utf8" ) , page );
+vm.runInContext( fs.readFileSync( path.join( root , "static" , "js" , "docs_crypto.js" ) , "utf8" ) + "\nglobalThis.DocsCrypto = DocsCrypto;" , page );
+page.I18n = { get: ( key ) => key };
+
+let failed = 0;
+function check( name , ok ) {
+  if ( !ok ) {
+    failed += 1;
+    console.error( "FAIL " + name );
+  }
+}
+
+page.sodium.ready.then( () => {
+  const C = page.DocsCrypto;
+  C.sodium = page.sodium;
+  const nonce = C.unb64( vectors.nonce );
+  const nonce_w = new Bytes( 24 ).fill( 0x42 );
+
+  // v1 and the keyring.
+  const master = C.parseKey( vectors.master_key );
+  check( "v1 key id" , C.keyId( master ) === vectors.key_id );
+  check( "v1 open" , C.open( master , vectors.collection , vectors.doc_id , vectors.envelope ) === vectors.plaintext );
+  check( "keyring" , C.keyId( C.unwrap( vectors.keyring , vectors.passphrase ) ) === vectors.key_id );
+
+  // v2, built from the same fixed bytes the Go test uses.
+  const counting = ( start , n ) => Bytes.from( { length: n } , ( _ , i ) => ( start + i ) & 255 );
+  const fixed = ( collection , start ) => {
+    const seed = counting( start + 32 , 32 );
+    return C.collectionKey( collection , counting( start , 32 ) , C.sodium.crypto_sign_seed_keypair( seed ).publicKey , seed );
+  };
+  const notes = fixed( vectors.collection , 0x40 );
+  const child = fixed( vectors.child , 0x60 );
+  check( "verify key" , C.b64( notes.verify ) === vectors.verify_key );
+  check( "read key id" , C.b64( notes.id ) === vectors.read_key_id );
+  check( "v2 seal" , C.sealV2( notes , vectors.doc_id , vectors.plaintext , nonce ) === vectors.envelope_v2 );
+  check( "lockbox seal" , C.sealLock( notes , master , nonce , nonce_w ) === vectors.lockbox );
+  check( "child lockbox seal" , C.sealLock( child , notes , nonce , nonce_w ) === vectors.child_lockbox );
+  check( "token" , C.makeToken( vectors.api_key , C.readOnly( notes ) ) === vectors.access_token_read_only );
+
+  // And opening what Go wrote.
+  const opened = C.openLock( vectors.lockbox , vectors.collection , master );
+  check( "lockbox open" , C.canWrite( opened ) && C.openV2( opened , vectors.doc_id , vectors.envelope_v2 ) === vectors.plaintext );
+  check( "child lockbox open" , C.b64( C.openLock( vectors.child_lockbox , vectors.child , opened ).read ) === vectors.child_read_key );
+  const token = C.parseToken( vectors.access_token_read_only );
+  check( "token parse" , token && token.api_key === vectors.api_key && !C.canWrite( token.key ) );
+  check( "reader opens" , C.openV2( token.key , vectors.doc_id , vectors.envelope_v2 ) === vectors.plaintext );
+  const child_read = C.openLock( vectors.child_lockbox , vectors.child , token.key );
+  check( "reader child is read-only" , !C.canWrite( child_read ) );
+  check( "v2 child lockbox seal" , C.sealLock( child , notes , nonce , nonce_w , 2 ) === vectors.child_lockbox_v2 );
+  check( "v2 child lockbox opens for the writer" , C.canWrite( C.openLock( vectors.child_lockbox_v2 , vectors.child , opened ) ) );
+  let unsigned = "";
+  try { C.openLock( vectors.child_lockbox_v2 , vectors.child , token.key ); } catch ( error ) { unsigned = error.code; }
+  check( "v2 child lockbox refused to a reader" , unsigned === "unsigned_lock" );
+  // A reader planting a child lockbox: it can wrap the read half, but its
+  // signature is not the parent's.
+  const planted = fixed( "planted" , 0x10 );
+  const box = JSON.parse( C.sealLock( planted , notes , nonce , nonce_w ) );
+  const own = C.sodium.crypto_sign_seed_keypair( counting( 0x90 , 32 ) );
+  box.sig = C.b64( C.sodium.crypto_sign_detached( C.lockSigned( "planted" , box.parent , C.unb64( box.key_id ) , C.unb64( box.nonce_r ) , C.unb64( box.read ) , C.unb64( box.nonce_w ) , C.unb64( box.write ) ) , own.privateKey ) );
+  let forged_lock = "";
+  try { C.openLock( JSON.stringify( box ) , "planted" , token.key ); } catch ( error ) { forged_lock = error.code; }
+  check( "forged lockbox refused to a reader" , forged_lock === "corrupt" );
+  let refused = "";
+  try { C.sealV2( token.key , "x" , "{}" ); } catch ( error ) { refused = error.code; }
+  check( "reader cannot seal" , refused === "read_only" );
+  const bytes = C.unb64( vectors.envelope_v2 );
+  bytes[ 60 ] ^= 1;
+  refused = "";
+  try { C.openV2( token.key , vectors.doc_id , C.b64( bytes ) ); } catch ( error ) { refused = error.code; }
+  check( "forged v2 refused" , refused === "corrupt" );
+
+  if ( failed > 0 ) process.exit( 1 );
+  console.log( "ok: browser crypto matches the Go vectors" );
+} ).catch( ( error ) => {
+  console.error( "FAIL " + String( error && error.message || error ).slice( 0 , 300 ) );
+  process.exit( 1 );
+} );
