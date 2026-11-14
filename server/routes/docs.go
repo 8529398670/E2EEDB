@@ -5,9 +5,11 @@ import (
 	base64 "encoding/base64"
 	errors "errors"
 	strconv "strconv"
+	time "time"
 
 	fiber "github.com/gofiber/fiber/v3"
 
+	apidoc "github.com/8529398670/E2EEDB/server/apidoc"
 	docstore "github.com/8529398670/E2EEDB/server/docstore"
 	logs "github.com/8529398670/E2EEDB/server/logs"
 	models "github.com/8529398670/E2EEDB/server/models"
@@ -24,18 +26,75 @@ import (
 // see README.md for the format. The server checks only that it is an
 // envelope (docstore.ValidEnvelope) and how big it is.
 
-// docRow is one document's metadata, and its body when asked for.
-func docRow( doc docstore.Doc , with_body bool ) ( row fiber.Map ) {
-	row = fiber.Map{
-		"collection": doc.Collection,
-		"id":         doc.ID,
-		"version":    doc.Version,
-		"seq":        doc.Seq,
-		"updated_at": doc.UpdatedAt,
-		"size":       doc.Size,
+// docMeta is one document's metadata: what the server knows about it.
+type docMeta struct {
+	Collection string    `json:"collection"`
+	ID         string    `json:"id"`
+	Version    int64     `json:"version" jsonschema_description:"Goes up by one on every write and delete."`
+	Seq        int64     `json:"seq" jsonschema_description:"Change number, for GET /api/changes?since=."`
+	UpdatedAt  time.Time `json:"updated_at"`
+	Size       int       `json:"size" jsonschema_description:"Bytes of ciphertext; 0 for a delete."`
+}
+
+func ( docMeta ) APIName() ( name string ) { name = "DocMeta"; return }
+
+func newDocMeta( doc docstore.Doc ) ( meta docMeta ) {
+	meta = docMeta{ Collection: doc.Collection , ID: doc.ID , Version: doc.Version , Seq: doc.Seq , UpdatedAt: doc.UpdatedAt , Size: doc.Size }
+	return
+}
+
+// docListRow is a document in a collection's list, with its body only when
+// asked for.
+type docListRow struct {
+	docMeta
+	Body string `json:"body,omitempty" jsonschema_description:"Only with include_body=true. Standard base64 (with padding) of the client's envelope (see Doc)."`
+}
+
+// docWithBody is one document with its ciphertext.
+type docWithBody struct {
+	docMeta
+	Body string `json:"body" jsonschema_description:"Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it."`
+}
+
+func ( docWithBody ) APIName() ( name string ) { name = "Doc"; return }
+
+// docChange is a write or a delete, as the change feed and the deletes
+// report it.
+type docChange struct {
+	docMeta
+	Deleted bool `json:"deleted" jsonschema_description:"The document was deleted: drop your copy."`
+}
+
+func ( docChange ) APIName() ( name string ) { name = "DocChange"; return }
+
+func newDocChange( doc docstore.Doc , deleted bool ) ( change docChange ) {
+	change = docChange{ docMeta: newDocMeta( doc ) , Deleted: deleted }
+	return
+}
+
+// collectionPath is the collection in a route's path.
+type collectionPath struct {
+	Collection string `json:"collection" path:"collection" jsonschema:"minLength=1,maxLength=64" jsonschema_description:"The collection's id: 1-64 of A-Z a-z 0-9 _ -" error:"collection must be 1-64 of A-Z a-z 0-9 _ -"`
+}
+
+// docPath is a document's collection and id in a route's path.
+type docPath struct {
+	collectionPath
+	DocID string `json:"doc_id" path:"doc_id" jsonschema:"minLength=1,maxLength=128" jsonschema_description:"1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default." error:"id must be 1-128 of A-Z a-z 0-9 _ - ."`
+}
+
+// check is what the schema cannot say: which characters an id may have.
+func ( path collectionPath ) check() ( refused *refusal ) {
+	if docstore.ValidCollection( path.Collection ) == false {
+		refused = refuse( fiber.StatusBadRequest , "collection must be 1-64 of A-Z a-z 0-9 _ -" )
 	}
-	if with_body {
-		row[ "body" ] = base64.StdEncoding.EncodeToString( doc.Body )
+	return
+}
+
+func ( path docPath ) check() ( refused *refusal ) {
+	if refused = path.collectionPath.check(); refused != nil { return }
+	if docstore.ValidDocID( path.DocID ) == false {
+		refused = refuse( fiber.StatusBadRequest , "id must be 1-128 of A-Z a-z 0-9 _ - ." )
 	}
 	return
 }
@@ -100,53 +159,6 @@ func ( handlers *Handlers ) docLimits() ( limits docstore.Limits ) {
 	return
 }
 
-// docAddress is the collection and id in the path, checked.
-func docAddress( c fiber.Ctx , with_id bool ) ( collection string , id string , refused *refusal ) {
-	collection = c.Params( "collection" )
-	if docstore.ValidCollection( collection ) == false {
-		refused = refuse( fiber.StatusBadRequest , "collection must be 1-64 of A-Z a-z 0-9 _ -" )
-		return
-	}
-	if with_id {
-		id = c.Params( "doc_id" )
-		if docstore.ValidDocID( id ) == false {
-			refused = refuse( fiber.StatusBadRequest , "id must be 1-128 of A-Z a-z 0-9 _ - ." )
-		}
-	}
-	return
-}
-
-// pageQuery reads ?limit= and ?offset= the way sendPage does, for lists the
-// database pages itself rather than reading whole.
-func pageQuery( c fiber.Ctx ) ( limit int , offset int , refused *refusal ) {
-	limit = pageDefault
-	if raw := c.Query( "limit" ); raw != "" {
-		parsed , err := strconv.Atoi( raw )
-		if err != nil || parsed < 1 || parsed > pageMax {
-			refused = refuse( fiber.StatusBadRequest , pageLimitMessage )
-			return
-		}
-		limit = parsed
-	}
-	if raw := c.Query( "offset" ); raw != "" {
-		parsed , err := strconv.Atoi( raw )
-		if err != nil || parsed < 0 {
-			refused = refuse( fiber.StatusBadRequest , pageOffsetMessage )
-			return
-		}
-		offset = parsed
-	}
-	return
-}
-
-// next is the offset of the page after this one, or nil on the last.
-func next( offset int , count int , total int ) ( result any ) {
-	if offset + count < total {
-		result = offset + count
-	}
-	return
-}
-
 // docRefusal turns what the store said no with into an answer.
 func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 	var conflict *docstore.ConflictError
@@ -184,92 +196,110 @@ func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 	return
 }
 
+
 // collectionRow is one folder as the API shows it.
-func collectionRow( entry docstore.Collection , with_counts bool ) ( row fiber.Map ) {
-	row = fiber.Map{
-		"id":         entry.ID,
-		"name":       entry.Name,
-		"parent":     entry.Parent,
-		"position":   entry.Position,
-		"version":    entry.Version,
-		"updated_at": entry.UpdatedAt,
-	}
-	if entry.Lock != "" {
-		row[ "lock" ] = entry.Lock
-	}
-	if entry.ByKey != "" {
-		// Made through someone's access key: a client writing by id can
-		// refuse to put the account's own documents there.
-		row[ "by_key" ] = entry.ByKey
-	}
-	if with_counts {
-		row[ "count" ] = entry.Count
-		row[ "bytes" ] = entry.Bytes
+type collectionRow struct {
+	ID        string    `json:"id" jsonschema_description:"What its documents are filed under and their encryption is bound to. Never changes."`
+	Name      string    `json:"name" jsonschema_description:"Shown name, unique among its siblings ignoring case. A collection made by writing a document is named after its id."`
+	Parent    string    `json:"parent" jsonschema_description:"The parent's id; \"\" for the top level."`
+	Position  int       `json:"position" jsonschema_description:"Place among its siblings, from 0."`
+	Version   int64     `json:"version" jsonschema_description:"Goes up by one on every rename or move."`
+	UpdatedAt time.Time `json:"updated_at"`
+	Lock      string    `json:"lock,omitempty" jsonschema_description:"The collection's lockbox: its own keys, wrapped by the client for its parent (or the master key at the top level). Opaque to the server. Absent until a client gives the collection keys. See README.md, Crypto format."`
+	// ByKey: made through someone's access key, so a client writing by id
+	// can refuse to put the account's own documents there.
+	ByKey string `json:"by_key,omitempty" jsonschema_description:"Present when the collection was made through an access token: the id of that scoped API key. The Go client will not write the account's own documents into such a collection unless asked to (client.AllowShared)."`
+}
+
+func ( collectionRow ) APIName() ( name string ) { name = "Collection"; return }
+
+func newCollectionRow( entry docstore.Collection ) ( row collectionRow ) {
+	row = collectionRow{ ID: entry.ID , Name: entry.Name , Parent: entry.Parent , Position: entry.Position , Version: entry.Version , UpdatedAt: entry.UpdatedAt , Lock: entry.Lock , ByKey: entry.ByKey }
+	return
+}
+
+// collectionCountedRow is a folder in the list, with what is in it.
+type collectionCountedRow struct {
+	collectionRow
+	Count int   `json:"count" jsonschema_description:"Its own live documents, not its subfolders'."`
+	Bytes int64 `json:"bytes" jsonschema_description:"Their ciphertext, in bytes."`
+}
+
+type listCollectionsReply struct {
+	Collections []collectionCountedRow `json:"collections"`
+	Paged
+	TreeSeq        int64 `json:"tree_seq" jsonschema_description:"Change number of the last change to your folders; 0 if none."`
+	UsedBytes      int64 `json:"used_bytes" jsonschema_description:"All your live documents."`
+	DocCount       int   `json:"doc_count"`
+	QuotaBytes     int64 `json:"quota_bytes" jsonschema_description:"0: no quota."`
+	MaxDocBytes    int   `json:"max_doc_bytes" jsonschema_description:"Largest one document may be, in ciphertext bytes."`
+	MaxCollections int   `json:"max_collections" jsonschema_description:"Most folders an account may have."`
+	MaxDepth       int   `json:"max_depth" jsonschema_description:"How deep folders may nest; a top-level folder is depth 1."`
+}
+
+// pagedOf is the Paged of a list the database cut itself.
+func pagedOf( page Page , count int , total int ) ( paged Paged ) {
+	paged.Total = total
+	if end := page.Offset + count; end < total {
+		paged.Next = &end
 	}
 	return
 }
 
-// ListCollections is the caller's folders, each parent's children together
+// pageLimit is a Page's limit, with the default filled in.
+func pageLimit( page Page ) ( limit int ) {
+	limit = page.Limit
+	if limit == 0 { limit = pageDefault }
+	return
+}
+
+// listCollections is the caller's folders, each parent's children together
 // in their order, with what the documents use against the quota.
-func ( handlers *Handlers ) ListCollections( c fiber.Ctx ) ( err error ) {
-	limit , offset , refused := pageQuery( c )
-	if refused != nil {
-		err = refused.send( c )
-		return
-	}
+//
+// @route("GET /api/collections", summary="Your collections", tag="Documents",
+//     description="Every collection (folder) in your account, each parent's children together in their order, "
+//         "with what your documents use against the quota. Rebuild the tree from parent and position. tree_seq "
+//         "moves on whenever a folder is made, renamed, moved or deleted.",
+// )
+func ( handlers *Handlers ) listCollections( c fiber.Ctx , in *Page ) ( reply *listCollectionsReply , err error ) {
 	owner := docOwner( c )
+	limit := pageLimit( *in )
 	var collections []docstore.Collection
 	var total , count int
 	var used int64
 	if scope := docScope( c ); scope != nil {
 		if refused := handlers.checkScopeRoot( c ); refused != nil {
-			err = refused.send( c )
+			err = refused
 			return
 		}
-		collections , total , used , count , err = handlers.scopedCollections( owner , scope.Collection , offset , limit )
-		if err != nil {
-			err = serverError( c , err )
-			return
-		}
+		collections , total , used , count , err = handlers.scopedCollections( owner , scope.Collection , in.Offset , limit )
+		if err != nil { return }
 	} else {
-		var list_err , usage_err error
-		collections , total , list_err = handlers.Docs.Collections( owner , offset , limit )
-		if list_err != nil {
-			err = serverError( c , list_err )
-			return
-		}
-		used , count , usage_err = handlers.Docs.Usage( owner )
-		if usage_err != nil {
-			err = serverError( c , usage_err )
-			return
-		}
+		if collections , total , err = handlers.Docs.Collections( owner , in.Offset , limit ); err != nil { return }
+		if used , count , err = handlers.Docs.Usage( owner ); err != nil { return }
 	}
-	tree_seq , seq_err := handlers.Docs.TreeSeq( owner )
-	if seq_err != nil {
-		err = serverError( c , seq_err )
-		return
-	}
-	rows := make( []fiber.Map , 0 , len( collections ) )
+	tree_seq , err := handlers.Docs.TreeSeq( owner )
+	if err != nil { return }
+	rows := make( []collectionCountedRow , 0 , len( collections ) )
 	for _ , entry := range collections {
-		rows = append( rows , collectionRow( entry , true ) )
+		rows = append( rows , collectionCountedRow{ collectionRow: newCollectionRow( entry ) , Count: entry.Count , Bytes: entry.Bytes } )
 	}
 	limits := handlers.docLimits()
-	err = c.JSON( fiber.Map{
-		"collections":     rows,
-		"next":            next( offset , len( rows ) , total ),
-		"total":           total,
-		"tree_seq":        tree_seq,
-		"used_bytes":      used,
-		"doc_count":       count,
-		"quota_bytes":     limits.QuotaBytes,
-		"max_doc_bytes":   limits.MaxDocBytes,
-		"max_collections": limits.MaxCollections,
-		"max_depth":       limits.MaxDepth,
-	} )
+	reply = &listCollectionsReply{
+		Collections:    rows,
+		Paged:          pagedOf( *in , len( rows ) , total ),
+		TreeSeq:        tree_seq,
+		UsedBytes:      used,
+		DocCount:       count,
+		QuotaBytes:     limits.QuotaBytes,
+		MaxDocBytes:    limits.MaxDocBytes,
+		MaxCollections: limits.MaxCollections,
+		MaxDepth:       limits.MaxDepth,
+	}
 	return
 }
 
-// scopedCollections is ListCollections for a scoped key: root and the
+// scopedCollections is listCollections for a scoped key: root and the
 // folders under it, root shown at the top level, one page of them, and what
 // their documents use.
 func ( handlers *Handlers ) scopedCollections( owner uint64 , root string , offset int , limit int ) ( page []docstore.Collection , total int , used int64 , count int , err error ) {
@@ -299,37 +329,42 @@ func ( handlers *Handlers ) scopedCollections( owner uint64 , root string , offs
 	return
 }
 
-type collectionRequest struct {
-	ID        string  `json:"id"`
-	Name      *string `json:"name"`
-	Parent    *string `json:"parent"`
-	Before    *string `json:"before"`
-	IfVersion *int64  `json:"if_version"`
-	Lock      *string `json:"lock"`
-	CSRFToken string  `json:"csrf_token"`
+// collectionFields are what a folder write may change.
+type collectionFields struct {
+	Name   *string `json:"name,omitempty" jsonschema_description:"1-128 characters, no control characters, no space at either end."`
+	Parent *string `json:"parent,omitempty" jsonschema_description:"Parent's id; \"\" for the top level."`
+	Before *string `json:"before,omitempty" jsonschema_description:"The sibling to go in front of; \"\" or absent for the end."`
+	Lock   *string `json:"lock,omitempty" jsonschema:"minLength=1,maxLength=2048" jsonschema_description:"A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by)." error:"lock must be 1-2048 bytes"`
+}
+
+type createCollectionRequest struct {
+	ID string `json:"id,omitempty" jsonschema:"maxLength=64" jsonschema_description:"1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key may only send a random 22-character id (client.NewID), so it cannot take an id the account's own code writes to by name." error:"id must be 1-64 of A-Z a-z 0-9 _ -"`
+	collectionFields
+}
+
+type updateCollectionRequest struct {
+	collectionPath
+	collectionFields
+	IfVersion *int64 `json:"if_version,omitempty" jsonschema:"minimum=1" jsonschema_description:"Change only if the collection is at this version." error:"if_version must be 1 or more"`
 }
 
 // change is the request checked and turned into what the store takes.
-func ( request collectionRequest ) change() ( change docstore.CollectionChange , refused *refusal ) {
-	if request.Name != nil && docstore.ValidCollectionName( *request.Name ) == false {
+func ( fields collectionFields ) change( if_version *int64 ) ( change docstore.CollectionChange , refused *refusal ) {
+	if fields.Name != nil && docstore.ValidCollectionName( *fields.Name ) == false {
 		refused = refuse( fiber.StatusBadRequest , "name must be 1-" + strconv.Itoa( docstore.CollectionNameMax ) + " characters, with no control characters and no space at either end" )
 		return
 	}
-	for _ , other := range []*string{ request.Parent , request.Before } {
+	for _ , other := range []*string{ fields.Parent , fields.Before } {
 		if other != nil && *other != "" && docstore.ValidCollection( *other ) == false {
 			refused = refuse( fiber.StatusBadRequest , "parent and before must be \"\" or a collection id" )
 			return
 		}
 	}
-	if request.IfVersion != nil && *request.IfVersion < 1 {
-		refused = refuse( fiber.StatusBadRequest , "if_version must be 1 or more" )
-		return
-	}
-	if request.Lock != nil && ( *request.Lock == "" || len( *request.Lock ) > docstore.LockMaxBytes ) {
+	if fields.Lock != nil && ( *fields.Lock == "" || len( *fields.Lock ) > docstore.LockMaxBytes ) {
 		refused = refuse( fiber.StatusBadRequest , "lock must be 1-" + strconv.Itoa( docstore.LockMaxBytes ) + " bytes" )
 		return
 	}
-	change = docstore.CollectionChange{ Name: request.Name , Parent: request.Parent , Before: request.Before , IfVersion: request.IfVersion , Lock: request.Lock }
+	change = docstore.CollectionChange{ Name: fields.Name , Parent: fields.Parent , Before: fields.Before , IfVersion: if_version , Lock: fields.Lock }
 	return
 }
 
@@ -346,37 +381,27 @@ func newCollectionID() ( id string ) {
 	return
 }
 
-// readCollectionRequest binds and checks a folder write's body.
-func ( handlers *Handlers ) readCollectionRequest( c fiber.Ctx ) ( request collectionRequest , change docstore.CollectionChange , done bool , err error ) {
-	if c.Bind().JSON( &request ) != nil {
-		err = badRequest( c , "malformed request body" )
-		done = true
-		return
-	}
-	if handlers.Guard.CheckCSRF( c , request.CSRFToken ) == false {
-		err = forbidden( c , "invalid csrf token" )
-		done = true
-		return
-	}
-	change , refused := request.change()
-	if refused != nil {
-		err = refused.send( c )
-		done = true
-	}
-	return
-}
-
-// CreateCollection makes a folder. id is optional (random when left out);
+// createCollection makes a folder. id is optional (random when left out);
 // name defaults to the id, parent to the top level, and the folder goes in
 // front of before, or at the end.
-func ( handlers *Handlers ) CreateCollection( c fiber.Ctx ) ( err error ) {
-	request , change , done , err := handlers.readCollectionRequest( c )
-	if done { return }
-	id := request.ID
+//
+// @route("POST /api/collections", summary="Make a collection", tag="Documents", errors=(404, 409, 413),
+//     description="A folder, empty until a document is written into it. Writing a document into an id that "
+//         "has no folder also makes one, at the top level. 409 name_taken: a sibling has that name. 409 "
+//         "version_conflict: the id is in use. 400 too_deep (with max_depth), 413 too_many_collections (with "
+//         "max_collections).",
+// )
+func ( handlers *Handlers ) createCollection( c fiber.Ctx , in *createCollectionRequest ) ( reply *collectionRow , err error ) {
+	change , refused := in.change( nil )
+	if refused != nil {
+		err = refused
+		return
+	}
+	id := in.ID
 	if id == "" {
 		id = newCollectionID()
 	} else if docstore.ValidCollection( id ) == false {
-		err = badRequest( c , "id must be 1-64 of A-Z a-z 0-9 _ -" )
+		err = refuse( fiber.StatusBadRequest , "id must be 1-64 of A-Z a-z 0-9 _ -" )
 		return
 	}
 	if docScope( c ) != nil {
@@ -384,406 +409,409 @@ func ( handlers *Handlers ) CreateCollection( c fiber.Ctx ) ( err error ) {
 		// random id: one it chose ("invoices") could be an id the account's
 		// own code later writes to by name, sealing those documents with keys
 		// the key's holder has.
-		if request.ID != "" && docstore.ValidRandomID( request.ID ) == false {
-			err = badRequest( c , "a scoped key's folder id must be a random 22-character id (client.NewID)" )
+		if in.ID != "" && docstore.ValidRandomID( in.ID ) == false {
+			err = refuse( fiber.StatusBadRequest , "a scoped key's folder id must be a random 22-character id (client.NewID)" )
 			return
 		}
 		parent := ""
 		if change.Parent != nil { parent = *change.Parent }
 		if refused := handlers.checkScope( c , parent , true ); refused != nil {
-			err = refused.send( c )
+			err = refused
 			return
 		}
 		change.ByKey = security.APIKeyFrom( c ).ID
 	}
 	entry , create_err := handlers.Docs.CreateCollection( docOwner( c ) , id , change , handlers.docLimits() )
 	if create_err != nil {
-		err = handlers.docRefusal( create_err ).send( c )
+		err = handlers.docRefusal( create_err )
 		return
 	}
-	err = c.JSON( collectionRow( entry , false ) )
+	row := newCollectionRow( entry )
+	reply = &row
 	return
 }
 
-// UpdateCollection renames, moves or reorders a folder: name, parent and
+// updateCollection renames, moves or reorders a folder: name, parent and
 // before, each optional. Its documents stay as they are.
-func ( handlers *Handlers ) UpdateCollection( c fiber.Ctx ) ( err error ) {
-	_ , change , done , err := handlers.readCollectionRequest( c )
-	if done { return }
-	id , _ , refused := docAddress( c , false )
+//
+// @route("POST /api/collections/{collection}", summary="Rename, move or reorder a collection",
+//     tag="Documents", errors=(404, 409),
+//     description="Give any of name, parent, before and lock. Its documents are not touched: they stay filed "
+//         "under the same id. Moving a folder into itself or one of its own subfolders is 400 "
+//         "collection_cycle; deeper than max_depth is 400 too_deep.",
+// )
+func ( handlers *Handlers ) updateCollection( c fiber.Ctx , in *updateCollectionRequest ) ( reply *collectionRow , err error ) {
+	change , refused := in.change( in.IfVersion )
+	if refused == nil { refused = in.collectionPath.check() }
+	if refused == nil { refused = handlers.checkScope( c , in.Collection , true ) }
 	if refused != nil {
-		err = refused.send( c )
+		err = refused
 		return
 	}
-	if refused = handlers.checkScope( c , id , true ); refused != nil {
-		err = refused.send( c )
-		return
-	}
+	id := in.Collection
 	if scope := docScope( c ); scope != nil && ( change.Parent != nil || change.Before != nil ) {
 		// The folder a key is for stays where it is; others move only
 		// within it.
 		if id == scope.Collection {
-			err = forbidden( c , "a scoped key cannot move the collection it is for" )
+			err = refuse( fiber.StatusForbidden , "a scoped key cannot move the collection it is for" )
 			return
 		}
 		if change.Parent != nil {
 			if refused = handlers.checkScope( c , *change.Parent , true ); refused != nil {
-				err = refused.send( c )
+				err = refused
 				return
 			}
 		}
 	}
 	entry , update_err := handlers.Docs.UpdateCollection( docOwner( c ) , id , change , handlers.docLimits() )
 	if update_err != nil {
-		err = handlers.docRefusal( update_err ).send( c )
+		err = handlers.docRefusal( update_err )
 		return
 	}
-	err = c.JSON( collectionRow( entry , false ) )
+	row := newCollectionRow( entry )
+	reply = &row
 	return
 }
 
-// DeleteCollection removes a folder, the folders under it and every document
+type deleteCollectionRequest struct {
+	collectionPath
+	IfVersion *int64 `json:"if_version,omitempty" jsonschema:"minimum=1" jsonschema_description:"Delete only if the collection is at this version." error:"if_version must be 1 or more"`
+}
+
+type deleteCollectionReply struct {
+	Collections []string    `json:"collections" jsonschema_description:"Every folder removed, the one asked for first, parents before children."`
+	Docs        []docChange `json:"docs" jsonschema_description:"The tombstones left."`
+}
+
+// deleteCollection removes a folder, the folders under it and every document
 // in them, each document leaving a tombstone the change feed reports.
-func ( handlers *Handlers ) DeleteCollection( c fiber.Ctx ) ( err error ) {
-	var request deleteDocRequest
-	if c.Bind().JSON( &request ) != nil {
-		err = badRequest( c , "malformed request body" )
-		return
-	}
-	if handlers.Guard.CheckCSRF( c , request.CSRFToken ) == false {
-		err = forbidden( c , "invalid csrf token" )
-		return
-	}
-	id , _ , refused := docAddress( c , false )
+//
+// @route("POST /api/collections/{collection}/delete", summary="Delete a collection and everything in it",
+//     tag="Documents", errors=(404, 409),
+//     description="Removes the folder, every folder under it, and every document in them. Each document leaves "
+//         "a tombstone GET /api/changes reports. To undo: make the folders again with the same ids, then write "
+//         "the documents back with if_version 0.",
+// )
+func ( handlers *Handlers ) deleteCollection( c fiber.Ctx , in *deleteCollectionRequest ) ( reply *deleteCollectionReply , err error ) {
+	refused := in.check()
+	if refused == nil { refused = handlers.checkScope( c , in.Collection , true ) }
 	if refused != nil {
-		err = refused.send( c )
+		err = refused
 		return
 	}
-	if refused = handlers.checkScope( c , id , true ); refused != nil {
-		err = refused.send( c )
-		return
-	}
+	id := in.Collection
 	if scope := docScope( c ); scope != nil && id == scope.Collection {
-		err = forbidden( c , "a scoped key cannot delete the collection it is for" )
+		err = refuse( fiber.StatusForbidden , "a scoped key cannot delete the collection it is for" )
 		return
 	}
-	deleted , delete_err := handlers.Docs.DeleteCollection( docOwner( c ) , id , request.IfVersion )
+	deleted , delete_err := handlers.Docs.DeleteCollection( docOwner( c ) , id , in.IfVersion )
 	if delete_err != nil {
-		err = handlers.docRefusal( delete_err ).send( c )
+		err = handlers.docRefusal( delete_err )
 		return
 	}
 	// The access keys for a folder that is gone go with it, so one can never
 	// reach a later folder that reuses the id.
-	revoked , revoke_err := models.RevokeScopedKeys( handlers.Store , docOwner( c ) , deleted.Collections )
+	revoked , err := models.RevokeScopedKeys( handlers.Store , docOwner( c ) , deleted.Collections )
 	for _ , key_id := range revoked {
 		handlers.audit( c , logs.KindAdmin , "api key revoked: its collection was deleted" , fiber.Map{ "key_id": key_id , "collection": id } )
 	}
-	if revoke_err != nil {
-		err = serverError( c , revoke_err )
-		return
-	}
-	rows := make( []fiber.Map , 0 , len( deleted.Docs ) )
+	if err != nil { return }
+	rows := make( []docChange , 0 , len( deleted.Docs ) )
 	for _ , doc := range deleted.Docs {
-		row := docRow( doc , false )
-		row[ "deleted" ] = true
-		rows = append( rows , row )
+		rows = append( rows , newDocChange( doc , true ) )
 	}
-	err = c.JSON( fiber.Map{ "collections": deleted.Collections , "docs": rows } )
+	reply = &deleteCollectionReply{ Collections: deleted.Collections , Docs: rows }
 	return
 }
 
-// ListDocs is one page of a collection's documents, by id. ?include_body=true
+type listDocsRequest struct {
+	collectionPath
+	Page
+	IncludeBody string `json:"include_body,omitempty" query:"include_body" jsonschema:"enum=true" jsonschema_description:"Add each document's ciphertext." error:"include_body must be true"`
+}
+
+type listDocsReply struct {
+	Docs []docListRow `json:"docs"`
+	Paged
+}
+
+// listDocs is one page of a collection's documents, by id. ?include_body=true
 // adds each one's ciphertext, so a client can fetch a collection in pages
 // rather than one document at a time.
-func ( handlers *Handlers ) ListDocs( c fiber.Ctx ) ( err error ) {
-	collection , _ , refused := docAddress( c , false )
-	if refused == nil {
-		refused = handlers.checkScope( c , collection , false )
+//
+// @route("GET /api/collections/{collection}/docs", summary="A collection's documents", tag="Documents",
+//     description="Live documents by id. Deleted ones are left out; GET /api/changes reports them.",
+// )
+func ( handlers *Handlers ) listDocs( c fiber.Ctx , in *listDocsRequest ) ( reply *listDocsReply , err error ) {
+	refused := in.check()
+	if refused == nil { refused = handlers.checkScope( c , in.Collection , false ) }
+	if refused != nil {
+		err = refused
+		return
 	}
-	if refused == nil {
-		var limit , offset int
-		limit , offset , refused = pageQuery( c )
-		if refused == nil {
-			with_bodies := c.Query( "include_body" ) == "true"
-			docs , total , list_err := handlers.Docs.List( docOwner( c ) , collection , offset , limit , with_bodies )
-			if list_err != nil {
-				err = serverError( c , list_err )
-				return
-			}
-			rows := make( []fiber.Map , 0 , len( docs ) )
-			for _ , doc := range docs {
-				rows = append( rows , docRow( doc , with_bodies ) )
-			}
-			err = c.JSON( fiber.Map{ "docs": rows , "next": next( offset , len( rows ) , total ) , "total": total } )
-			return
-		}
+	with_bodies := in.IncludeBody == "true"
+	docs , total , err := handlers.Docs.List( docOwner( c ) , in.Collection , in.Offset , pageLimit( in.Page ) , with_bodies )
+	if err != nil { return }
+	rows := make( []docListRow , 0 , len( docs ) )
+	for _ , doc := range docs {
+		row := docListRow{ docMeta: newDocMeta( doc ) }
+		if with_bodies { row.Body = base64.StdEncoding.EncodeToString( doc.Body ) }
+		rows = append( rows , row )
 	}
-	err = refused.send( c )
+	reply = &listDocsReply{ Docs: rows , Paged: pagedOf( in.Page , len( rows ) , total ) }
 	return
 }
 
-// GetDoc is one document with its ciphertext.
-func ( handlers *Handlers ) GetDoc( c fiber.Ctx ) ( err error ) {
-	collection , id , refused := docAddress( c , true )
+// getDoc is one document with its ciphertext.
+//
+// @route("GET /api/collections/{collection}/docs/{doc_id}", summary="One document", tag="Documents",
+//     errors=(404,),
+// )
+func ( handlers *Handlers ) getDoc( c fiber.Ctx , in *docPath ) ( reply *docWithBody , err error ) {
+	refused := in.check()
+	if refused == nil { refused = handlers.checkScope( c , in.Collection , false ) }
 	if refused != nil {
-		err = refused.send( c )
+		err = refused
 		return
 	}
-	if refused = handlers.checkScope( c , collection , false ); refused != nil {
-		err = refused.send( c )
-		return
-	}
-	doc , get_err := handlers.Docs.Get( docOwner( c ) , collection , id )
+	doc , get_err := handlers.Docs.Get( docOwner( c ) , in.Collection , in.DocID )
 	if get_err != nil {
-		err = handlers.docRefusal( get_err ).send( c )
+		err = handlers.docRefusal( get_err )
 		return
 	}
-	err = c.JSON( docRow( doc , true ) )
+	reply = &docWithBody{ docMeta: newDocMeta( doc ) , Body: base64.StdEncoding.EncodeToString( doc.Body ) }
 	return
 }
 
 type setDocRequest struct {
-	Body      string `json:"body"`
-	IfVersion *int64 `json:"if_version"`
-	CSRFToken string `json:"csrf_token"`
+	docPath
+	Body      string `json:"body" jsonschema_description:"Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it." error:"body must be a base64 v1 or v2 envelope (see README.md); the server stores ciphertext only"`
+	IfVersion *int64 `json:"if_version,omitempty" jsonschema:"minimum=0" jsonschema_description:"Write only if the document is at this version: 0 means only if there is no live document. Absent: unconditional. A mismatch is 409 version_conflict with current_version and live." error:"if_version must be 0 or more"`
 }
 
-type deleteDocRequest struct {
-	IfVersion *int64 `json:"if_version"`
-	CSRFToken string `json:"csrf_token"`
-}
-
-// SetDoc creates or replaces a document. if_version makes it conditional:
-// 0 only if there is no live document, n only if the live one is at n.
-func ( handlers *Handlers ) SetDoc( c fiber.Ctx ) ( err error ) {
-	var request setDocRequest
-	if c.Bind().JSON( &request ) != nil {
-		err = badRequest( c , "malformed request body" )
+// envelope decodes a write's body and checks it is one the server takes.
+func envelope( encoded string ) ( body []byte , refused *refusal ) {
+	body , err := base64.StdEncoding.DecodeString( encoded )
+	if err != nil || docstore.ValidEnvelope( body ) == false {
+		refused = refuse( fiber.StatusBadRequest , "body must be a base64 v1 or v2 envelope (see README.md); the server stores ciphertext only" )
 		return
 	}
-	if handlers.Guard.CheckCSRF( c , request.CSRFToken ) == false {
-		err = forbidden( c , "invalid csrf token" )
-		return
-	}
-	collection , id , refused := docAddress( c , true )
-	if refused != nil {
-		err = refused.send( c )
-		return
-	}
-	if request.IfVersion != nil && *request.IfVersion < 0 {
-		err = badRequest( c , "if_version must be 0 or more" )
-		return
-	}
-	body , decode_err := base64.StdEncoding.DecodeString( request.Body )
-	if decode_err != nil || docstore.ValidEnvelope( body ) == false {
-		err = badRequest( c , "body must be a base64 v1 or v2 envelope (see README.md); the server stores ciphertext only" )
-		return
-	}
-	if refused = handlers.checkScope( c , collection , true ); refused != nil {
-		err = refused.send( c )
-		return
-	}
-	if docScope( c ) != nil && body[ 0 ] != docstore.EnvelopeV2 {
-		err = badRequest( c , "a scoped key writes v2 envelopes only" )
-		return
-	}
-	doc , set_err := handlers.Docs.Set( docOwner( c ) , collection , id , body , request.IfVersion , handlers.docLimits() )
-	if set_err != nil {
-		err = handlers.docRefusal( set_err ).send( c )
-		return
-	}
-	err = c.JSON( docRow( doc , false ) )
 	return
 }
 
-// DeleteDoc deletes a document, leaving a tombstone syncing clients see.
-// Writing it again with if_version 0 brings it back, which is the undo.
-func ( handlers *Handlers ) DeleteDoc( c fiber.Ctx ) ( err error ) {
-	var request deleteDocRequest
-	if c.Bind().JSON( &request ) != nil {
-		err = badRequest( c , "malformed request body" )
-		return
+// setDoc creates or replaces a document. if_version makes it conditional:
+// 0 only if there is no live document, n only if the live one is at n.
+//
+// @route("POST /api/collections/{collection}/docs/{doc_id}", summary="Create or replace a document",
+//     tag="Documents", errors=(409, 413),
+//     description="Too big is 413 doc_too_large (with max_bytes), over your quota 413 quota_exceeded (with "
+//         "quota_bytes).",
+// )
+func ( handlers *Handlers ) setDoc( c fiber.Ctx , in *setDocRequest ) ( reply *docMeta , err error ) {
+	refused := in.check()
+	var body []byte
+	if refused == nil { body , refused = envelope( in.Body ) }
+	if refused == nil { refused = handlers.checkScope( c , in.Collection , true ) }
+	if refused == nil && docScope( c ) != nil && body[ 0 ] != docstore.EnvelopeV2 {
+		refused = refuse( fiber.StatusBadRequest , "a scoped key writes v2 envelopes only" )
 	}
-	if handlers.Guard.CheckCSRF( c , request.CSRFToken ) == false {
-		err = forbidden( c , "invalid csrf token" )
-		return
-	}
-	collection , id , refused := docAddress( c , true )
 	if refused != nil {
-		err = refused.send( c )
+		err = refused
 		return
 	}
-	if refused = handlers.checkScope( c , collection , true ); refused != nil {
-		err = refused.send( c )
+	doc , set_err := handlers.Docs.Set( docOwner( c ) , in.Collection , in.DocID , body , in.IfVersion , handlers.docLimits() )
+	if set_err != nil {
+		err = handlers.docRefusal( set_err )
 		return
 	}
-	doc , delete_err := handlers.Docs.Delete( docOwner( c ) , collection , id , request.IfVersion )
+	meta := newDocMeta( doc )
+	reply = &meta
+	return
+}
+
+type deleteDocRequest struct {
+	docPath
+	IfVersion *int64 `json:"if_version,omitempty" jsonschema:"minimum=1" jsonschema_description:"Delete only if the document is at this version. Absent: unconditional." error:"if_version must be 1 or more"`
+}
+
+// deleteDoc deletes a document, leaving a tombstone syncing clients see.
+// Writing it again with if_version 0 brings it back, which is the undo.
+//
+// @route("POST /api/collections/{collection}/docs/{doc_id}/delete", summary="Delete a document",
+//     tag="Documents", errors=(404, 409),
+//     description="Leaves a tombstone that GET /api/changes reports for docs.tombstone_days. Writing the "
+//         "document again with if_version 0 brings it back.",
+// )
+func ( handlers *Handlers ) deleteDoc( c fiber.Ctx , in *deleteDocRequest ) ( reply *docChange , err error ) {
+	refused := in.check()
+	if refused == nil { refused = handlers.checkScope( c , in.Collection , true ) }
+	if refused != nil {
+		err = refused
+		return
+	}
+	doc , delete_err := handlers.Docs.Delete( docOwner( c ) , in.Collection , in.DocID , in.IfVersion )
 	if delete_err != nil {
-		err = handlers.docRefusal( delete_err ).send( c )
+		err = handlers.docRefusal( delete_err )
 		return
 	}
-	row := docRow( doc , false )
-	row[ "deleted" ] = true
-	err = c.JSON( row )
+	change := newDocChange( doc , true )
+	reply = &change
 	return
 }
 
 type moveDocRequest struct {
-	ToCollection string `json:"to_collection"`
-	ToID         string `json:"to_id"`
-	Body         string `json:"body"`
-	IfVersion    *int64 `json:"if_version"`
-	CSRFToken    string `json:"csrf_token"`
+	docPath
+	ToCollection string `json:"to_collection" jsonschema:"minLength=1,maxLength=64" jsonschema_description:"The destination collection's id. It must exist." error:"to_collection must be 1-64 of A-Z a-z 0-9 _ -"`
+	ToID         string `json:"to_id,omitempty" jsonschema:"maxLength=128" jsonschema_description:"The document's id there. Default: the same id." error:"to_id must be 1-128 of A-Z a-z 0-9 _ - ."`
+	Body         string `json:"body" jsonschema_description:"Standard base64 of the document's v1 or v2 envelope, sealed for to_collection and to_id. See README.md." error:"body must be a base64 v1 or v2 envelope (see README.md); the server stores ciphertext only"`
+	IfVersion    *int64 `json:"if_version,omitempty" jsonschema:"minimum=1" jsonschema_description:"Move only if the source is at this version." error:"if_version must be 1 or more"`
 }
 
-// MoveDoc moves a document to another folder (or id) in one step. The body
+type moveDocReply struct {
+	Doc     docMeta   `json:"doc" jsonschema_description:"The document in its new place."`
+	Deleted docChange `json:"deleted" jsonschema_description:"The tombstone left where it was."`
+}
+
+// moveDoc moves a document to another folder (or id) in one step. The body
 // is the document sealed again by the client for its new place, since the
 // old ciphertext is bound to the old one. if_version is the source's.
-func ( handlers *Handlers ) MoveDoc( c fiber.Ctx ) ( err error ) {
-	var request moveDocRequest
-	if c.Bind().JSON( &request ) != nil {
-		err = badRequest( c , "malformed request body" )
-		return
+//
+// @route("POST /api/collections/{collection}/docs/{doc_id}/move", summary="Move a document to another collection",
+//     tag="Documents", errors=(404, 409, 413),
+//     description="In one step: the document is written at to_collection/to_id and the old one becomes a "
+//         "tombstone. A document's ciphertext is bound to its collection and id, so the client opens it and "
+//         "seals it again for the new place, and sends that as body. 409 version_conflict: the source is not at "
+//         "if_version, or a live document is already at the destination. 404: no such document, or no such "
+//         "destination collection.",
+// )
+func ( handlers *Handlers ) moveDoc( c fiber.Ctx , in *moveDocRequest ) ( reply *moveDocReply , err error ) {
+	to_id := in.ToID
+	if to_id == "" { to_id = in.DocID }
+	refused := in.check()
+	if refused == nil && docstore.ValidCollection( in.ToCollection ) == false {
+		refused = refuse( fiber.StatusBadRequest , "to_collection must be 1-64 of A-Z a-z 0-9 _ -" )
 	}
-	if handlers.Guard.CheckCSRF( c , request.CSRFToken ) == false {
-		err = forbidden( c , "invalid csrf token" )
-		return
+	if refused == nil && docstore.ValidDocID( to_id ) == false {
+		refused = refuse( fiber.StatusBadRequest , "to_id must be 1-128 of A-Z a-z 0-9 _ - ." )
 	}
-	collection , id , refused := docAddress( c , true )
+	var body []byte
+	if refused == nil { body , refused = envelope( in.Body ) }
+	for _ , place := range []string{ in.Collection , in.ToCollection } {
+		if refused == nil { refused = handlers.checkScope( c , place , true ) }
+	}
+	if refused == nil && docScope( c ) != nil && body[ 0 ] != docstore.EnvelopeV2 {
+		refused = refuse( fiber.StatusBadRequest , "a scoped key writes v2 envelopes only" )
+	}
 	if refused != nil {
-		err = refused.send( c )
+		err = refused
 		return
 	}
-	to_id := request.ToID
-	if to_id == "" { to_id = id }
-	if docstore.ValidCollection( request.ToCollection ) == false {
-		err = badRequest( c , "to_collection must be 1-64 of A-Z a-z 0-9 _ -" )
-		return
-	}
-	if docstore.ValidDocID( to_id ) == false {
-		err = badRequest( c , "to_id must be 1-128 of A-Z a-z 0-9 _ - ." )
-		return
-	}
-	if request.IfVersion != nil && *request.IfVersion < 1 {
-		err = badRequest( c , "if_version must be 1 or more" )
-		return
-	}
-	body , decode_err := base64.StdEncoding.DecodeString( request.Body )
-	if decode_err != nil || docstore.ValidEnvelope( body ) == false {
-		err = badRequest( c , "body must be a base64 v1 or v2 envelope (see README.md); the server stores ciphertext only" )
-		return
-	}
-	for _ , place := range []string{ collection , request.ToCollection } {
-		if refused = handlers.checkScope( c , place , true ); refused != nil {
-			err = refused.send( c )
-			return
-		}
-	}
-	if docScope( c ) != nil && body[ 0 ] != docstore.EnvelopeV2 {
-		err = badRequest( c , "a scoped key writes v2 envelopes only" )
-		return
-	}
-	moved , gone , move_err := handlers.Docs.MoveDoc( docOwner( c ) , collection , id , request.ToCollection , to_id , body , request.IfVersion , handlers.docLimits() )
+	moved , gone , move_err := handlers.Docs.MoveDoc( docOwner( c ) , in.Collection , in.DocID , in.ToCollection , to_id , body , in.IfVersion , handlers.docLimits() )
 	if move_err != nil {
-		err = handlers.docRefusal( move_err ).send( c )
+		err = handlers.docRefusal( move_err )
 		return
 	}
-	deleted := docRow( gone , false )
-	deleted[ "deleted" ] = true
-	err = c.JSON( fiber.Map{ "doc": docRow( moved , false ) , "deleted": deleted } )
+	reply = &moveDocReply{ Doc: newDocMeta( moved ) , Deleted: newDocChange( gone , true ) }
 	return
 }
 
-// ListChanges is the sync feed: everything in the caller's account that
+type listChangesRequest struct {
+	Since int64 `json:"since,omitempty" query:"since" jsonschema:"minimum=0" jsonschema_description:"The next_since of your last call. Default 0: everything." error:"since must be 0 or more"`
+	Limit int   `json:"limit,omitempty" query:"limit" jsonschema:"minimum=1,maximum=1000,default=200" jsonschema_description:"Changes to return. Default 200." error:"limit must be 1-1000"`
+}
+
+type listChangesReply struct {
+	Changes   []docChange `json:"changes"`
+	NextSince int64       `json:"next_since" jsonschema_description:"Pass as since next time."`
+	More      bool        `json:"more" jsonschema_description:"Another page is waiting."`
+}
+
+// listChanges is the sync feed: everything in the caller's account that
 // changed after ?since=, oldest first, deletes included, without bodies.
 // Keep calling with next_since while more is true.
-func ( handlers *Handlers ) ListChanges( c fiber.Ctx ) ( err error ) {
-	limit , _ , refused := pageQuery( c )
-	if refused != nil {
-		err = refused.send( c )
-		return
-	}
-	var since int64
-	if raw := c.Query( "since" ); raw != "" {
-		parsed , parse_err := strconv.ParseInt( raw , 10 , 64 )
-		if parse_err != nil || parsed < 0 {
-			err = badRequest( c , "since must be 0 or more" )
-			return
-		}
-		since = parsed
-	}
+//
+// @route("GET /api/changes", summary="What changed since you last synced", tag="Documents", errors=(410,),
+//     description="Every write and delete in your account after change number since, oldest first, without "
+//         "bodies. Start from 0, keep calling with next_since while more is true, and save next_since for next "
+//         "time. 410 sync_expired: deletes you never saw have been purged; start again from 0.",
+// )
+func ( handlers *Handlers ) listChanges( c fiber.Ctx , in *listChangesRequest ) ( reply *listChangesReply , err error ) {
+	limit := in.Limit
+	if limit == 0 { limit = pageDefault }
 	root := ""
 	if scope := docScope( c ); scope != nil {
-		if refused = handlers.checkScopeRoot( c ); refused != nil {
-			err = refused.send( c )
+		if refused := handlers.checkScopeRoot( c ); refused != nil {
+			err = refused
 			return
 		}
 		root = scope.Collection
 	}
-	changes , more , changes_err := handlers.Docs.ChangesIn( docOwner( c ) , root , since , limit )
+	changes , more , changes_err := handlers.Docs.ChangesIn( docOwner( c ) , root , in.Since , limit )
 	if changes_err != nil {
-		err = handlers.docRefusal( changes_err ).send( c )
+		err = handlers.docRefusal( changes_err )
 		return
 	}
-	rows := make( []fiber.Map , 0 , len( changes ) )
-	next_since := since
+	rows := make( []docChange , 0 , len( changes ) )
+	next_since := in.Since
 	for _ , doc := range changes {
-		row := docRow( doc , false )
-		row[ "deleted" ] = doc.Deleted
-		rows = append( rows , row )
+		rows = append( rows , newDocChange( doc , doc.Deleted ) )
 		next_since = doc.Seq
 	}
-	err = c.JSON( fiber.Map{ "changes": rows , "next_since": next_since , "more": more } )
+	reply = &listChangesReply{ Changes: rows , NextSince: next_since , More: more }
 	return
 }
 
-// GetKeyring is the caller's wrapped master key, for unlocking with a
+type keyringReply struct {
+	Keyring   string    `json:"keyring" jsonschema_description:"JSON text; see README.md, Keyring."`
+	Version   int64     `json:"version"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// getKeyring is the caller's wrapped master key, for unlocking with a
 // passphrase. It is useless without the passphrase; see README.md.
-func ( handlers *Handlers ) GetKeyring( c fiber.Ctx ) ( err error ) {
-	keyring , get_err := handlers.Docs.GetKeyring( docOwner( c ) )
-	if errors.Is( get_err , docstore.ErrNotFound ) {
-		err = notFound( c , "no keyring" )
+//
+// @route("GET /api/keyring", summary="Your wrapped master key", tag="Documents", errors=(404,),
+//     description="The master key sealed under a key derived from your passphrase (Argon2id), stored as the "
+//         "client wrote it. Useless without the passphrase. 404 when no passphrase has been set.",
+// )
+func ( handlers *Handlers ) getKeyring( c fiber.Ctx , in *apidoc.None ) ( reply *keyringReply , err error ) {
+	keyring , err := handlers.Docs.GetKeyring( docOwner( c ) )
+	if errors.Is( err , docstore.ErrNotFound ) {
+		err = refuse( fiber.StatusNotFound , "no keyring" )
 		return
 	}
-	if get_err != nil {
-		err = serverError( c , get_err )
-		return
-	}
-	err = c.JSON( fiber.Map{ "keyring": keyring.Body , "version": keyring.Version , "updated_at": keyring.UpdatedAt } )
+	if err != nil { return }
+	reply = &keyringReply{ Keyring: keyring.Body , Version: keyring.Version , UpdatedAt: keyring.UpdatedAt }
 	return
 }
 
 type setKeyringRequest struct {
-	Keyring   string `json:"keyring"`
-	IfVersion *int64 `json:"if_version"`
-	CSRFToken string `json:"csrf_token"`
+	Keyring   string `json:"keyring" jsonschema:"minLength=1,maxLength=4096" jsonschema_description:"JSON text; see README.md, Keyring." error:"keyring must be 1-4096 bytes"`
+	IfVersion *int64 `json:"if_version,omitempty" jsonschema:"minimum=0" jsonschema_description:"0: only if none is set yet. n: only if the stored one is at n." error:"if_version must be 0 or more"`
 }
 
-// SetKeyring stores a new wrapped master key: a passphrase set or changed.
-func ( handlers *Handlers ) SetKeyring( c fiber.Ctx ) ( err error ) {
-	var request setKeyringRequest
-	if c.Bind().JSON( &request ) != nil {
-		err = badRequest( c , "malformed request body" )
-		return
-	}
-	if handlers.Guard.CheckCSRF( c , request.CSRFToken ) == false {
-		err = forbidden( c , "invalid csrf token" )
-		return
-	}
-	if request.IfVersion != nil && *request.IfVersion < 0 {
-		err = badRequest( c , "if_version must be 0 or more" )
-		return
-	}
-	keyring , set_err := handlers.Docs.SetKeyring( docOwner( c ) , request.Keyring , request.IfVersion )
+type setKeyringReply struct {
+	Version   int64     `json:"version"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// setKeyring stores a new wrapped master key: a passphrase set or changed.
+//
+// @route("POST /api/keyring", summary="Set or change your passphrase", tag="Documents", errors=(409,),
+//     description="Stores a new wrapped master key. Documents are not re-encrypted: they stay under the same "
+//         "master key.",
+// )
+func ( handlers *Handlers ) setKeyring( c fiber.Ctx , in *setKeyringRequest ) ( reply *setKeyringReply , err error ) {
+	keyring , set_err := handlers.Docs.SetKeyring( docOwner( c ) , in.Keyring , in.IfVersion )
 	if errors.Is( set_err , docstore.ErrTooLarge ) {
-		err = badRequest( c , "keyring must be 1-" + strconv.Itoa( docstore.KeyringMaxBytes ) + " bytes" )
+		err = refuse( fiber.StatusBadRequest , "keyring must be 1-" + strconv.Itoa( docstore.KeyringMaxBytes ) + " bytes" )
 		return
 	}
 	if set_err != nil {
-		err = handlers.docRefusal( set_err ).send( c )
+		err = handlers.docRefusal( set_err )
 		return
 	}
 	handlers.audit( c , logs.KindAuth , "keyring set" , fiber.Map{ "version": keyring.Version } )
-	err = c.JSON( fiber.Map{ "version": keyring.Version , "updated_at": keyring.UpdatedAt } )
+	reply = &setKeyringReply{ Version: keyring.Version , UpdatedAt: keyring.UpdatedAt }
 	return
 }

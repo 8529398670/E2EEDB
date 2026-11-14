@@ -73,14 +73,13 @@ Every write and delete in your account after change number since, oldest first, 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
 | `since` | query | integer | no | at least 0 | The next_since of your last call. Default 0: everything. |
-| `limit` | query | integer | no | 1 to 1000 | Changes to return. Default 200. |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Changes to return. Default 200. |
 
 **Reply 200**: Success
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `changes` | array of [`DocMeta`](#docmeta) + object | yes |  |  |
-| `changes[].deleted` | boolean | yes |  | The document was deleted: drop your copy. |
+| `changes` | array of [`DocChange`](#docchange) | yes |  |  |
 | `more` | boolean | yes |  | Another page is waiting. |
 | `next_since` | integer | yes |  | Pass as since next time. |
 
@@ -99,16 +98,24 @@ Every collection (folder) in your account, each parent's children together in th
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `limit` | query | integer | no | 1 to 1000 | Rows to return. Default 200. |
-| `offset` | query | integer | no | at least 0 |  |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
+| `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
 
 **Reply 200**: Success
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `collections` | array of [`Collection`](#collection) + object | yes |  |  |
+| `collections` | array of object | yes |  |  |
+| `collections[].by_key` | string | no |  | Present when the collection was made through an access token: the id of that scoped API key. The Go client will not write the account's own documents into such a collection unless asked to (client.AllowShared). |
 | `collections[].bytes` | integer | yes |  | Their ciphertext, in bytes. |
 | `collections[].count` | integer | yes |  | Its own live documents, not its subfolders'. |
+| `collections[].id` | string | yes |  | What its documents are filed under and their encryption is bound to. Never changes. |
+| `collections[].lock` | string | no |  | The collection's lockbox: its own keys, wrapped by the client for its parent (or the master key at the top level). Opaque to the server. Absent until a client gives the collection keys. See README.md, Crypto format. |
+| `collections[].name` | string | yes |  | Shown name, unique among its siblings ignoring case. A collection made by writing a document is named after its id. |
+| `collections[].parent` | string | yes |  | The parent's id; "" for the top level. |
+| `collections[].position` | integer | yes |  | Place among its siblings, from 0. |
+| `collections[].updated_at` | string (date-time) | yes |  |  |
+| `collections[].version` | integer | yes |  | Goes up by one on every rename or move. |
 | `doc_count` | integer | yes |  |  |
 | `max_collections` | integer | yes |  | Most folders an account may have. |
 | `max_depth` | integer | yes |  | How deep folders may nest; a top-level folder is depth 1. |
@@ -134,12 +141,12 @@ A folder, empty until a document is written into it. Writing a document into an 
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `before` | string | no |  | The sibling to go in front of. Default: at the end. |
+| `before` | string or null | no |  | The sibling to go in front of; "" or absent for the end. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `id` | string | no |  | 1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key may only send a random 22-character id (client.NewID), so it cannot take an id the account's own code writes to by name. |
-| `lock` | string | no | at most 2048 characters | The new collection's lockbox, wrapped for parent. |
-| `name` | string | no |  | 1-128 characters, no control characters, no space at either end. Default: the id. |
-| `parent` | string | no |  | Parent's id. Default "": the top level. |
+| `id` | string | no | at most 64 characters | 1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key may only send a random 22-character id (client.NewID), so it cannot take an id the account's own code writes to by name. |
+| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by). |
+| `name` | string or null | no |  | 1-128 characters, no control characters, no space at either end. |
+| `parent` | string or null | no |  | Parent's id; "" for the top level. |
 
 **Reply 200**: Success
 
@@ -160,18 +167,18 @@ Give any of name, parent, before and lock. Its documents are not touched: they s
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `collection` | path | string | yes |  | The collection's id. |
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
 
 **Request body**
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `before` | string | no |  | The sibling to go in front of; "" for the end. Read when parent or before is given. |
+| `before` | string or null | no |  | The sibling to go in front of; "" or absent for the end. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
 | `if_version` | integer or null | no | at least 1 | Change only if the collection is at this version. |
-| `lock` | string | no | at most 2048 characters | A lockbox: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by). |
-| `name` | string | no |  | New name. |
-| `parent` | string | no |  | New parent's id; "" for the top level. |
+| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by). |
+| `name` | string or null | no |  | 1-128 characters, no control characters, no space at either end. |
+| `parent` | string or null | no |  | Parent's id; "" for the top level. |
 
 **Reply 200**: Success
 
@@ -192,7 +199,7 @@ Removes the folder, every folder under it, and every document in them. Each docu
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `collection` | path | string | yes |  | The collection's id. |
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
 
 **Request body**
 
@@ -206,8 +213,7 @@ Removes the folder, every folder under it, and every document in them. Each docu
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `collections` | array of string | yes |  | Every folder removed, the one asked for first, parents before children. |
-| `docs` | array of [`DocMeta`](#docmeta) + object | yes |  | The tombstones left. |
-| `docs[].deleted` | boolean | yes |  | The document was deleted: drop your copy. |
+| `docs` | array of [`DocChange`](#docchange) | yes |  | The tombstones left. |
 
 ### GET /api/collections/{collection}/docs
 
@@ -224,17 +230,23 @@ Live documents by id. Deleted ones are left out; GET /api/changes reports them.
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `collection` | path | string | yes |  | 1-64 of A-Z a-z 0-9 _ - |
-| `limit` | query | integer | no | 1 to 1000 | Rows to return. Default 200. |
-| `offset` | query | integer | no | at least 0 |  |
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
+| `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
 | `include_body` | query | string | no | one of `true` | Add each document's ciphertext. |
 
 **Reply 200**: Success
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `docs` | array of [`DocMeta`](#docmeta) + object | yes |  |  |
-| `docs[].body` | string | no |  | Only with include_body=true. Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it. |
+| `docs` | array of object | yes |  |  |
+| `docs[].body` | string | no |  | Only with include_body=true. Standard base64 (with padding) of the client's envelope (see Doc). |
+| `docs[].collection` | string | yes |  |  |
+| `docs[].id` | string | yes |  |  |
+| `docs[].seq` | integer | yes |  | Change number, for GET /api/changes?since=. |
+| `docs[].size` | integer | yes |  | Bytes of ciphertext; 0 for a delete. |
+| `docs[].updated_at` | string (date-time) | yes |  |  |
+| `docs[].version` | integer | yes |  | Goes up by one on every write and delete. |
 | `next` | integer or null | yes |  | Offset of the next page, or null on the last one. |
 | `total` | integer | yes |  |  |
 
@@ -251,16 +263,12 @@ One document
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `collection` | path | string | yes |  | 1-64 of A-Z a-z 0-9 _ - |
-| `doc_id` | path | string | yes |  | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
+| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
 
 **Reply 200**: Success
 
-Every field of [`DocMeta`](#docmeta), plus these:
-
-| Field | Type | Required | Limits | Description |
-|---|---|---|---|---|
-| `body` | string | yes |  | Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it. |
+[`Doc`](#doc).
 
 ### POST /api/collections/{collection}/docs/{doc_id}
 
@@ -277,8 +285,8 @@ Too big is 413 doc_too_large (with max_bytes), over your quota 413 quota_exceede
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `collection` | path | string | yes |  | 1-64 of A-Z a-z 0-9 _ - |
-| `doc_id` | path | string | yes |  | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
+| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
 
 **Request body**
 
@@ -307,8 +315,8 @@ Leaves a tombstone that GET /api/changes reports for docs.tombstone_days. Writin
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `collection` | path | string | yes |  | 1-64 of A-Z a-z 0-9 _ - |
-| `doc_id` | path | string | yes |  | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
+| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
 
 **Request body**
 
@@ -319,11 +327,7 @@ Leaves a tombstone that GET /api/changes reports for docs.tombstone_days. Writin
 
 **Reply 200**: Success
 
-Every field of [`DocMeta`](#docmeta), plus these:
-
-| Field | Type | Required | Limits | Description |
-|---|---|---|---|---|
-| `deleted` | boolean | yes |  | The document was deleted: drop your copy. |
+[`DocChange`](#docchange).
 
 ### POST /api/collections/{collection}/docs/{doc_id}/move
 
@@ -340,8 +344,8 @@ In one step: the document is written at to_collection/to_id and the old one beco
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `collection` | path | string | yes |  | 1-64 of A-Z a-z 0-9 _ - |
-| `doc_id` | path | string | yes |  | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
+| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
 
 **Request body**
 
@@ -350,15 +354,14 @@ In one step: the document is written at to_collection/to_id and the old one beco
 | `body` | string | yes |  | Standard base64 of the document's v1 or v2 envelope, sealed for to_collection and to_id. See README.md. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
 | `if_version` | integer or null | no | at least 1 | Move only if the source is at this version. |
-| `to_collection` | string | yes |  | The destination collection's id. It must exist. |
-| `to_id` | string | no |  | The document's id there. Default: the same id. |
+| `to_collection` | string | yes | 1 to 64 characters | The destination collection's id. It must exist. |
+| `to_id` | string | no | at most 128 characters | The document's id there. Default: the same id. |
 
 **Reply 200**: Success
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `deleted` | [`DocMeta`](#docmeta) + object | yes |  | The tombstone left where it was. |
-| `deleted.deleted` | boolean | yes |  | The document was deleted: drop your copy. |
+| `deleted` | [`DocChange`](#docchange) | yes |  | The tombstone left where it was. |
 | `doc` | [`DocMeta`](#docmeta) | yes |  | The document in its new place. |
 
 ### GET /api/keyring
@@ -412,13 +415,13 @@ Stores a new wrapped master key. Documents are not re-encrypted: they stay under
 |---|---|---|---|
 | POST | [`/api/account/login-link`](#post-apiaccountlogin-link) | A login link for yourself | browser session or API key, anyone signed in |
 | POST | [`/api/account/login-link/cancel`](#post-apiaccountlogin-linkcancel) | Stop your own login link working | browser session or API key, anyone signed in |
-| POST | [`/api/account/rename`](#post-apiaccountrename) | Change your display name | browser session or API key, anyone signed in |
+| POST | [`/api/account/rename`](#post-apiaccountrename) | Rename your account | browser session or API key, anyone signed in |
 | GET | [`/api/account/sessions`](#get-apiaccountsessions) | Your signed-in devices | browser session or API key, anyone signed in |
 | POST | [`/api/account/sessions/revoke-others`](#post-apiaccountsessionsrevoke-others) | Sign out every other device | browser session or API key, anyone signed in |
 | POST | [`/api/account/sessions/{session_id}/label`](#post-apiaccountsessionssession_idlabel) | Name one of your devices | browser session or API key, anyone signed in |
-| POST | [`/api/account/sessions/{session_id}/revoke`](#post-apiaccountsessionssession_idrevoke) | Sign out one device | browser session or API key, anyone signed in |
+| POST | [`/api/account/sessions/{session_id}/revoke`](#post-apiaccountsessionssession_idrevoke) | Sign out one of your devices | browser session or API key, anyone signed in |
 | POST | [`/api/account/shortcuts`](#post-apiaccountshortcuts) | Change your keyboard shortcuts | browser session or API key, anyone signed in |
-| POST | [`/api/account/theme`](#post-apiaccounttheme) | Pick which theme you use | browser session or API key, anyone signed in |
+| POST | [`/api/account/theme`](#post-apiaccounttheme) | Pick your theme | browser session or API key, anyone signed in |
 | POST | [`/api/account/themes`](#post-apiaccountthemes) | Replace your own themes | browser session or API key, anyone signed in |
 | POST | [`/api/account/two-factor/confirm`](#post-apiaccounttwo-factorconfirm) | Turn two-factor on | browser session only, anyone signed in |
 | POST | [`/api/account/two-factor/disable`](#post-apiaccounttwo-factordisable) | Turn two-factor off | browser session only, anyone signed in |
@@ -427,11 +430,13 @@ Stores a new wrapped master key. Documents are not re-encrypted: they stay under
 | POST | [`/api/logout`](#post-apilogout) | Sign out | browser session or API key, anyone signed in |
 | POST | [`/api/logs/events`](#post-apilogsevents) | Record what happened on the page | browser session or API key, anyone signed in |
 | GET | [`/api/me`](#get-apime) | Who am I | browser session or API key, anyone signed in |
-| GET | [`/api/team`](#get-apiteam) | Everyone's names | browser session or API key, anyone signed in |
+| GET | [`/api/team`](#get-apiteam) | List team | browser session or API key, anyone signed in |
 
 ### POST /api/account/login-link
 
 A login link for yourself
+
+A link that signs your own account in on a browser or another device. Only a key with your account's full role may ask: one scoped down to user on an admin account is refused.
 
 |  |  |
 |---|---|
@@ -443,8 +448,8 @@ A login link for yourself
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `expires_in_minutes` | integer | no | 0 to 525600 | 0 never expires. Default auth.login_token_ttl_seconds for a link that works once, auth.multi_use_login_token_ttl_seconds otherwise. |
-| `max_uses` | integer | no | 0 to 1000 | Sign-ins the link allows: 1-1000, or 0 for unlimited. Default 1. |
+| `expires_in_minutes` | integer or null | no | 0 to 525600 | 0 never expires. Default auth.login_token_ttl_seconds for a link that works once, auth.multi_use_login_token_ttl_seconds otherwise. |
+| `max_uses` | integer or null | no | 0 to 1000 | Sign-ins the link allows: 1-1000, or 0 for unlimited. Default 1. |
 
 **Reply 200**: Success
 
@@ -459,6 +464,8 @@ A login link for yourself
 ### POST /api/account/login-link/cancel
 
 Stop your own login link working
+
+Void your account's live login link without making a new one. Devices it already signed in stay signed in. Answers with removed: 0 or 1.
 
 |  |  |
 |---|---|
@@ -480,7 +487,9 @@ Stop your own login link working
 
 ### POST /api/account/rename
 
-Change your display name
+Rename your account
+
+Change your own display name (1-80 characters). expect, when given, is the name you think it has now; if someone changed it meanwhile the rename is refused with the current name, so nothing is overwritten unseen.
 
 |  |  |
 |---|---|
@@ -492,7 +501,7 @@ Change your display name
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `display_name` | string | yes |  |  |
+| `display_name` | string | yes | 1 to 80 characters |  |
 | `expect` | string or null | no |  |  |
 
 **Reply 200**: Success
@@ -506,6 +515,8 @@ Change your display name
 
 Your signed-in devices
 
+Where your account is signed in, a page at a time: id, when it started and was last seen, the browser, and the name you gave it. Through an API key no device is current. next is the offset of the following page, or null on the last one.
+
 |  |  |
 |---|---|
 | Who may call | browser session or API key, anyone signed in |
@@ -515,8 +526,8 @@ Your signed-in devices
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `limit` | query | integer | no | 1 to 1000 | Rows to return. Default 200. |
-| `offset` | query | integer | no | at least 0 |  |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
+| `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
 
 **Reply 200**: Success
 
@@ -552,7 +563,7 @@ Sign out every other device
 
 Name one of your devices
 
-This device included. Empty clears the name.
+Give one of your devices a name (at most 80 characters; empty clears it). expect, when given, is the name you think it has now.
 
 |  |  |
 |---|---|
@@ -563,15 +574,15 @@ This device included. Empty clears the name.
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `session_id` | path | string | yes |  |  |
+| `session_id` | path | string | yes |  | The device's id, from GET /api/account/sessions or GET /api/admin/users/{user_id}/sessions (list_my_sessions or admin_list_user_sessions over MCP). |
 
 **Request body**
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `expect` | string | no |  | The name you think it has. Answers 409 if it has another. |
-| `label` | string | yes |  | At most 80 characters. |
+| `expect` | string or null | no |  | The name you think it has. Answers 409 if it has another. |
+| `label` | string | yes | at most 80 characters | At most 80 characters. |
 
 **Reply 200**: Success
 
@@ -582,7 +593,9 @@ This device included. Empty clears the name.
 
 ### POST /api/account/sessions/{session_id}/revoke
 
-Sign out one device
+Sign out one of your devices
+
+End one of your signed-in sessions; that browser has to sign in again.
 
 |  |  |
 |---|---|
@@ -593,7 +606,7 @@ Sign out one device
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `session_id` | path | string | yes |  |  |
+| `session_id` | path | string | yes |  | The device's id, from GET /api/account/sessions or GET /api/admin/users/{user_id}/sessions (list_my_sessions or admin_list_user_sessions over MCP). |
 
 **Request body**
 
@@ -610,6 +623,8 @@ Sign out one device
 ### POST /api/account/shortcuts
 
 Change your keyboard shortcuts
+
+Replace your changed keyboard shortcuts: action name to binding, such as "search": "Mod+K" (Mod is Cmd on a Mac, Ctrl elsewhere). Send the whole set; an empty binding switches a key off, and {} puts every key back to its default.
 
 |  |  |
 |---|---|
@@ -632,7 +647,9 @@ Change your keyboard shortcuts
 
 ### POST /api/account/theme
 
-Pick which theme you use
+Pick your theme
+
+Switch to another theme from your list (or the defaults), by its id.
 
 |  |  |
 |---|---|
@@ -656,6 +673,8 @@ Pick which theme you use
 ### POST /api/account/themes
 
 Replace your own themes
+
+Replace your whole list of color themes (1 to 40) and pick the one you use. themes: null goes back to following the app's defaults. A theme is the Theme schema in the API reference (config/openapi.json): id, name, mode light|dark, accent, second, and optional colors as #rrggbb.
 
 |  |  |
 |---|---|
@@ -805,6 +824,8 @@ Record what happened on the page
 
 Who am I
 
+The account this API key belongs to, the role it acts with (role -- never higher than the key's own scope), and the account's own role.
+
 |  |  |
 |---|---|
 | Who may call | browser session or API key, anyone signed in |
@@ -816,7 +837,9 @@ Who am I
 
 ### GET /api/team
 
-Everyone's names
+List team
+
+People with an active account, a page at a time: id and display name.
 
 |  |  |
 |---|---|
@@ -827,8 +850,8 @@ Everyone's names
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `limit` | query | integer | no | 1 to 1000 | Rows to return. Default 200. |
-| `offset` | query | integer | no | at least 0 |  |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
+| `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
 
 **Reply 200**: Success
 
@@ -918,8 +941,8 @@ Every key in the app
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `limit` | query | integer | no | 1 to 1000 | Rows to return. Default 200. |
-| `offset` | query | integer | no | at least 0 |  |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
+| `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
 | `q` | query | string | no |  | Keep keys whose name or owner contains this, in any case. |
 | `live` | query | string | no | one of `true` | Leave out revoked and expired keys. |
 | `sort` | query | string | no | one of `display_name`, `name`, `role`, `last_used_at`, `expires_at`, `created_at` | Field to sort the whole list by. Rows without it go last. |
@@ -952,7 +975,7 @@ Any admin may do this for an ordinary user, and only the owner for another admin
 | `expires_in_days` | integer or null | no | 0 to 3650 | Absent or null: the configured default. 0: never expires. |
 | `name` | string | yes | 1 to 80 characters |  |
 | `role` | string | no | one of `admin`, `user`; default `user` |  |
-| `user_id` | integer | yes |  |  |
+| `user_id` | integer | yes | at least 1 |  |
 
 **Reply 201**: Success
 
@@ -971,7 +994,7 @@ Delete anyone's key
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
@@ -998,7 +1021,7 @@ Change when anyone's key expires
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
@@ -1009,7 +1032,7 @@ Change when anyone's key expires
 
 **Reply 200**: Success
 
-An empty object.
+[`APIKey`](#apikey).
 
 ### POST /api/admin/keys/{key_id}/rename
 
@@ -1024,15 +1047,15 @@ Rename anyone's key
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `expect` | string | no |  | The name you think it has. Answers 409 if it has another. |
-| `name` | string | yes |  | 1-80 characters. |
+| `expect` | string or null | no |  | The name you think it has. Answers 409 if it has another. |
+| `name` | string | yes | 1 to 80 characters | 1-80 characters. |
 
 **Reply 200**: Success
 
@@ -1054,7 +1077,7 @@ Undo deleting anyone's key
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
@@ -1079,7 +1102,7 @@ Revoke anyone's key
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
@@ -1106,8 +1129,8 @@ Your API keys
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `limit` | query | integer | no | 1 to 1000 | Rows to return. Default 200. |
-| `offset` | query | integer | no | at least 0 |  |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
+| `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
 | `q` | query | string | no |  | Keep keys whose name contains this, in any case. |
 | `live` | query | string | no | one of `true` | Leave out revoked and expired keys. |
 | `sort` | query | string | no | one of `name`, `role`, `last_used_at`, `expires_at`, `created_at` | Field to sort the whole list by. Rows without it go last. |
@@ -1138,9 +1161,7 @@ Create an API key
 | `expires_in_days` | integer or null | no | 0 to 3650 | Absent or null: the configured default. 0: never expires. |
 | `name` | string | yes | 1 to 80 characters |  |
 | `role` | string | no | one of `admin`, `user`; default `user` |  |
-| `scope` | object or null | no |  | Limit the key to one collection and the ones under it, read or write. It then reaches only the document routes, and role must be user. 404: no such collection. |
-| `scope.access` | string | yes | one of `read`, `write` |  |
-| `scope.collection` | string | yes |  | The collection's id. |
+| `scope` | [`APIKeyScope`](#apikeyscope) or null | no |  | Limit the key to one collection and the ones under it, read or write. It then reaches only the document routes, and role must be user. 404: no such collection. |
 
 **Reply 201**: Success
 
@@ -1159,7 +1180,7 @@ Delete one of your keys
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
@@ -1186,7 +1207,7 @@ Change when one of your keys expires
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
@@ -1197,7 +1218,7 @@ Change when one of your keys expires
 
 **Reply 200**: Success
 
-An empty object.
+[`APIKey`](#apikey).
 
 ### POST /api/keys/{key_id}/rename
 
@@ -1212,15 +1233,15 @@ Rename one of your keys
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `expect` | string | no |  | The name you think it has. Answers 409 if it has another. |
-| `name` | string | yes |  | 1-80 characters. |
+| `expect` | string or null | no |  | The name you think it has. Answers 409 if it has another. |
+| `name` | string | yes | 1 to 80 characters | 1-80 characters. |
 
 **Reply 200**: Success
 
@@ -1242,7 +1263,7 @@ Undo deleting one of your keys
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
@@ -1267,7 +1288,7 @@ Revoke one of your keys
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `key_id` | path | string | yes |  |  |
+| `key_id` | path | string | yes |  | The key's id, from GET /api/keys (GET /api/admin/keys for anyone's). |
 
 **Request body**
 
@@ -1285,24 +1306,26 @@ Revoke one of your keys
 
 | Method | Path | Summary | Who may call |
 |---|---|---|---|
-| GET | [`/api/admin/theme-defaults`](#get-apiadmintheme-defaults) | The themes everyone without their own list sees | browser session or API key, admins |
+| GET | [`/api/admin/theme-defaults`](#get-apiadmintheme-defaults) | Default themes | browser session or API key, admins |
 | POST | [`/api/admin/theme-defaults`](#post-apiadmintheme-defaults) | Replace the default themes | browser session or API key, admins |
-| GET | [`/api/admin/users`](#get-apiadminusers) | Every account | browser session or API key, admins |
-| POST | [`/api/admin/users`](#post-apiadminusers) | Create an account and its login link | browser session or API key, admins |
+| GET | [`/api/admin/users`](#get-apiadminusers) | List users | browser session or API key, admins |
+| POST | [`/api/admin/users`](#post-apiadminusers) | Create an account | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/cancel-login-link`](#post-apiadminusersuser_idcancel-login-link) | Stop an account's login link working | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/delete`](#post-apiadminusersuser_iddelete) | Delete an account | browser session or API key, admins |
-| POST | [`/api/admin/users/{user_id}/disabled`](#post-apiadminusersuser_iddisabled) | Disable or enable an account | browser session or API key, admins |
+| POST | [`/api/admin/users/{user_id}/disabled`](#post-apiadminusersuser_iddisabled) | Disable or enable a user | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/reissue-login`](#post-apiadminusersuser_idreissue-login) | A new login link for an account | browser session or API key, admins |
-| POST | [`/api/admin/users/{user_id}/rename`](#post-apiadminusersuser_idrename) | Rename someone else | browser session or API key, admins |
+| POST | [`/api/admin/users/{user_id}/rename`](#post-apiadminusersuser_idrename) | Rename someone | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/reset-two-factor`](#post-apiadminusersuser_idreset-two-factor) | Turn off an account's two-factor | browser session or API key, admins |
-| POST | [`/api/admin/users/{user_id}/revoke-access`](#post-apiadminusersuser_idrevoke-access) | End every credential an account holds | browser session or API key, admins |
+| POST | [`/api/admin/users/{user_id}/revoke-access`](#post-apiadminusersuser_idrevoke-access) | Revoke a user's access | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/role`](#post-apiadminusersuser_idrole) | Change an account's role | browser session or API key, admins |
 | GET | [`/api/admin/users/{user_id}/sessions`](#get-apiadminusersuser_idsessions) | An account's signed-in devices | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/sessions/{session_id}/revoke`](#post-apiadminusersuser_idsessionssession_idrevoke) | Sign out one of an account's devices | browser session or API key, admins |
 
 ### GET /api/admin/theme-defaults
 
-The themes everyone without their own list sees
+Default themes
+
+The theme list everyone without their own list sees. themes is null while the built-in ones apply.
 
 |  |  |
 |---|---|
@@ -1318,6 +1341,8 @@ The themes everyone without their own list sees
 ### POST /api/admin/theme-defaults
 
 Replace the default themes
+
+Replace the theme list everyone without their own list sees, 1 to 40 themes in the Theme schema of the API reference. null puts the built-in themes back.
 
 |  |  |
 |---|---|
@@ -1340,7 +1365,9 @@ Replace the default themes
 
 ### GET /api/admin/users
 
-Every account
+List users
+
+Accounts, a page at a time, including disabled ones, with each one's role and which is the owner. next is the offset of the following page, or null on the last one.
 
 |  |  |
 |---|---|
@@ -1351,8 +1378,8 @@ Every account
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `limit` | query | integer | no | 1 to 1000 | Rows to return. Default 200. |
-| `offset` | query | integer | no | at least 0 |  |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
+| `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
 | `q` | query | string | no |  | Keep accounts whose name or username contains this, in any case. |
 | `sort` | query | string | no | one of `display_name`, `role`, `disabled`, `created_at` | Field to sort the whole list by. Rows without it go last. |
 | `dir` | query | string | no | one of `asc`, `desc` | Default asc. |
@@ -1367,7 +1394,9 @@ Every account
 
 ### POST /api/admin/users
 
-Create an account and its login link
+Create an account
+
+Make a new account and its first login link, to hand to the person. role is admin or user. Answers with user_id and the link.
 
 |  |  |
 |---|---|
@@ -1379,10 +1408,10 @@ Create an account and its login link
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `display_name` | string | yes |  |  |
-| `expires_in_minutes` | integer | no | 0 to 525600 | 0 never expires. Default auth.login_token_ttl_seconds for a link that works once, auth.multi_use_login_token_ttl_seconds otherwise. |
-| `max_uses` | integer | no | 0 to 1000 | Sign-ins the link allows: 1-1000, or 0 for unlimited. Default 1. |
-| `role` | string | no | one of `admin`, `user` |  |
+| `display_name` | string | yes | 1 to 80 characters |  |
+| `expires_in_minutes` | integer or null | no | 0 to 525600 | 0 never expires. Default auth.login_token_ttl_seconds for a link that works once, auth.multi_use_login_token_ttl_seconds otherwise. |
+| `max_uses` | integer or null | no | 0 to 1000 | Sign-ins the link allows: 1-1000, or 0 for unlimited. Default 1. |
+| `role` | string | yes | one of `admin`, `user` |  |
 
 **Reply 201**: Success
 
@@ -1399,6 +1428,8 @@ Create an account and its login link
 
 Stop an account's login link working
 
+Void an account's live login link without making a new one: a link that went somewhere it should not have.
+
 |  |  |
 |---|---|
 | Who may call | browser session or API key, admins |
@@ -1408,7 +1439,7 @@ Stop an account's login link working
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
 
 **Request body**
 
@@ -1427,6 +1458,8 @@ Stop an account's login link working
 
 Delete an account
 
+Remove an account for good, with its sessions, login link and API keys.
+
 |  |  |
 |---|---|
 | Who may call | browser session or API key, admins |
@@ -1436,7 +1469,7 @@ Delete an account
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
 
 **Request body**
 
@@ -1453,7 +1486,9 @@ Delete an account
 
 ### POST /api/admin/users/{user_id}/disabled
 
-Disable or enable an account
+Disable or enable a user
+
+Switch an account off (disabled: true) or back on (false). Disabling signs it out everywhere and voids its live login link; its API keys stop working while it is off. Reversible. The owner and your own account cannot be disabled.
 
 |  |  |
 |---|---|
@@ -1464,7 +1499,7 @@ Disable or enable an account
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
 
 **Request body**
 
@@ -1483,6 +1518,8 @@ Disable or enable an account
 
 A new login link for an account
 
+For someone who lost their device or their link: a fresh login link for their account.
+
 |  |  |
 |---|---|
 | Who may call | browser session or API key, admins |
@@ -1492,15 +1529,15 @@ A new login link for an account
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
 
 **Request body**
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `expires_in_minutes` | integer | no | 0 to 525600 | 0 never expires. Default auth.login_token_ttl_seconds for a link that works once, auth.multi_use_login_token_ttl_seconds otherwise. |
-| `max_uses` | integer | no | 0 to 1000 | Sign-ins the link allows: 1-1000, or 0 for unlimited. Default 1. |
+| `expires_in_minutes` | integer or null | no | 0 to 525600 | 0 never expires. Default auth.login_token_ttl_seconds for a link that works once, auth.multi_use_login_token_ttl_seconds otherwise. |
+| `max_uses` | integer or null | no | 0 to 1000 | Sign-ins the link allows: 1-1000, or 0 for unlimited. Default 1. |
 
 **Reply 200**: Success
 
@@ -1514,9 +1551,9 @@ A new login link for an account
 
 ### POST /api/admin/users/{user_id}/rename
 
-Rename someone else
+Rename someone
 
-Only the owner can rename an admin.
+Change another account's display name (1-80 characters). Only the owner renames an admin. expect, when given, is the name you think it has now; if it changed meanwhile the rename is refused with the current name.
 
 |  |  |
 |---|---|
@@ -1527,15 +1564,15 @@ Only the owner can rename an admin.
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
 
 **Request body**
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `display_name` | string | yes |  | 1-80 characters. |
-| `expect` | string | no |  | The name you think they have. Answers 409 if it is another. |
+| `display_name` | string | yes | 1 to 80 characters | 1-80 characters. |
+| `expect` | string or null | no |  | The name you think they have. Answers 409 if it is another. |
 
 **Reply 200**: Success
 
@@ -1548,6 +1585,8 @@ Only the owner can rename an admin.
 
 Turn off an account's two-factor
 
+For someone who lost both their phone and their recovery codes: switches their two-factor sign-in off so a login link lets them in again. Only the owner resets an admin's; the owner's is reset from a shell.
+
 |  |  |
 |---|---|
 | Who may call | browser session or API key, admins |
@@ -1557,7 +1596,7 @@ Turn off an account's two-factor
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
 
 **Request body**
 
@@ -1573,7 +1612,9 @@ Turn off an account's two-factor
 
 ### POST /api/admin/users/{user_id}/revoke-access
 
-End every credential an account holds
+Revoke a user's access
+
+For an account that may be compromised: ends every session and voids its live login link and every API key it holds, at once.
 
 |  |  |
 |---|---|
@@ -1584,7 +1625,7 @@ End every credential an account holds
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
 
 **Request body**
 
@@ -1603,7 +1644,7 @@ End every credential an account holds
 
 Change an account's role
 
-Only the owner can take an admin's rights away. Becoming an admin ends the account's sessions and live login link.
+Make an account an admin or an ordinary user. Only the owner takes an admin's rights away; the owner is always an admin, and nobody changes their own role. Becoming an admin ends the account's sessions and live login link.
 
 |  |  |
 |---|---|
@@ -1614,7 +1655,7 @@ Only the owner can take an admin's rights away. Becoming an admin ends the accou
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
 
 **Request body**
 
@@ -1634,7 +1675,7 @@ Only the owner can take an admin's rights away. Becoming an admin ends the accou
 
 An account's signed-in devices
 
-The owner's are the owner's alone, and only the owner sees addresses.
+Where an account is signed in: every session, with when it started and was last seen. Addresses are shown to the owner only, and only the owner sees the owner's.
 
 |  |  |
 |---|---|
@@ -1645,9 +1686,9 @@ The owner's are the owner's alone, and only the owner sees addresses.
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | integer | yes |  |  |
-| `limit` | query | integer | no | 1 to 1000 | Rows to return. Default 200. |
-| `offset` | query | integer | no | at least 0 |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
+| `offset` | query | integer | no | at least 0 | Rows to skip: the next value of the previous page. |
 
 **Reply 200**: Success
 
@@ -1670,8 +1711,8 @@ Sign out one of an account's devices
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `user_id` | path | integer | yes |  |  |
-| `session_id` | path | string | yes |  |  |
+| `user_id` | path | integer | yes | at least 1 | The account's id, from GET /api/admin/users (admin_list_users over MCP). |
+| `session_id` | path | string | yes |  | The device's id, from GET /api/account/sessions or GET /api/admin/users/{user_id}/sessions (list_my_sessions or admin_list_user_sessions over MCP). |
 
 **Request body**
 
@@ -1731,7 +1772,7 @@ Run a job now
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `name` | path | string | yes |  |  |
+| `name` | path | string | yes |  | The job's name, from GET /api/owner/jobs. |
 
 **Request body**
 
@@ -1752,7 +1793,7 @@ The days on record
 |  |  |
 |---|---|
 | Who may call | browser session only, the owner |
-| Errors | 404, 429, 503 |
+| Errors | 400, 404, 429, 503 |
 
 **Parameters**
 
@@ -1777,10 +1818,10 @@ One day's entries
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `date` | path | string | yes |  |  |
+| `date` | path | string | yes |  | The day's date, from GET /api/owner/logs/days. |
 | `q` | query | string | no |  | The Logs screen's search. |
-| `before` | query | integer | no |  |  |
-| `limit` | query | integer | no |  |  |
+| `before` | query | integer or null | no | at least 0 |  |
+| `limit` | query | integer | no | 1 to 1000; default `200` | Rows to return. Default 200. |
 
 **Reply 200**: Success
 
@@ -1799,7 +1840,7 @@ Delete one day
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `date` | path | string | yes |  |  |
+| `date` | path | string | yes |  | The day's date, from GET /api/owner/logs/days. |
 
 **Request body**
 
@@ -1826,7 +1867,7 @@ One day's entries as a file
 
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
-| `date` | path | string | yes |  |  |
+| `date` | path | string | yes |  | The day's date, from GET /api/owner/logs/days. |
 
 **Reply 200**: Success
 
@@ -1859,15 +1900,15 @@ Name an address or a range, or rename one
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `name` | string | yes | at most 80 characters |  |
+| `name` | string | yes | 1 to 80 characters |  |
 | `target` | string | yes | e.g. `10.0.0.0/24` | An address, or a range such as 10.0.0.0/24. |
 
 **Reply 200**: Success
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `name` | string | no |  |  |
-| `target` | string | no |  |  |
+| `name` | string | yes |  |  |
+| `target` | string | yes |  |  |
 
 ### POST /api/owner/logs/ip-names/delete
 
@@ -1889,7 +1930,7 @@ Take a name off an address or a range
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `deleted` | boolean | no |  |  |
+| `deleted` | boolean | yes |  |  |
 
 ### POST /api/owner/logs/prune
 
@@ -1917,7 +1958,7 @@ New log entries as they happen
 |  |  |
 |---|---|
 | Who may call | browser session only, the owner |
-| Errors | 404, 429, 503 |
+| Errors | 400, 404, 429, 503 |
 
 **Parameters**
 
@@ -2035,10 +2076,15 @@ The shapes the routes above refer to by name.
 | `revoked` | boolean | yes |  |  |
 | `revoked_at` | string (date-time) | no |  |  |
 | `role` | string | yes | one of `admin`, `user` |  |
-| `scope` | object or null | no |  | Present on a key limited to one collection and the ones under it. |
-| `scope.access` | string | yes | one of `read`, `write` |  |
-| `scope.collection` | string | yes |  | The collection's id. |
+| `scope` | [`APIKeyScope`](#apikeyscope) or null | no |  | Present on a key limited to one collection and the ones under it. |
 | `user_id` | integer | yes |  |  |
+
+### APIKeyScope
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `access` | string | yes | one of `read`, `write` |  |
+| `collection` | string | yes |  | The collection's id. |
 
 ### Collection
 
@@ -2052,6 +2098,30 @@ The shapes the routes above refer to by name.
 | `position` | integer | yes |  | Place among its siblings, from 0. |
 | `updated_at` | string (date-time) | yes |  |  |
 | `version` | integer | yes |  | Goes up by one on every rename or move. |
+
+### Doc
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `body` | string | yes |  | Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it. |
+| `collection` | string | yes |  |  |
+| `id` | string | yes |  |  |
+| `seq` | integer | yes |  | Change number, for GET /api/changes?since=. |
+| `size` | integer | yes |  | Bytes of ciphertext; 0 for a delete. |
+| `updated_at` | string (date-time) | yes |  |  |
+| `version` | integer | yes |  | Goes up by one on every write and delete. |
+
+### DocChange
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `collection` | string | yes |  |  |
+| `deleted` | boolean | yes |  | The document was deleted: drop your copy. |
+| `id` | string | yes |  |  |
+| `seq` | integer | yes |  | Change number, for GET /api/changes?since=. |
+| `size` | integer | yes |  | Bytes of ciphertext; 0 for a delete. |
+| `updated_at` | string (date-time) | yes |  |  |
+| `version` | integer | yes |  | Goes up by one on every write and delete. |
 
 ### DocMeta
 
@@ -2075,10 +2145,10 @@ The shapes the routes above refer to by name.
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `names` | array of object | no |  |  |
-| `names[].created_at` | string (date-time) | no |  |  |
-| `names[].name` | string | no |  |  |
-| `names[].target` | string | no |  |  |
+| `names` | array of object | yes |  |  |
+| `names[].created_at` | string (date-time) | yes |  |  |
+| `names[].name` | string | yes |  |  |
+| `names[].target` | string | yes |  |  |
 
 ### Job
 
@@ -2089,7 +2159,7 @@ The shapes the routes above refer to by name.
 | `last_error` | string | no |  |  |
 | `last_finished` | string (date-time) | no |  |  |
 | `last_note` | string | no |  |  |
-| `last_ok` | boolean | no |  |  |
+| `last_ok` | boolean or null | no |  |  |
 | `last_started` | string (date-time) | no |  |  |
 | `name` | string | yes |  |  |
 | `next_due` | string (date-time) | yes |  |  |
@@ -2102,16 +2172,16 @@ The shapes the routes above refer to by name.
 |---|---|---|---|---|
 | `date` | string | yes |  |  |
 | `entries` | array of object | yes |  |  |
-| `next` | integer or null | no |  |  |
+| `next` | integer or null | yes |  |  |
 
 ### LogDays
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `days` | array of object | yes |  |  |
-| `dropped` | integer | no |  |  |
-| `settings` | object | no |  |  |
-| `total_bytes` | integer | no |  |  |
+| `dropped` | integer | yes |  |  |
+| `settings` | object | yes |  |  |
+| `total_bytes` | integer | yes |  |  |
 
 ### LoginLink
 
@@ -2136,32 +2206,32 @@ The shapes the routes above refer to by name.
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `account_role` | string | yes |  |  |
-| `announcement` | string | no |  | server.announcement. Empty when there is none. |
+| `announcement` | string | yes |  | server.announcement. Empty when there is none. |
 | `api_key_id` | string | no |  | API keys only. |
 | `api_key_name` | string | no |  | API keys only. |
-| `api_keys_enabled` | boolean | no |  |  |
-| `auth` | string | no |  |  |
+| `api_keys_enabled` | boolean | yes |  |  |
+| `auth` | string | yes |  |  |
 | `authenticated` | boolean | yes |  |  |
 | `csrf_token` | string | no |  | Browser sessions only. |
-| `description` | string | no |  | app.description. Empty when there is none. |
+| `description` | string | yes |  | app.description. Empty when there is none. |
 | `display_name` | string | yes |  |  |
 | `id` | integer | yes |  |  |
 | `is_owner` | boolean | yes |  |  |
-| `login_link` | [`LoginLink`](#loginlink) or null | no |  | Your own live login link, or null. |
-| `logs_enabled` | boolean | no |  |  |
-| `logs_ui_clicks` | boolean | no |  |  |
+| `login_link` | [`LoginLink`](#loginlink) or null | yes |  | Your own live login link, or null. |
+| `logs_enabled` | boolean | yes |  |  |
+| `logs_ui_clicks` | boolean | yes |  |  |
 | `maintenance` | string | yes | one of `none`, `read_only`, `full` |  |
-| `openapi_url` | string | no |  | Where to read this API's reference: config/openapi.json in app.repo, or /api/openapi.json when there is no repo. |
-| `repo` | string | no |  | app.repo without a trailing / or .git: where the source lives. Empty when it is not set. |
+| `openapi_url` | string | yes |  | Where to read this API's reference: config/openapi.json in app.repo, or /api/openapi.json when there is no repo. |
+| `repo` | string | yes |  | app.repo without a trailing / or .git: where the source lives. Empty when it is not set. |
 | `role` | string | yes |  | The effective role: never higher than an API key's own. |
-| `shortcuts` | map of string | no |  | The keyboard shortcuts you changed, by action. Mod is Cmd on a Mac and Ctrl elsewhere. |
-| `show_about` | boolean | no |  | app.show_about: whether the menu has About. |
-| `theme_id` | string | no |  | The theme you use. Empty: the first. |
-| `themes` | array of object or null | no |  | Your themes (see the Theme schema): your own list, else the app's defaults, else null for the built-in ones. |
-| `themes_custom` | boolean | no |  | Whether you have your own list rather than following the defaults. |
-| `two_factor` | boolean | no |  |  |
-| `two_factor_enabled` | boolean | no |  |  |
-| `version` | string | no |  | The running build. dev when none was stamped. |
+| `shortcuts` | map of string | yes |  | The keyboard shortcuts you changed, by action. Mod is Cmd on a Mac and Ctrl elsewhere. |
+| `show_about` | boolean | yes |  | app.show_about: whether the menu has About. |
+| `theme_id` | string | yes |  | The theme you use. Empty: the first. |
+| `themes` | array of [`Theme`](#theme) or null | yes |  | Your themes (see the Theme schema): your own list, else the app's defaults, else null for the built-in ones. |
+| `themes_custom` | boolean | yes |  | Whether you have your own list rather than following the defaults. |
+| `two_factor` | boolean | yes |  |  |
+| `two_factor_enabled` | boolean | yes |  |  |
+| `version` | string | yes |  | The running build. dev when none was stamped. |
 
 ### Member
 
@@ -2172,29 +2242,41 @@ The shapes the routes above refer to by name.
 
 ### NewAPIKey
 
-Every field of [`APIKey`](#apikey), plus these:
-
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
+| `created_at` | string (date-time) | yes |  |  |
+| `created_by` | integer | no |  | The admin who made this key for its owner. Absent if the owner made it. |
+| `created_by_name` | string | no |  |  |
 | `credential` | string | yes |  | Shown in this response only, and never recoverable. |
+| `display_name` | string | no |  | The key's owner. On the admin list only. |
+| `expired` | boolean | yes |  |  |
+| `expires_at` | string (date-time) | no |  |  |
+| `id` | string | yes |  |  |
+| `last_used_at` | string (date-time) | no |  |  |
+| `live` | boolean | yes |  |  |
+| `name` | string | yes |  |  |
+| `revoked` | boolean | yes |  |  |
+| `revoked_at` | string (date-time) | no |  |  |
+| `role` | string | yes | one of `admin`, `user` |  |
+| `scope` | [`APIKeyScope`](#apikeyscope) or null | no |  | Present on a key limited to one collection and the ones under it. |
+| `user_id` | integer | yes |  |  |
 
 ### PruneResult
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `bytes_after` | integer | no |  |  |
-| `bytes_before` | integer | no |  |  |
-| `compressed` | integer | no |  |  |
-| `deleted` | integer | no |  |  |
+| `bytes_after` | integer | yes |  |  |
+| `bytes_before` | integer | yes |  |  |
+| `compressed` | integer | yes |  |  |
+| `deleted` | integer | yes |  |  |
 
 ### Revoked
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `api_keys` | integer | no |  |  |
-| `login_links` | integer | no |  |  |
-| `passwords` | integer | no |  |  |
-| `sessions` | integer | no |  |  |
+| `api_keys` | integer | yes |  |  |
+| `login_links` | integer | yes |  |  |
+| `sessions` | integer | yes |  |  |
 
 ### Session
 
@@ -2214,43 +2296,43 @@ Every field of [`APIKey`](#apikey), plus these:
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `applied` | array of string or null | no |  |  |
-| `changes` | array of object or null | no |  |  |
-| `restart` | array of string or null | no |  |  |
-| `scripts` | array of string or null | no |  |  |
-| `unchanged` | array of string or null | no |  |  |
-| `version` | string | no |  |  |
+| `applied` | array of string or null | yes |  |  |
+| `changes` | array of object or null | yes |  |  |
+| `restart` | array of string or null | yes |  |  |
+| `scripts` | array of string or null | yes |  |  |
+| `unchanged` | array of string or null | yes |  |  |
+| `version` | string | yes |  |  |
 
 ### SettingsSnapshot
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `error` | object or null | no |  |  |
-| `error.at` | string (date-time) | no |  |  |
-| `error.message` | string | no |  |  |
-| `error.origin` | string | no |  |  |
-| `file` | string | no |  |  |
-| `in_container` | boolean | no |  |  |
-| `secret_file` | string | no |  |  |
-| `sections` | array of object | no |  |  |
-| `sections[].help` | string | no |  |  |
-| `sections[].keys` | array of object | no |  |  |
-| `sections[].keys[].apply` | string | no |  |  |
-| `sections[].keys[].default` | any | no |  |  |
-| `sections[].keys[].file_only` | boolean | no |  | A path: change it in config.yaml, never here. |
-| `sections[].keys[].help` | string | no |  |  |
-| `sections[].keys[].in_file` | boolean | no |  |  |
-| `sections[].keys[].key` | string | no |  |  |
-| `sections[].keys[].locked` | boolean | no |  |  |
-| `sections[].keys[].name` | string | no |  |  |
-| `sections[].keys[].pending_restart` | boolean | no |  |  |
-| `sections[].keys[].running` | any | no |  |  |
-| `sections[].keys[].type` | string | no |  |  |
-| `sections[].keys[].value` | any | no |  |  |
-| `sections[].name` | string | no |  |  |
-| `stale` | boolean | no |  |  |
-| `version` | string | no |  | Send it back when saving: a changed file is refused with a 409. |
-| `writable` | boolean | no |  |  |
+| `error` | object or null | yes |  |  |
+| `error.at` | string (date-time) | yes |  |  |
+| `error.message` | string | yes |  |  |
+| `error.origin` | string | yes |  |  |
+| `file` | string | yes |  |  |
+| `in_container` | boolean | yes |  |  |
+| `secret_file` | string | yes |  |  |
+| `sections` | array of object | yes |  |  |
+| `sections[].help` | string | yes |  |  |
+| `sections[].keys` | array of object | yes |  |  |
+| `sections[].keys[].apply` | string | yes |  |  |
+| `sections[].keys[].default` | any | yes |  |  |
+| `sections[].keys[].file_only` | boolean | yes |  | A path: change it in config.yaml, never here. |
+| `sections[].keys[].help` | string | yes |  |  |
+| `sections[].keys[].in_file` | boolean | yes |  |  |
+| `sections[].keys[].key` | string | yes |  |  |
+| `sections[].keys[].locked` | boolean | yes |  |  |
+| `sections[].keys[].name` | string | yes |  |  |
+| `sections[].keys[].pending_restart` | boolean | yes |  |  |
+| `sections[].keys[].running` | any | yes |  |  |
+| `sections[].keys[].type` | string | yes |  |  |
+| `sections[].keys[].value` | any | yes |  |  |
+| `sections[].name` | string | yes |  |  |
+| `stale` | boolean | yes |  |  |
+| `version` | string | yes |  | Send it back when saving: a changed file is refused with a 409. |
+| `writable` | boolean | yes |  |  |
 
 ### SignIn
 
@@ -2275,19 +2357,19 @@ One of these:
 |---|---|---|---|---|
 | `accent` | string | yes |  | The main color: what you can press. |
 | `background` | string | no |  | The page. Left out: the mode's own. |
-| `button` | object | no |  | How the theme's buttons look. A choice left out is the default (rounded, normal, raised, normal). |
+| `button` | object or null | no |  | How the theme's buttons look. A choice left out is the default (rounded, normal, raised, normal). |
 | `button.case` | string | no | one of `normal`, `upper` |  |
 | `button.depth` | string | no | one of `flat`, `raised`, `glossy` |  |
 | `button.shape` | string | no | one of `square`, `soft`, `rounded`, `pill` |  |
 | `button.weight` | string | no | one of `normal`, `medium`, `bold` |  |
-| `dark` | object | no |  | A light theme's colors for dark mode, kept while it is light. Switching the theme to dark swaps them in. A light theme's light (or a dark theme's dark) is dropped. |
+| `dark` | object or null | no |  | A light theme's colors for dark mode, kept while it is light. Switching the theme to dark swaps them in. A light theme's light (or a dark theme's dark) is dropped. |
 | `dark.accent` | string | yes |  | The main color: what you can press. |
 | `dark.background` | string | no |  | The page. Left out: the mode's own. |
 | `dark.overrides` | map of string | no |  | Worked-out colors replaced by name: text, accent, accentFg, second, secondFg, secondText, link, navLink, background, surface, nested, chrome, info, infoBorder, border, and for each button variant V (Secondary, Success, Danger, Warning, Info, Light, Dark) btnV, btnVFg and btnVText. Leaving one out puts the readable color back. |
 | `dark.second` | string | yes |  | Says where you are: active nav item, headings, info. |
 | `dark.surface` | string | no |  | Cards. Left out: the mode's own. |
 | `id` | string | yes |  | Lower-case letters, digits, - and _, up to 32. |
-| `light` | object | no |  | A dark theme's colors for light mode, kept while it is dark. Switching the theme to light swaps them in. |
+| `light` | object or null | no |  | A dark theme's colors for light mode, kept while it is dark. Switching the theme to light swaps them in. |
 | `light.accent` | string | yes |  | The main color: what you can press. |
 | `light.background` | string | no |  | The page. Left out: the mode's own. |
 | `light.overrides` | map of string | no |  | Worked-out colors replaced by name: text, accent, accentFg, second, secondFg, secondText, link, navLink, background, surface, nested, chrome, info, infoBorder, border, and for each button variant V (Secondary, Success, Danger, Warning, Info, Light, Dark) btnV, btnVFg and btnVText. Leaving one out puts the readable color back. |
@@ -2303,11 +2385,11 @@ One of these:
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `created_at` | string (date-time) | no |  |  |
+| `created_at` | string (date-time) | yes |  |  |
 | `disabled` | boolean | yes |  |  |
 | `display_name` | string | yes |  |  |
 | `id` | integer | yes |  |  |
-| `login_link` | [`LoginLink`](#loginlink) or null | no |  | The account's live login link, or null. |
+| `login_link` | [`LoginLink`](#loginlink) or null | yes |  | The account's live login link, or null. |
 | `owner` | boolean | yes |  |  |
 | `role` | string | yes | one of `admin`, `user` |  |
-| `two_factor` | boolean | no |  |  |
+| `two_factor` | boolean | yes |  |  |
