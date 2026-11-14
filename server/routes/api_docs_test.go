@@ -16,12 +16,12 @@ import (
 	routegen "github.com/8529398670/E2EEDB/server/apidoc/routegen"
 )
 
-// The API reference is written from the code: config/openapi.json and
+// The API reference is written from the code: config/api.json and
 // config/api.md from each route's declaration (the // @route(...) at the
 // end of its handler's doc comment), and config/mcp.json and config/mcp.md from the registered MCP tools.
 // scripts/api_docs.sh runs TestAPIDocsAreCurrent with -update to rewrite
 // them; without it, the test fails while a committed file is out of date.
-var updateAPIDocs = flag.Bool( "update" , false , "rewrite config/openapi.json, config/mcp.json, config/api.md and config/mcp.md from the code" )
+var updateAPIDocs = flag.Bool( "update" , false , "rewrite config/api.json, config/mcp.json, config/api.md and config/mcp.md from the code" )
 
 // notDocumented is what the route table has that is not an API: the pages a
 // link opens, and the catch-alls.
@@ -41,7 +41,7 @@ func newParityFixture( t *testing.T ) ( fixture *monitored ) {
 	return
 }
 
-// apiSpec is openapi.json as the code describes it, built from the route
+// apiSpec is api.json as the code describes it, built from the route
 // table of the app with everything on. A route mounted without a
 // declaration fails the test that asked.
 func apiSpec( t *testing.T ) ( spec map[string]any , fixture *monitored ) {
@@ -111,7 +111,7 @@ func TestAPIDocsAreCurrent( t *testing.T ) {
 	spec , _ := apiSpec( t )
 	files := map[string][]byte{}
 	var err error
-	if files[ "openapi.json" ] , err = apidoc.Encode( spec ); err != nil { t.Fatal( err ) }
+	if files[ "api.json" ] , err = apidoc.Encode( spec ); err != nil { t.Fatal( err ) }
 	var manifest map[string]any
 	files[ "api.md" ] = apidoc.Markdown( spec , manifest )
 	for name , want := range files {

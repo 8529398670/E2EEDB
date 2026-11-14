@@ -674,7 +674,7 @@ Switch to another theme from your list (or the defaults), by its id.
 
 Replace your own themes
 
-Replace your whole list of color themes (1 to 40) and pick the one you use. themes: null goes back to following the app's defaults. A theme is the Theme schema in the API reference (config/openapi.json): id, name, mode light|dark, accent, second, and optional colors as #rrggbb.
+Replace your whole list of color themes (1 to 40) and pick the one you use. themes: null goes back to following the app's defaults. A theme is the Theme schema in the API reference (config/api.json): id, name, mode light|dark, accent, second, and optional colors as #rrggbb.
 
 |  |  |
 |---|---|
@@ -2008,9 +2008,22 @@ Save settings
 
 | Method | Path | Summary | Who may call |
 |---|---|---|---|
+| GET | [`/api/api.json`](#get-apiapijson) | This document | browser session or API key, anyone signed in |
 | GET | [`/api/health`](#get-apihealth) | Is the process up | anyone |
-| GET | [`/api/openapi.json`](#get-apiopenapijson) | This document | browser session or API key, anyone signed in |
 | GET | [`/api/ready`](#get-apiready) | Can the server do real work | anyone |
+
+### GET /api/api.json
+
+This document
+
+|  |  |
+|---|---|
+| Who may call | browser session or API key, anyone signed in |
+| Errors | 401, 404, 429, 503 |
+
+**Reply 200**: Success
+
+An empty object.
 
 ### GET /api/health
 
@@ -2026,19 +2039,6 @@ Is the process up
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `ok` | boolean | yes |  |  |
-
-### GET /api/openapi.json
-
-This document
-
-|  |  |
-|---|---|
-| Who may call | browser session or API key, anyone signed in |
-| Errors | 401, 404, 429, 503 |
-
-**Reply 200**: Success
-
-An empty object.
 
 ### GET /api/ready
 
@@ -2221,7 +2221,7 @@ The shapes the routes above refer to by name.
 | `logs_enabled` | boolean | yes |  |  |
 | `logs_ui_clicks` | boolean | yes |  |  |
 | `maintenance` | string | yes | one of `none`, `read_only`, `full` |  |
-| `openapi_url` | string | yes |  | Where to read this API's reference: config/openapi.json in app.repo, or /api/openapi.json when there is no repo. |
+| `openapi_url` | string | yes |  | Where to read this API's reference: config/api.json in app.repo, or /api/api.json when there is no repo. |
 | `repo` | string | yes |  | app.repo without a trailing / or .git: where the source lives. Empty when it is not set. |
 | `role` | string | yes |  | The effective role: never higher than an API key's own. |
 | `shortcuts` | map of string | yes |  | The keyboard shortcuts you changed, by action. Mod is Cmd on a Mac and Ctrl elsewhere. |

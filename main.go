@@ -81,7 +81,7 @@ var (
 
 	// Embedded only, unlike language.yaml: it describes the routes compiled
 	// into this binary, so a copy on disk could only disagree with them.
-	//go:embed config/openapi.json
+	//go:embed config/api.json
 	embeddedOpenAPI []byte
 
 

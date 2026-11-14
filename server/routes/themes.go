@@ -68,7 +68,7 @@ func ( handlers *Handlers ) myThemes( user *models.User ) ( themes []models.Them
 //     tag="Account", feature="appearance",
 //     description="Replace your whole list of color themes (1 to 40) and pick the one you use. themes: "
 //         "null goes back to following the app's defaults. A theme is the Theme schema in the API "
-//         "reference (config/openapi.json): id, name, mode light|dark, accent, second, and optional colors "
+//         "reference (config/api.json): id, name, mode light|dark, accent, second, and optional colors "
 //         "as #rrggbb.",
 // )
 func ( handlers *Handlers ) setMyThemes( c fiber.Ctx , in *setMyThemesRequest ) ( reply *setMyThemesReply , err error ) {

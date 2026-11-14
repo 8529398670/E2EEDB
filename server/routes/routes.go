@@ -56,7 +56,7 @@ type Handlers struct {
 	// ErrorPages is what a browser gets while the app is in maintenance mode,
 	// set by main.go. Nil is fine: everyone gets the JSON answer.
 	ErrorPages *errorpage.Pages
-	// OpenAPI is config/openapi.json, set by main.go.
+	// OpenAPI is config/api.json, set by main.go.
 	OpenAPI []byte
 	// Docs is the end-to-end encrypted document store, set by main.go. See
 	// docs.go.
