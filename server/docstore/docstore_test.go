@@ -22,7 +22,7 @@ func open( t *testing.T ) ( store *Store , path string ) {
 // envelope is a body the store accepts: right first byte, right length.
 func envelope( fill byte , size int ) ( body []byte ) {
 	body = bytes.Repeat( []byte{ fill } , size )
-	body[ 0 ] = EnvelopeV1
+	body[ 0 ] = EnvelopeMaster
 	return
 }
 

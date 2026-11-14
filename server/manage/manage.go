@@ -35,7 +35,6 @@ import (
 	config "github.com/8529398670/E2EEDB/server/config"
 	control "github.com/8529398670/E2EEDB/server/control"
 	db "github.com/8529398670/E2EEDB/server/db"
-	docstore "github.com/8529398670/E2EEDB/server/docstore"
 	logs "github.com/8529398670/E2EEDB/server/logs"
 	models "github.com/8529398670/E2EEDB/server/models"
 	rotate "github.com/8529398670/E2EEDB/server/rotate"
@@ -67,8 +66,6 @@ Usage:
   rotate-key      -yes               move to a new secret key; the server must be
                                      stopped (in Docker: docker/rotate-key.sh)
   paths                              where this app keeps its state
-  docs-audit                         nested folders with a non-random id, to check
-                                     none was made through an access key
   logs            [-day 2026-11-02] [-q "status:5xx"] [-limit 50]
                                      the activity log: days, or one day's
                                      entries newest first, as JSON lines
@@ -176,13 +173,6 @@ func Run( arguments []string ) ( err error ) {
 	}
 	if cfg.RotationPending {
 		err = config.ErrRotationPending
-		return
-	}
-
-	// "docs-audit" reads docs.db read-only, so it works with the server up
-	// or down and never needs the bolt database.
-	if command == "docs-audit" {
-		err = commandDocsAudit( cfg )
 		return
 	}
 
@@ -1113,30 +1103,5 @@ func commandRevokeAccess( back backend , arguments []string ) ( err error ) {
 	report += fmt.Sprintf( ", revoked %d API keys" , revoked.APIKeys )
 	fmt.Println( report )
 	fmt.Printf( "To let them back in: reissue-login -user-id %d\n" , *user_id )
-	return
-}
-
-// commandDocsAudit lists folders nested inside another folder whose id is
-// not a random one: where, before scoped keys were held to random ids,
-// someone holding a read/write access token could have taken an id the
-// account's own code writes to by name. Check each is a folder you made.
-func commandDocsAudit( cfg *config.Config ) ( err error ) {
-	entries , err := docstore.AuditNested( cfg.DocsPath )
-	if errors.Is( err , os.ErrNotExist ) {
-		fmt.Println( "No docs.db yet: nothing to check." )
-		return nil
-	}
-	if err != nil { return }
-	if len( entries ) == 0 {
-		fmt.Println( "No nested folder has a non-random id. Nothing to review." )
-		return
-	}
-	fmt.Printf( "%-8s %-24s %-24s %-24s %s\n" , "USER" , "FOLDER ID" , "NAME" , "PARENT" , "MADE BY KEY" )
-	for _ , entry := range entries {
-		made := entry.ByKey
-		if made == "" { made = "-" }
-		fmt.Printf( "%-8d %-24s %-24s %-24s %s\n" , entry.UserID , entry.ID , entry.Name , entry.Parent , made )
-	}
-	fmt.Println( "\nCheck each is a folder you made. One made through an access key, holding documents your own code wrote, was readable by that key's holder." )
 	return
 }

@@ -18,12 +18,12 @@ import (
 // server refuses anything that is not an envelope; and the sync feed reports
 // deletes.
 
-// fakeEnvelope is a body the server accepts. Its contents are never opened,
+// fakeEnvelope is a body the server accepts (a private envelope). Its contents are never opened,
 // so they need not be real ciphertext here (the client tests cover that).
 func fakeEnvelope( fill byte ) ( encoded string ) {
-	body := make( []byte , docstore.EnvelopeMin + 8 )
+	body := make( []byte , docstore.EnvelopeMasterMin + 8 )
 	for index := range body { body[ index ] = fill }
-	body[ 0 ] = docstore.EnvelopeV1
+	body[ 0 ] = docstore.EnvelopeMaster
 	encoded = base64.StdEncoding.EncodeToString( body )
 	return
 }
@@ -111,7 +111,7 @@ func TestDocsRefuseWhatIsNotAnEnvelope( t *testing.T ) {
 	}
 
 	fixture.cfg.Docs = fixture.cfg.Docs.Limits()
-	fixture.cfg.Docs.MaxDocBytes = docstore.EnvelopeMin + 4
+	fixture.cfg.Docs.MaxDocBytes = docstore.EnvelopeMasterMin + 4
 	status , reply := fixture.withKey( t , key , http.MethodPost , "/api/collections/notes/docs/big" , fiber.Map{ "body": fakeEnvelope( 1 ) } )
 	if status != 413 || reply[ "error" ] != "doc_too_large" { t.Fatalf( "too large: %d %v" , status , reply ) }
 }

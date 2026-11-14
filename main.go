@@ -17,7 +17,6 @@ package main
 import (
 	context "context"
 	embed "embed"
-	errors "errors"
 	fmt "fmt"
 	fs "io/fs"
 	log "log"
@@ -39,7 +38,6 @@ import (
 	errorpage "github.com/8529398670/E2EEDB/server/errorpage"
 	healthcheck "github.com/8529398670/E2EEDB/server/healthcheck"
 	jobs "github.com/8529398670/E2EEDB/server/jobs"
-	models "github.com/8529398670/E2EEDB/server/models"
 	language "github.com/8529398670/E2EEDB/server/language"
 	logs "github.com/8529398670/E2EEDB/server/logs"
 	manage "github.com/8529398670/E2EEDB/server/manage"
@@ -188,18 +186,6 @@ func run() ( err error ) {
 	docs , err := docstore.Open( cfg.DocsPath )
 	if err != nil { return }
 	defer docs.Close()
-	// Access keys minted before they recorded which folder they were for
-	// (KeyScope.Born) learn it now; those whose folder is gone are revoked.
-	if filled , revoked , born_err := models.BackfillScopeBorn( store , func( user_id uint64 , collection string ) ( int64 , bool , error ) {
-		entry , get_err := docs.GetCollection( user_id , collection )
-		if errors.Is( get_err , docstore.ErrNoCollection ) { return 0 , false , nil }
-		return entry.Born , get_err == nil , get_err
-	} ); born_err != nil {
-		err = born_err
-		return
-	} else if filled + revoked > 0 {
-		log.Printf( "[docs] access keys tied to their folders: %d, revoked because their folder is gone: %d" , filled , revoked )
-	}
 
 	lang , err := language.Parse( bundle.LanguageYAML )
 	if err != nil { return }

@@ -144,7 +144,7 @@ A folder, empty until a document is written into it. Writing a document into an 
 | `before` | string or null | no |  | The sibling to go in front of; "" or absent for the end. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
 | `id` | string | no | at most 64 characters | 1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key may only send a random 22-character id (client.NewID), so it cannot take an id the account's own code writes to by name. |
-| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by). |
+| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists. |
 | `name` | string or null | no |  | 1-128 characters, no control characters, no space at either end. |
 | `parent` | string or null | no |  | Parent's id; "" for the top level. |
 
@@ -176,7 +176,7 @@ Give any of name, parent, before and lock. Its documents are not touched: they s
 | `before` | string or null | no |  | The sibling to go in front of; "" or absent for the end. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
 | `if_version` | integer or null | no | at least 1 | Change only if the collection is at this version. |
-| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by). |
+| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists. |
 | `name` | string or null | no |  | 1-128 characters, no control characters, no space at either end. |
 | `parent` | string or null | no |  | Parent's id; "" for the top level. |
 
@@ -292,7 +292,7 @@ Too big is 413 doc_too_large (with max_bytes), over your quota 413 quota_exceede
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `body` | string | yes |  | Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it. |
+| `body` | string | yes |  | Standard base64 (with padding) of the client's envelope. A collection envelope (what clients write): 0x02, the collection key's 16-byte id, a 24-byte nonce, XChaCha20-Poly1305 ciphertext of the JSON document, then a 64-byte Ed25519 signature. A private envelope (sealed by the master key alone, so never shareable): 0x01, the master key's id, nonce and ciphertext the same way, no signature. See README.md. The server stores it and never opens it. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
 | `if_version` | integer or null | no | at least 0 | Write only if the document is at this version: 0 means only if there is no live document. Absent: unconditional. A mismatch is 409 version_conflict with current_version and live. |
 
@@ -351,7 +351,7 @@ In one step: the document is written at to_collection/to_id and the old one beco
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `body` | string | yes |  | Standard base64 of the document's v1 or v2 envelope, sealed for to_collection and to_id. See README.md. |
+| `body` | string | yes |  | Standard base64 of the document's private or collection envelope, sealed for to_collection and to_id. See README.md. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
 | `if_version` | integer or null | no | at least 1 | Move only if the source is at this version. |
 | `to_collection` | string | yes | 1 to 64 characters | The destination collection's id. It must exist. |
@@ -2103,7 +2103,7 @@ The shapes the routes above refer to by name.
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `body` | string | yes |  | Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it. |
+| `body` | string | yes |  | Standard base64 (with padding) of the client's envelope. A collection envelope (what clients write): 0x02, the collection key's 16-byte id, a 24-byte nonce, XChaCha20-Poly1305 ciphertext of the JSON document, then a 64-byte Ed25519 signature. A private envelope (sealed by the master key alone, so never shareable): 0x01, the master key's id, nonce and ciphertext the same way, no signature. See README.md. The server stores it and never opens it. |
 | `collection` | string | yes |  |  |
 | `id` | string | yes |  |  |
 | `seq` | integer | yes |  | Change number, for GET /api/changes?since=. |

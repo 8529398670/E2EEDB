@@ -1,8 +1,8 @@
 package client
 
-// The client's crypto: this file (format v1 and the keyring) and
-// crypto_collection.go (format v2: collection keys) are the only files in
-// this package that touch it.
+// The client's crypto: this file (the master key, its private envelope and
+// the keyring) and crypto_collection.go (collection keys, their envelope and
+// lockboxes) are the only files in this package that touch it.
 // Every primitive is libsodium's, so the browser viewer (static/js/
 // docs_crypto.js, libsodium.js) reads and writes exactly the same bytes:
 //
@@ -29,19 +29,23 @@ const (
 	// KeySize is the master key's length in bytes.
 	KeySize = 32
 
-	envelopeV1  = 0x01
+	// EnvelopeMaster is the first byte of a private envelope: sealed by the
+	// master key alone, so it can never be shared or opened by a scoped key.
+	EnvelopeMaster = 0x01
+
 	keyIDSize   = 16
 	nonceSize   = chacha20poly1305.NonceSizeX
 	headerSize  = 1 + keyIDSize
 	envelopeMin = headerSize + nonceSize + chacha20poly1305.Overhead
 
-	encLabel     = "e2eedb/v1/enc"
-	keyIDLabel   = "e2eedb/v1/kid"
-	keyringLabel = "e2eedb/v1/keyring"
+	encLabel     = "e2eedb/master/enc"
+	keyIDLabel   = "e2eedb/master/kid"
+	keyringLabel = "e2eedb/keyring"
 
 	// Argon2id cost for a new keyring: 2 passes over 32 MiB, above OWASP's
 	// minimum for Argon2id and about 3.5 s in the browser's plain-JS
-	// libsodium. A keyring stores its own cost, so older ones still open.
+	// libsodium. A keyring records its own cost, so a keyring made with other
+	// settings opens too.
 	keyringOps = 2
 	keyringMem = 32 * 1024 * 1024
 	saltSize   = 16
@@ -114,7 +118,7 @@ func generichash( size int , key []byte , message string ) ( sum []byte ) {
 func ( key *Key ) ID() string { return b64.EncodeToString( key.id[ : ] ) }
 
 func ( key *Key ) header() ( header []byte ) {
-	header = append( []byte{ envelopeV1 } , key.id[ : ]... )
+	header = append( []byte{ EnvelopeMaster } , key.id[ : ]... )
 	return
 }
 
@@ -128,7 +132,9 @@ func associated( header []byte , collection string , id string ) ( data []byte )
 	return
 }
 
-// Seal encrypts plaintext for collection/id into a v1 envelope.
+// Seal encrypts plaintext for collection/id into a private envelope, which
+// only this master key opens. Clients write collection envelopes
+// (CollectionKey.Seal) by default; this is the other option.
 func ( key *Key ) Seal( collection string , id string , plaintext []byte ) ( envelope []byte , err error ) {
 	nonce := make( []byte , nonceSize )
 	if _ , err = rand.Read( nonce ); err != nil { return }
@@ -144,9 +150,9 @@ func ( key *Key ) sealWithNonce( collection string , id string , plaintext []byt
 	return
 }
 
-// Open decrypts a v1 envelope written for collection/id.
+// Open decrypts a private envelope written for collection/id.
 func ( key *Key ) Open( collection string , id string , envelope []byte ) ( plaintext []byte , err error ) {
-	if len( envelope ) < envelopeMin || envelope[ 0 ] != envelopeV1 {
+	if len( envelope ) < envelopeMin || envelope[ 0 ] != EnvelopeMaster {
 		err = ErrCorrupt
 		return
 	}
@@ -168,7 +174,6 @@ func ( key *Key ) Open( collection string , id string , envelope []byte ) ( plai
 // keyring is the wrapped master key the server stores (README.md,
 // "Keyring"). Byte fields are standard base64.
 type keyring struct {
-	V       int    `json:"v"`
 	Alg     string `json:"alg"`
 	Ops     uint64 `json:"ops"`
 	Mem     uint64 `json:"mem"`
@@ -207,7 +212,7 @@ func ( key *Key ) wrapWith( passphrase string , salt []byte , nonce []byte , ops
 	if err != nil { return }
 	wrapped := aead.Seal( nil , nonce , key.master[ : ] , append( []byte( keyringLabel ) , key.id[ : ]... ) )
 	encoded , err := json.Marshal( keyring{
-		V: 1 , Alg: keyringAlg , Ops: ops , Mem: mem ,
+		Alg: keyringAlg , Ops: ops , Mem: mem ,
 		Salt: b64.EncodeToString( salt ) , Nonce: b64.EncodeToString( nonce ) ,
 		KeyID: key.ID() , Wrapped: b64.EncodeToString( wrapped ) ,
 	} )
@@ -223,7 +228,7 @@ func UnwrapKey( text string , passphrase string ) ( key *Key , err error ) {
 		err = ErrCorrupt
 		return
 	}
-	if ring.V != 1 || ring.Alg != keyringAlg || ring.Ops < 1 || ring.Ops > maxKeyringOps || ring.Mem < minKeyringMem || ring.Mem > maxKeyringMem {
+	if ring.Alg != keyringAlg || ring.Ops < 1 || ring.Ops > maxKeyringOps || ring.Mem < minKeyringMem || ring.Mem > maxKeyringMem {
 		err = fmt.Errorf( "%w: unsupported keyring parameters" , ErrCorrupt )
 		return
 	}

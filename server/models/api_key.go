@@ -65,9 +65,8 @@ type KeyScope struct {
 	Write      bool   `json:"write"`
 	// Born is the collection's born value when the key was minted
 	// (docstore.Collection.Born): a later collection that reuses the id has
-	// another, and the key does not reach it. 0 on keys from before this was
-	// kept, until BackfillScopeBorn fills it in.
-	Born       int64  `json:"born,omitempty"`
+	// another, and the key does not reach it. Never 0.
+	Born       int64  `json:"born"`
 }
 
 var (
@@ -75,6 +74,7 @@ var (
 	ErrAPIKeyRole     = errors.New( "an API key cannot be given a role its owner does not have" )
 	ErrAPIKeyDisabled = errors.New( "cannot issue an API key for a disabled account" )
 	ErrAPIKeyDead     = errors.New( "only a live API key can have its expiry changed" )
+	ErrScopeBorn      = errors.New( "a scoped API key needs its collection's born value" )
 )
 
 const (
@@ -191,6 +191,10 @@ func IssueAPIKey( store *db.Store , user_id uint64 , name string , role string ,
 // always role user. Whether the collection exists is the caller's to check:
 // the documents live in another database.
 func IssueScopedAPIKey( store *db.Store , user_id uint64 , name string , scope KeyScope , ttl time.Duration ) ( credential string , key *APIKey , err error ) {
+	if scope.Born == 0 {
+		err = ErrScopeBorn
+		return
+	}
 	credential , key , err = issueAPIKey( store , user_id , name , RoleUser , ttl , 0 , &scope )
 	return
 }
@@ -409,43 +413,6 @@ func RevokeScopedKeys( store *db.Store , user_id uint64 , collections []string )
 		if key.Scope == nil || key.Revoked() || gone[ key.Scope.Collection ] == false { continue }
 		if err = RevokeAPIKey( store , key.ID ); err != nil { return }
 		revoked = append( revoked , key.ID )
-	}
-	return
-}
-
-// BackfillScopeBorn gives each live scoped key minted before KeyScope.Born was
-// kept the born value of its collection, as born answers it, and revokes the
-// ones whose collection is gone. found false means no such collection.
-func BackfillScopeBorn( store *db.Store , born func( user_id uint64 , collection string ) ( value int64 , found bool , err error ) ) ( filled int , revoked int , err error ) {
-	pending := []*APIKey{}
-	err = store.ForEach( db.BucketAPIKeys ,
-		func() any { return &APIKey{} } ,
-		func( key []byte , item any ) bool {
-			stored := item.( *APIKey )
-			if stored.Scope != nil && stored.Scope.Born == 0 && stored.Deleted() == false && stored.Revoked() == false {
-				pending = append( pending , stored )
-			}
-			return true
-		} )
-	if err != nil { return }
-	for _ , key := range pending {
-		value , found , born_err := born( key.UserID , key.Scope.Collection )
-		if born_err != nil { return filled , revoked , born_err }
-		if found == false {
-			if err = RevokeAPIKey( store , key.ID ); err != nil { return }
-			revoked += 1
-			continue
-		}
-		err = store.Write( func( tx *db.Tx ) ( tx_err error ) {
-			current := &APIKey{}
-			if tx_err = tx.Get( db.BucketAPIKeys , []byte( key.ID ) , current ); tx_err != nil { return }
-			if current.Scope == nil || current.Scope.Born != 0 { return }
-			current.Scope.Born = value
-			tx_err = tx.Put( db.BucketAPIKeys , []byte( key.ID ) , current )
-			return
-		} )
-		if err != nil { return }
-		filled += 1
 	}
 	return
 }

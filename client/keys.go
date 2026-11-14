@@ -58,7 +58,7 @@ func ( client *Client ) tree( ctx context.Context ) ( tree map[ string ]Collecti
 // a collection without keys yet gets them, which needs write access to its
 // parent; and one that does not exist yet is made at the top level, which
 // needs the master key. Without create, a collection with no keys is
-// ErrCorrupt (nothing in it can be a v2 document).
+// ErrCorrupt (nothing in it can be a collection envelope).
 func ( client *Client ) CollectionKey( ctx context.Context , collection string , create bool ) ( key *CollectionKey , err error ) {
 	if key = client.cached( collection ); key != nil { return }
 	tree , err := client.tree( ctx )
@@ -172,9 +172,9 @@ func ( client *Client ) createTopLevel( ctx context.Context , id string ) ( key 
 
 // PrepareShare gets collection, and every collection under it, ready to be
 // opened with the collection's own keys, and answers those keys: read-only
-// unless write. Collections without keys get them, and documents written
-// before collection keys existed (format v1, which only the master key
-// opens) are sealed again as v2. Pair the answer with a scoped API key from
+// unless write. Collections without keys get them, and private envelopes
+// (which only the master key opens) are sealed again as collection
+// envelopes. Pair the answer with a scoped API key from
 // the Account screen in NewAccessToken; the browser's Share dialog does all
 // of it in one step.
 func ( client *Client ) PrepareShare( ctx context.Context , collection string , write bool ) ( key *CollectionKey , err error ) {
@@ -191,10 +191,7 @@ func ( client *Client ) PrepareShare( ctx context.Context , collection string , 
 		queue = append( queue[ 1: ] , children[ id ]... )
 		folder_key , key_err := client.resolve( ctx , tree , id , true )
 		if key_err != nil { return nil , key_err }
-		// A read-only holder refuses unsigned (v2) lockboxes, so every one
-		// it will open is signed now.
-		if _ , err = client.upgradeLock( ctx , tree , id ); err != nil { return }
-		if err = client.upgradeDocs( ctx , folder_key ); err != nil { return }
+		if err = client.sealForSharing( ctx , folder_key ); err != nil { return }
 	}
 	key = client.cached( collection )
 	if write == false {
@@ -203,9 +200,9 @@ func ( client *Client ) PrepareShare( ctx context.Context , collection string , 
 	return
 }
 
-// upgradeDocs seals every v1 document in key's collection again as v2, each
-// only if it has not changed since it was read.
-func ( client *Client ) upgradeDocs( ctx context.Context , key *CollectionKey ) ( err error ) {
+// sealForSharing seals every private envelope in key's collection again as a
+// collection envelope, each only if it has not changed since it was read.
+func ( client *Client ) sealForSharing( ctx context.Context , key *CollectionKey ) ( err error ) {
 	offset := 0
 	for offset >= 0 {
 		var reply struct {
@@ -220,7 +217,7 @@ func ( client *Client ) upgradeDocs( ctx context.Context , key *CollectionKey ) 
 		for _ , row := range reply.Docs {
 			envelope , decode_err := b64.DecodeString( row.Body )
 			if decode_err != nil { return ErrCorrupt }
-			if EnvelopeVersion( envelope ) != envelopeV1 { continue }
+			if EnvelopeKind( envelope ) != EnvelopeMaster { continue }
 			if client.key == nil { return errNoMaster }
 			plaintext , open_err := client.key.Open( row.Collection , row.ID , envelope )
 			if open_err != nil { return open_err }
@@ -229,7 +226,7 @@ func ( client *Client ) upgradeDocs( ctx context.Context , key *CollectionKey ) 
 			request := map[string]any{ "body": b64.EncodeToString( sealed ) , "if_version": row.Version }
 			if err = client.call( ctx , http.MethodPost , docPath( row.Collection , row.ID ) , request , nil ); err != nil {
 				if errors.Is( err , ErrConflict ) {
-					// Written meanwhile -- as v2, since every write is now.
+					// Written meanwhile, as a collection envelope.
 					err = nil
 					continue
 				}
@@ -239,53 +236,5 @@ func ( client *Client ) upgradeDocs( ctx context.Context , key *CollectionKey ) 
 		offset = -1
 		if reply.Next != nil { offset = *reply.Next }
 	}
-	return
-}
-
-// UpgradeLocks signs every lockbox still in the unsigned format (v2) that
-// this client can wrap again -- all of them with the master key, the ones
-// under its collection with a read/write access token -- and answers how
-// many it signed. A read-only access token refuses unsigned lockboxes
-// (ErrLockUnsigned), so run this once after updating; PrepareShare does it
-// for the collection it shares. The keys inside stay the same.
-func ( client *Client ) UpgradeLocks( ctx context.Context ) ( upgraded int , err error ) {
-	tree , err := client.tree( ctx )
-	if err != nil { return }
-	children := map[ string ][]string{}
-	for _ , entry := range tree {
-		children[ entry.Parent ] = append( children[ entry.Parent ] , entry.ID )
-	}
-	// Parents before children, from the top, or from a scoped client's own
-	// collection (whose lockbox its parent's keys wrap, out of reach).
-	queue := children[ "" ]
-	if client.key == nil {
-		if client.scope == nil { return }
-		queue = children[ client.scope.collection ]
-	}
-	for len( queue ) > 0 {
-		id := queue[ 0 ]
-		queue = append( queue[ 1: ] , children[ id ]... )
-		done , lock_err := client.upgradeLock( ctx , tree , id )
-		if lock_err != nil { return upgraded , lock_err }
-		if done { upgraded += 1 }
-	}
-	return
-}
-
-// upgradeLock wraps id's lockbox again, signed, if it is unsigned (v2) and
-// this client holds the write half of its parent.
-func ( client *Client ) upgradeLock( ctx context.Context , tree map[ string ]Collection , id string ) ( done bool , err error ) {
-	entry , found := tree[ id ]
-	if found == false || entry.Lock == "" || lockVersion( entry.Lock ) != lockboxV2 { return }
-	holder , err := client.holder( ctx , tree , entry.Parent , false )
-	if err != nil || holder.wrapWrite() == nil { return false , err }
-	key , err := client.resolve( ctx , tree , id , false )
-	if err != nil || key.CanWrite() == false { return false , err }
-	lock , err := sealLock( key , holder )
-	if err != nil { return }
-	if err = client.call( ctx , http.MethodPost , collectionPath( id ) , map[string]any{ "lock": lock } , nil ); err != nil { return }
-	entry.Lock = lock
-	tree[ id ] = entry
-	done = true
 	return
 }

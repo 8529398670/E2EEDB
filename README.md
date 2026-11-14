@@ -47,8 +47,8 @@ Collections nest, like folders. Each one has an **id** and a **name**:
   Names are unique among siblings, ignoring case.
 
 Writing a document into an id that has no collection yet makes one at the top
-level, named after the id, so code that never thinks about folders works as
-before. Collections from before folders existed show up that way too.
+level, named after the id, so code that never thinks about folders keeps
+working.
 
 Moving a *document* to another collection does need the key: its ciphertext is
 bound to where it is, so the client opens it and seals it again for the new
@@ -77,8 +77,7 @@ Known limits, by design for this version:
 - **Sharing with write access lets someone add folders.** Whoever holds a
   read/write access key can make folders inside the shared one. They always
   get random ids, and the Go client refuses to write your own documents into
-  them unless asked to. `manage docs-audit` lists nested folders with
-  non-random ids, made before this rule, for you to check.
+  them unless asked to.
 
 ## Keys
 
@@ -105,14 +104,14 @@ level), so:
 - a **read-only** key holds only the read half. It opens documents but cannot
   sign one, and readers refuse unsigned documents, so it cannot forge a
   document even with the server's help. Nor can it plant keys for a folder
-  under its own: every lockbox is signed by its parent's write key (format
-  v3), which a read-only key does not hold. The server also refuses its
+  under its own: every lockbox is signed by its parent's write key, which a
+  read-only key does not hold. The server also refuses its
   writes.
 
 To hand one collection to someone, use **Share...** in that collection's menu
 on the Documents screen (unlocked with the master key). Choose read only or read
 and write, name it, and set when it expires. It shows an **access key**
-(`e2eedb-ck1.…`) once. The access key holds:
+(`e2eedb-ck.…`) once. The access key holds:
 
 - a **scoped API key** that the server lets reach only that collection's subtree,
   only on the document routes (`/api/collections…`, `/api/changes`), read or
@@ -130,9 +129,9 @@ an id your own code writes to by name. A collection made that way says so
 (`by_key`), and the Go client will not write your documents into one unless
 you pass `client.AllowShared()` (`ErrSharedCollection` otherwise).
 
-Sharing first gives every collection in the subtree its keys, and seals again
-as v2 any document written before collection keys existed (v1, which only the
-master key opens). In Go, `PrepareShare` does that and returns the keys, and
+Sharing first gives every collection in the subtree its keys, and seals any
+private envelope in it (which only the master key opens) again as a
+collection envelope. In Go, `PrepareShare` does that and returns the keys, and
 `client.NewAccessToken( scopedAPIKey , keys )` builds the token. API keys
 are minted from a signed-in browser only, as for every key.
 
@@ -189,107 +188,133 @@ version `n`. A mismatch is `409 version_conflict` with `current_version`.
 
 ## Crypto format
 
-Documents: versions 1 and 2; lockboxes: versions 2 and 3. The Go client (`client/crypto.go`,
-`client/crypto_collection.go`) and the browser (`static/js/docs_crypto.js`)
-both implement them. `client/testdata/vectors.json` pins them, and
-`scripts/check_crypto.js` (run by `go test ./server/static`) holds the browser
-to the same vectors. New writes are always v2. v1 documents still open with
-the master key.
+One format, built from these pieces:
+
+- **Collection envelope**: what every document write produces. It is sealed
+  with its collection's read key and signed with its write key.
+- **Private envelope**: the other option. It is sealed with the master key
+  alone, so no access token can open it, and it is never shared as it is.
+  Clients don't write one unless asked (`Key.Seal`, `DocsCrypto.seal`). They
+  open one with the master key, and sharing seals it again as a collection
+  envelope.
+- **Lockbox**: a collection's keys, wrapped and signed by its holder.
+- **Keyring**: the master key, wrapped under a passphrase.
+
+The Go client (`client/crypto.go`, `client/crypto_collection.go`) and the
+browser (`static/js/docs_crypto.js`) both implement them.
+`client/testdata/vectors.json` pins them, and `scripts/check_crypto.js` (run by
+`go test ./server/static`) holds the browser to the same vectors. The first
+byte of an envelope names its kind: `0x01` private, `0x02` collection.
+
+### The master key
 
 Subkeys from the master key `M` (keyed BLAKE2b, `crypto_generichash`):
 
 ```
-enc_key = BLAKE2b-256( key = M , message = "e2eedb/v1/enc" )
-key_id  = BLAKE2b-128( key = M , message = "e2eedb/v1/kid" )
+enc_key = BLAKE2b-256( key = M , message = "e2eedb/master/enc" )
+key_id  = BLAKE2b-128( key = M , message = "e2eedb/master/kid" )
 ```
 
-A document body (the `body` field, standard base64 with padding):
-
-```
-envelope = 0x01 || key_id (16) || nonce (24) || XChaCha20-Poly1305-IETF( enc_key , nonce , plaintext , AD )
-AD       = 0x01 || key_id || collection || 0x00 || doc_id
-```
-
-`plaintext` is the document's JSON as UTF-8. The nonce is random. The AD binds
-the ciphertext to its collection and id.
+`key_id` names the master key wherever it appears: in the keyring, in the `by`
+of a top-level lockbox, and in a private envelope.
 
 The keyring (`GET/POST /api/keyring`, stored as opaque text):
 
 ```json
-{"v":1,"alg":"argon2id13","ops":2,"mem":33554432,
+{"alg":"argon2id13","ops":2,"mem":33554432,
  "salt":"<16 bytes>","nonce":"<24 bytes>","key_id":"<16 bytes>","wrapped":"<48 bytes>"}
 ```
 
 ```
 wrap_key = crypto_pwhash( 32 , passphrase (UTF-8, as typed) , salt , ops , mem , ALG_ARGON2ID13 )
-wrapped  = XChaCha20-Poly1305-IETF( wrap_key , nonce , M , AD = "e2eedb/v1/keyring" || key_id )
+wrapped  = XChaCha20-Poly1305-IETF( wrap_key , nonce , M , AD = "e2eedb/keyring" || key_id )
 ```
 
-### Version 2: collection keys
+### Collection keys
 
 Per collection `c`, the client that first gives it keys picks two random
 32-byte secrets: a read key `rk` and an Ed25519 seed `ws` (write key), whose
 public key is `vk`.
 
 ```
-enc_key = BLAKE2b-256( key = rk , message = "e2eedb/v2/enc" )
-key_id  = BLAKE2b-128( key = rk , message = "e2eedb/v2/kid" )
-
-envelope = 0x02 || key_id (16) || nonce (24) || XChaCha20-Poly1305-IETF( enc_key , nonce , plaintext , AD ) || sig (64)
-AD       = 0x02 || key_id || collection || 0x00 || doc_id
-sig      = Ed25519-sign( ws , envelope-before-sig || collection || 0x00 || doc_id )
+enc_key = BLAKE2b-256( key = rk , message = "e2eedb/collection/enc" )
+key_id  = BLAKE2b-128( key = rk , message = "e2eedb/collection/kid" )
 ```
 
-Readers check `sig` against `vk` before decrypting.
+### Envelopes
 
-The lockbox (`lock` on the collection, opaque text to the server) is wrapped by
-a holder: the master key for a top-level collection, or the parent
-collection's keys. With the holder's secret `h` (the master key `M`; for a
-parent, its `rk` for the read half and its `ws` for the write half):
+A document body (the `body` field, standard base64 with padding) is one of:
 
 ```
-wrap_r = BLAKE2b-256( key = h_read  , message = "e2eedb/v2/wrap-r" )
-wrap_w = BLAKE2b-256( key = h_write , message = "e2eedb/v2/wrap-w" )
-read   = XChaCha20-Poly1305-IETF( wrap_r , nonce_r , rk || vk , AD = "e2eedb/v2/lock-r" || 0x00 || c || 0x00 || parent )
-write  = XChaCha20-Poly1305-IETF( wrap_w , nonce_w , ws      , AD = "e2eedb/v2/lock-w" || 0x00 || c || 0x00 || parent )
+collection = 0x02 || key_id (16) || nonce (24) || XChaCha20-Poly1305-IETF( enc_key , nonce , plaintext , AD ) || sig (64)
+             AD  = 0x02 || key_id || collection || 0x00 || doc_id
+             sig = Ed25519-sign( ws , envelope-before-sig || collection || 0x00 || doc_id )
+
+private    = 0x01 || key_id (16) || nonce (24) || XChaCha20-Poly1305-IETF( enc_key , nonce , plaintext , AD )
+             AD  = 0x01 || key_id || collection || 0x00 || doc_id
 ```
 
-The holder also signs the lockbox (format v3) with its own Ed25519 key: a
-parent collection with its write key `ws` (checked with its `vk`), the master
-key with one derived from it:
+Use the collection key's `enc_key` and `key_id` for a collection envelope, and
+the master key's for a private one. `plaintext` is the document's JSON as
+UTF-8. The nonce is random. The AD binds the ciphertext to its collection and
+id. Readers check a collection envelope's `sig` against `vk` before
+decrypting. A scoped key may only write collection envelopes.
+
+### Lockboxes
+
+The lockbox (`lock` on the collection, opaque text to the server) is wrapped
+and signed by a holder: the master key for a top-level collection, or the
+parent collection's keys.
+
+The holder's secret `h` is:
+
+- the master key `M`, for a top-level collection;
+- for a parent collection, its `rk` for the read half and its `ws` for the
+  write half.
 
 ```
-lock_seed = BLAKE2b-256( key = M , message = "e2eedb/v3/lock-sign" )
-sig       = Ed25519-sign( holder , "e2eedb/v3/lock" || 0x00 || c || 0x00 || parent || 0x00 || key_id || nonce_r || read || nonce_w || write )
+wrap_r = BLAKE2b-256( key = h_read  , message = "e2eedb/lock/wrap-r" )
+wrap_w = BLAKE2b-256( key = h_write , message = "e2eedb/lock/wrap-w" )
+read   = XChaCha20-Poly1305-IETF( wrap_r , nonce_r , rk || vk , AD = "e2eedb/lock/read"  || 0x00 || c || 0x00 || parent )
+write  = XChaCha20-Poly1305-IETF( wrap_w , nonce_w , ws      , AD = "e2eedb/lock/write" || 0x00 || c || 0x00 || parent )
+```
+
+The holder signs it with its own Ed25519 key. A parent collection uses its
+write key `ws`, checked with its `vk`. The master key uses one derived from
+it:
+
+```
+lock_seed = BLAKE2b-256( key = M , message = "e2eedb/lock/sign-seed" )
+sig       = Ed25519-sign( holder , "e2eedb/lock/sign" || 0x00 || c || 0x00 || parent || 0x00 || key_id || nonce_r || read || nonce_w || write )
 ```
 
 ```json
-{"v":3,"parent":"<parent id, or \"\">","by":"<holder's key id>","key_id":"<c's key id>",
+{"parent":"<parent id, or \"\">","by":"<holder's key id>","key_id":"<c's key id>",
  "nonce_r":"…","read":"…","nonce_w":"…","write":"…","sig":"…"}
 ```
 
-Every reader checks `sig` before opening `read`. A v2 lockbox is the same
-without `sig`. Holders of the write half still open one, since they check
-the write half, which a read-only key cannot make; a read-only holder refuses
-it (`ErrLockUnsigned`, `unsigned_lock` in the browser), because another
-read-only key could have planted it. Unlocking the Documents screen with the
-master key, sharing, or `client.UpgradeLocks` signs old ones in place; the
-server allows that one in-place change (same `key_id`, `parent` and `by`).
+Every reader checks `sig` before opening `read`, and a lockbox without a valid
+one opens for nobody. A read-only key holds the parent's `vk` but not its
+`ws`, so it cannot plant a lockbox for a folder under its own.
 
 A holder without a write half (a read-only key) opens only `read`, so
-everything under it is read-only too. Moving a collection to another parent
-sends its lockbox wrapped again for that parent; the server refuses the move
-without one (`409 lock_required`), and sets a lockbox only once otherwise
-(`409 lock_exists`), apart from signing a v2 one (below).
+everything under it is read-only too.
 
-An access token is `e2eedb-ck1.` followed by the unpadded URL-safe base64 of
+The server sets a lockbox only once (`409 lock_exists`). The one exception is
+a move: moving a collection to another parent sends its lockbox wrapped again
+for that parent, and the server refuses the move without one
+(`409 lock_required`).
+
+### Access tokens
+
+An access token is `e2eedb-ck.` followed by the unpadded URL-safe base64 of
 `{"k":"<api key>","c":"<collection>","r":"<rk>","v":"<vk>","w":"<ws, read/write only>"}`.
 
 ### Keyring cost
 
 New keyrings use 2 passes over 32 MiB (about 3.5 seconds in the browser's
 plain-JS libsodium). Each keyring records its own cost, so one made with other
-settings still opens. Clients refuse keyrings asking for more than 10 passes or outside 8 MiB-1 GiB
+settings opens too. Clients refuse keyrings asking for more than 10 passes or outside 8 MiB-1 GiB
 of memory, so a server cannot make them spend unbounded time on an unlock.
 
 ### In the browser: plain JavaScript, no WebAssembly

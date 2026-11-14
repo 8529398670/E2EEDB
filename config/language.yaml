@@ -106,7 +106,6 @@ docs:
   error_corrupt: "This document could not be decrypted: it is damaged or not where it was written."
   error_read_only: "This key can read here but not write."
   error_no_folder: "There is no such collection here."
-  error_unsigned_lock: "This folder's keys are not signed yet, so an access key cannot trust them. Ask the owner to unlock the Documents screen once with their key, then try again."
   folder_share: "Share..."
   share_title: "Share {name}"
   share_pick_title: "Share a collection"
@@ -399,9 +398,9 @@ access:
   heading: "Have an access key?"
   body: "Someone shared a collection with you. Paste the access key they gave you to open it. It stays in this tab only."
   label: "Access key"
-  placeholder: "e2eedb-ck1...."
+  placeholder: "e2eedb-ck..."
   button: "Open"
-  invalid: "That is not an access key. It starts with e2eedb-ck1."
+  invalid: "That is not an access key. It starts with e2eedb-ck."
   refused: "This access key no longer works. It may have been revoked or have expired."
 
 signed_out:

@@ -169,40 +169,20 @@ const Docs = {
     return DocsCrypto.sealLock( key , await this.holderFor( parent , true ) );
   },
 
-  // Signs again, as v3, every lockbox in the subtrees of roots still in the
-  // unsigned v2 format, where this page holds the write half of its parent.
-  // A read-only access key refuses an unsigned lockbox ("unsigned_lock"), so
-  // this runs after unlocking with the master key and before sharing. The
-  // keys inside stay the same, so nothing else changes.
-  async upgradeLocks( roots ) {
-    for ( const root of roots ) {
-      for ( const at of DocsTree.subtree( root ) ) {
-        const folder = DocsTree.get( at );
-        if ( !folder || DocsCrypto.lockVersion( folder.lock || "" ) !== 2 ) continue;
-        // An access key's own folder is wrapped by a parent it cannot reach.
-        if ( this.scope && at === this.scope.key.collection ) continue;
-        const holder = await this.holderFor( folder.parent , false );
-        if ( !DocsCrypto.holderWrap( holder , true ) ) continue;
-        const key = await this.keyFor( at , false );
-        const done = await Api.updateCollection( at , { lock: DocsCrypto.sealLock( key , holder ) } );
-        folder.lock = done.lock;
-      }
-    }
-  },
-
-  // A body (base64 envelope) in, JSON text out: v1 with the master key, v2
-  // with the collection's keys.
+  // A body (base64 envelope) in, JSON text out: a private envelope with the
+  // master key, a collection envelope with the collection's keys.
   async openBody( collection , id , body ) {
-    if ( DocsCrypto.envelopeVersion( body ) === DocsCrypto.ENVELOPE_V1 ) {
+    if ( DocsCrypto.envelopeKind( body ) === DocsCrypto.ENVELOPE_MASTER ) {
       if ( !this.key ) throw DocsCrypto.fail( "wrong_key" );
       return DocsCrypto.open( this.key , collection , id , body );
     }
-    return DocsCrypto.openV2( await this.keyFor( collection , false ) , id , body );
+    return DocsCrypto.openCollection( await this.keyFor( collection , false ) , id , body );
   },
 
-  // JSON text in, a v2 body sealed and signed for collection/id out.
+  // JSON text in, a collection envelope sealed and signed for collection/id
+  // out.
   async sealBody( collection , id , text ) {
-    return DocsCrypto.sealV2( await this.keyFor( collection , true ) , id , text );
+    return DocsCrypto.sealCollection( await this.keyFor( collection , true ) , id , text );
   },
 
   // ---- links to a document -------------------------------------------------
@@ -350,9 +330,6 @@ const Docs = {
     this.key = key;
     this.folderKeys.clear();
     this.renderLock();
-    // Quietly sign any lockbox from before lockboxes were signed, so access
-    // keys keep opening every folder under the one they are for.
-    this.upgradeLocks( DocsTree.children( "" ).map( ( folder ) => folder.id ) ).catch( () => {} );
     // The document list can now say which ones this key opens.
     if ( this.collection ) this.refreshDocs();
     const link = this.pendingLink;
@@ -500,12 +477,13 @@ const Docs = {
   },
 
   // The badge a row gets when its body is sealed under a key this page does
-  // not hold: another master key (v1), or not its collection's (v2).
+  // not hold: another master key (a private envelope), or not its
+  // collection's.
   keyBadge( row ) {
     if ( !this.hasKey() || !row.body ) return null;
     const named = DocsCrypto.envelopeKeyId( row.body );
     let mine = "";
-    if ( DocsCrypto.envelopeVersion( row.body ) === DocsCrypto.ENVELOPE_V1 ) {
+    if ( DocsCrypto.envelopeKind( row.body ) === DocsCrypto.ENVELOPE_MASTER ) {
       mine = this.key ? DocsCrypto.keyId( this.key ) : "";
     } else {
       const key = this.folderKeys.get( row.collection || this.collection );
@@ -1058,9 +1036,9 @@ const Docs = {
     if ( Keys.me ) Keys.refresh().catch( () => {} );
   },
 
-  // Gives id, and every collection under it, keys, and seals again as v2 the
-  // documents written before collection keys (v1), which only the master key
-  // opens. Answers id's keys.
+  // Gives id, and every collection under it, keys, and seals any private
+  // envelope (which only the master key opens) again as a collection
+  // envelope. Answers id's keys.
   async prepareShare( id ) {
     for ( const at of DocsTree.subtree( id ) ) {
       const key = await this.keyFor( at , true );
@@ -1068,20 +1046,18 @@ const Docs = {
       while ( offset !== null && offset !== undefined ) {
         const page = await Api.docs( at , offset , 200 , true );
         for ( const row of page.docs ) {
-          if ( DocsCrypto.envelopeVersion( row.body ) !== DocsCrypto.ENVELOPE_V1 ) continue;
+          if ( DocsCrypto.envelopeKind( row.body ) !== DocsCrypto.ENVELOPE_MASTER ) continue;
           const text = DocsCrypto.open( this.key , at , row.id , row.body );
           try {
-            await Api.setDoc( at , row.id , DocsCrypto.sealV2( key , row.id , text ) , row.version );
+            await Api.setDoc( at , row.id , DocsCrypto.sealCollection( key , row.id , text ) , row.version );
           } catch ( error ) {
-            // Written meanwhile, and so already v2.
+            // Written meanwhile, and so already a collection envelope.
             if ( error.status !== 409 ) throw error;
           }
         }
         offset = page.next;
       }
     }
-    // A read-only key refuses unsigned lockboxes: sign every one it will open.
-    await this.upgradeLocks( [ id ] );
     return this.keyFor( id , false );
   },
 

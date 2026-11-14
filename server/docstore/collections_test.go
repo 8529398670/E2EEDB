@@ -1,9 +1,7 @@
 package docstore
 
 import (
-	sql "database/sql"
 	errors "errors"
-	filepath "path/filepath"
 	testing "testing"
 )
 
@@ -39,25 +37,13 @@ func same( a []string , b ...string ) bool {
 	return true
 }
 
-func TestMigrationMakesFoldersOfOldCollections( t *testing.T ) {
-	path := filepath.Join( t.TempDir() , "docs.db" )
-	// A docs.db as the first schema left it.
-	handle , err := sql.Open( "sqlite" , dsn( path , false ) )
-	if err != nil { t.Fatal( err ) }
-	if _ , err = handle.Exec( migrations[ 0 ] + "; PRAGMA user_version = 1;" ); err != nil { t.Fatal( err ) }
-	_ , err = handle.Exec( `INSERT INTO docs ( user_id , collection , doc_id , version , seq , updated_at , deleted , size , body ) VALUES
-		( 1 , 'tasks' , 'a' , 1 , 1 , 1000 , 0 , 60 , x'01' ) , ( 1 , 'notes' , 'b' , 1 , 2 , 2000 , 0 , 60 , x'01' ) ,
-		( 1 , 'gone' , 'c' , 2 , 3 , 3000 , 1 , 0 , NULL ) , ( 2 , 'notes' , 'd' , 1 , 4 , 4000 , 0 , 60 , x'01' )` )
-	if err != nil { t.Fatal( err ) }
-	handle.Close()
-
-	store , err := Open( path )
-	if err != nil { t.Fatal( err ) }
-	defer store.Close()
-	if ids := children( t , store , 1 , "" ); same( ids , "notes" , "tasks" ) == false { t.Fatalf( "user 1 top level: %v" , ids ) }
-	notes := tree( t , store , 1 )[ "notes" ]
-	if notes.Name != "notes" || notes.Count != 1 || notes.Position != 0 { t.Fatalf( "notes: %+v" , notes ) }
-	if ids := children( t , store , 2 , "" ); same( ids , "notes" ) == false { t.Fatalf( "user 2 top level: %v" , ids ) }
+// A lockbox is set once: replacing it in place is refused, so nobody (a
+// read-only key included) can swap a folder's keys under its readers.
+func TestLockIsSetOnce( t *testing.T ) {
+	store , _ := open( t )
+	if _ , err := store.CreateCollection( 1 , "notes" , CollectionChange{ Lock: name( `{"key_id":"a"}` ) } , limits ); err != nil { t.Fatal( err ) }
+	if _ , err := store.UpdateCollection( 1 , "notes" , CollectionChange{ Lock: name( `{"key_id":"a"}` ) } , limits ); err != nil { t.Fatalf( "same lockbox again: %v" , err ) }
+	if _ , err := store.UpdateCollection( 1 , "notes" , CollectionChange{ Lock: name( `{"key_id":"b"}` ) } , limits ); errors.Is( err , ErrLockExists ) == false { t.Fatalf( "replaced in place: %v" , err ) }
 }
 
 func TestSetMakesAFolder( t *testing.T ) {

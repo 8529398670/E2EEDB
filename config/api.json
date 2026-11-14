@@ -239,7 +239,7 @@
       "Doc": {
         "properties": {
           "body": {
-            "description": "Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it.",
+            "description": "Standard base64 (with padding) of the client's envelope. A collection envelope (what clients write): 0x02, the collection key's 16-byte id, a 24-byte nonce, XChaCha20-Poly1305 ciphertext of the JSON document, then a 64-byte Ed25519 signature. A private envelope (sealed by the master key alone, so never shareable): 0x01, the master key's id, nonce and ciphertext the same way, no signature. See README.md. The server stores it and never opens it.",
             "type": "string"
           },
           "collection": {
@@ -4940,7 +4940,7 @@
                     "type": "string"
                   },
                   "lock": {
-                    "description": "A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by).",
+                    "description": "A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists.",
                     "maxLength": 2048,
                     "minLength": 1,
                     "type": [
@@ -5062,7 +5062,7 @@
                     ]
                   },
                   "lock": {
-                    "description": "A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by).",
+                    "description": "A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists.",
                     "maxLength": 2048,
                     "minLength": 1,
                     "type": [
@@ -5493,7 +5493,7 @@
                 "additionalProperties": false,
                 "properties": {
                   "body": {
-                    "description": "Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it.",
+                    "description": "Standard base64 (with padding) of the client's envelope. A collection envelope (what clients write): 0x02, the collection key's 16-byte id, a 24-byte nonce, XChaCha20-Poly1305 ciphertext of the JSON document, then a 64-byte Ed25519 signature. A private envelope (sealed by the master key alone, so never shareable): 0x01, the master key's id, nonce and ciphertext the same way, no signature. See README.md. The server stores it and never opens it.",
                     "type": "string"
                   },
                   "csrf_token": {
@@ -5700,7 +5700,7 @@
                 "additionalProperties": false,
                 "properties": {
                   "body": {
-                    "description": "Standard base64 of the document's v1 or v2 envelope, sealed for to_collection and to_id. See README.md.",
+                    "description": "Standard base64 of the document's private or collection envelope, sealed for to_collection and to_id. See README.md.",
                     "type": "string"
                   },
                   "csrf_token": {

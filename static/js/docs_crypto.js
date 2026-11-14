@@ -4,11 +4,12 @@
 // specification for both, and client/testdata/vectors.json pins it
 // (scripts/check_crypto.js checks this file against it).
 //
-// Two formats. v1: a document sealed with the master key's own subkey. v2:
-// every collection has its own read key and Ed25519 write key, kept in a
-// lockbox wrapped by its parent's keys (the master key at the top level), and
-// documents are sealed with the read key and signed with the write key. A
-// collection's keys reach its subtree; an access token carries one
+// Every collection has its own read key and Ed25519 write key, kept in a
+// signed lockbox wrapped by its parent's keys (the master key at the top
+// level). A document is a collection envelope, sealed with the read key and
+// signed with the write key, or, as the other option, a private envelope
+// sealed with the master key's own subkey, which nothing but the master key
+// opens. A collection's keys reach its subtree; an access token carries one
 // collection's keys, read-only or with the write half.
 //
 // No WebAssembly is used. static/vendor/sodium.js is libsodium.js with its
@@ -24,10 +25,10 @@ const DocsCrypto = {
   sodium: null,
   loading: null,
 
-  ENVELOPE_V1: 1,
-  ENVELOPE_V2: 2,
+  ENVELOPE_MASTER: 1,
+  ENVELOPE_COLLECTION: 2,
   SIGNATURE_BYTES: 64,
-  TOKEN_PREFIX: "e2eedb-ck1.",
+  TOKEN_PREFIX: "e2eedb-ck.",
   KEY_BYTES: 32,
   KEY_ID_BYTES: 16,
   NONCE_BYTES: 24,
@@ -102,8 +103,8 @@ const DocsCrypto = {
     const sodium = this.sodium;
     return {
       master: master,
-      enc: sodium.crypto_generichash( 32 , this.utf8( "e2eedb/v1/enc" ) , master ),
-      id: sodium.crypto_generichash( this.KEY_ID_BYTES , this.utf8( "e2eedb/v1/kid" ) , master ),
+      enc: sodium.crypto_generichash( 32 , this.utf8( "e2eedb/master/enc" ) , master ),
+      id: sodium.crypto_generichash( this.KEY_ID_BYTES , this.utf8( "e2eedb/master/kid" ) , master ),
     };
   },
 
@@ -124,24 +125,24 @@ const DocsCrypto = {
     return this.join( header , this.utf8( collection ) , new Uint8Array( [ 0 ] ) , this.utf8( id ) );
   },
 
-  // JSON text in, base64 envelope out.
-  seal( key , collection , id , text ) {
+  // JSON text in, base64 private envelope out.
+  seal( key , collection , id , text , nonce ) {
     const sodium = this.sodium;
-    const header = this.join( new Uint8Array( [ this.ENVELOPE_V1 ] ) , key.id );
-    const nonce = sodium.randombytes_buf( this.NONCE_BYTES );
+    const header = this.join( new Uint8Array( [ this.ENVELOPE_MASTER ] ) , key.id );
+    nonce = nonce || sodium.randombytes_buf( this.NONCE_BYTES );
     const sealed = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( this.utf8( text ) , this.associated( header , collection , id ) , null , nonce , key.enc );
     return this.b64( this.join( header , nonce , sealed ) );
   },
 
-  // The key id an envelope names (the master key's for v1, the collection
-  // key's for v2), base64, or "" if it is not an envelope.
+  // The key id an envelope names (the master key's for a private envelope,
+  // the collection key's otherwise), base64, or "" if it is not an envelope.
   envelopeKeyId( body ) {
     const bytes = this.unb64( body );
-    if ( bytes.length < 1 + this.KEY_ID_BYTES || ( bytes[ 0 ] !== this.ENVELOPE_V1 && bytes[ 0 ] !== this.ENVELOPE_V2 ) ) return "";
+    if ( bytes.length < 1 + this.KEY_ID_BYTES || ( bytes[ 0 ] !== this.ENVELOPE_MASTER && bytes[ 0 ] !== this.ENVELOPE_COLLECTION ) ) return "";
     return this.b64( bytes.subarray( 1 , 1 + this.KEY_ID_BYTES ) );
   },
 
-  // Base64 envelope in, JSON text out. Throws an Error whose code is
+  // Base64 private envelope in, JSON text out. Throws an Error whose code is
   // "wrong_key" (sealed under another key) or "corrupt".
   open( key , collection , id , body ) {
     const sodium = this.sodium;
@@ -152,7 +153,7 @@ const DocsCrypto = {
     };
     const bytes = this.unb64( body );
     const header_end = 1 + this.KEY_ID_BYTES;
-    if ( bytes.length < header_end + this.NONCE_BYTES + 16 || bytes[ 0 ] !== this.ENVELOPE_V1 ) throw fail( "corrupt" );
+    if ( bytes.length < header_end + this.NONCE_BYTES + 16 || bytes[ 0 ] !== this.ENVELOPE_MASTER ) throw fail( "corrupt" );
     if ( !sodium.memcmp( bytes.subarray( 1 , header_end ) , key.id ) ) throw fail( "wrong_key" );
     const header = bytes.subarray( 0 , header_end );
     const nonce = bytes.subarray( header_end , header_end + this.NONCE_BYTES );
@@ -170,8 +171,8 @@ const DocsCrypto = {
     return error;
   },
 
-  // The format byte of a base64 envelope: 1, 2, or 0.
-  envelopeVersion( body ) {
+  // The kind of a base64 envelope: ENVELOPE_MASTER, ENVELOPE_COLLECTION, or 0.
+  envelopeKind( body ) {
     try {
       const bytes = this.unb64( body );
       return bytes.length ? bytes[ 0 ] : 0;
@@ -180,7 +181,7 @@ const DocsCrypto = {
     }
   },
 
-  // ---- v2: collection keys ----
+  // ---- collection keys ----
 
   // One collection's keys. seed (the write half) may be null: read-only.
   collectionKey( collection , read , verify , seed ) {
@@ -189,8 +190,8 @@ const DocsCrypto = {
     const key = {
       collection: collection ,
       read: read ,
-      enc: sodium.crypto_generichash( 32 , this.utf8( "e2eedb/v2/enc" ) , read ) ,
-      id: sodium.crypto_generichash( this.KEY_ID_BYTES , this.utf8( "e2eedb/v2/kid" ) , read ) ,
+      enc: sodium.crypto_generichash( 32 , this.utf8( "e2eedb/collection/enc" ) , read ) ,
+      id: sodium.crypto_generichash( this.KEY_ID_BYTES , this.utf8( "e2eedb/collection/kid" ) , read ) ,
       verify: verify ,
       seed: seed || null ,
       sign: null ,
@@ -220,23 +221,24 @@ const DocsCrypto = {
     return this.join( body , this.utf8( collection ) , new Uint8Array( [ 0 ] ) , this.utf8( id ) );
   },
 
-  // JSON text in, base64 v2 envelope out (sealed and signed).
-  sealV2( key , id , text , nonce ) {
+  // JSON text in, base64 collection envelope out (sealed and signed).
+  sealCollection( key , id , text , nonce ) {
     const sodium = this.sodium;
     if ( !key.sign ) throw this.fail( "read_only" );
-    const header = this.join( new Uint8Array( [ this.ENVELOPE_V2 ] ) , key.id );
+    const header = this.join( new Uint8Array( [ this.ENVELOPE_COLLECTION ] ) , key.id );
     nonce = nonce || sodium.randombytes_buf( this.NONCE_BYTES );
     const sealed = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( this.utf8( text ) , this.associated( header , key.collection , id ) , null , nonce , key.enc );
     const body = this.join( header , nonce , sealed );
     return this.b64( this.join( body , sodium.crypto_sign_detached( this.signed( body , key.collection , id ) , key.sign ) ) );
   },
 
-  // Base64 v2 envelope in, JSON text out, after checking its signature.
-  openV2( key , id , body ) {
+  // Base64 collection envelope in, JSON text out, after checking its
+  // signature.
+  openCollection( key , id , body ) {
     const sodium = this.sodium;
     const bytes = this.unb64( body );
     const header_end = 1 + this.KEY_ID_BYTES;
-    if ( bytes.length < header_end + this.NONCE_BYTES + 16 + this.SIGNATURE_BYTES || bytes[ 0 ] !== this.ENVELOPE_V2 ) throw this.fail( "corrupt" );
+    if ( bytes.length < header_end + this.NONCE_BYTES + 16 + this.SIGNATURE_BYTES || bytes[ 0 ] !== this.ENVELOPE_COLLECTION ) throw this.fail( "corrupt" );
     if ( !sodium.memcmp( bytes.subarray( 1 , header_end ) , key.id ) ) throw this.fail( "wrong_key" );
     const signed_end = bytes.length - this.SIGNATURE_BYTES;
     const signed_part = bytes.subarray( 0 , signed_end );
@@ -257,39 +259,29 @@ const DocsCrypto = {
   },
 
   holderWrap( holder , write ) {
-    const label = this.utf8( write ? "e2eedb/v2/wrap-w" : "e2eedb/v2/wrap-r" );
+    const label = this.utf8( write ? "e2eedb/lock/wrap-w" : "e2eedb/lock/wrap-r" );
     if ( holder.master ) return this.sodium.crypto_generichash( 32 , label , holder.master );
     if ( !write ) return this.sodium.crypto_generichash( 32 , label , holder.read );
     return holder.seed ? this.sodium.crypto_generichash( 32 , label , holder.seed ) : null;
   },
 
-  // What signs and checks the lockboxes a holder wraps (format v3): the
+  // What signs and checks the lockboxes a holder wraps: the
   // master key's own signing key, derived from it, or a collection's write
   // key and verify key. sign is null for a read-only holder.
   holderSigner( holder ) {
     const sodium = this.sodium;
     if ( holder.master ) {
-      const pair = sodium.crypto_sign_seed_keypair( sodium.crypto_generichash( 32 , this.utf8( "e2eedb/v3/lock-sign" ) , holder.master ) );
+      const pair = sodium.crypto_sign_seed_keypair( sodium.crypto_generichash( 32 , this.utf8( "e2eedb/lock/sign-seed" ) , holder.master ) );
       return { sign: pair.privateKey , verify: pair.publicKey };
     }
     return { sign: holder.sign || null , verify: holder.verify };
   },
 
-  // What a v3 lockbox's sig covers:
-  // "e2eedb/v3/lock" || 0 || c || 0 || parent || 0 || key_id || nonce_r || read || nonce_w || write
+  // What a lockbox's sig covers:
+  // "e2eedb/lock/sign" || 0 || c || 0 || parent || 0 || key_id || nonce_r || read || nonce_w || write
   lockSigned( collection , parent , key_id , nonce_r , read , nonce_w , write ) {
     const zero = new Uint8Array( [ 0 ] );
-    return this.join( this.utf8( "e2eedb/v3/lock" ) , zero , this.utf8( collection ) , zero , this.utf8( parent ) , zero , key_id , nonce_r , read , nonce_w , write );
-  },
-
-  // A lockbox's format: 2 (unsigned), 3 (signed), or 0.
-  lockVersion( text ) {
-    try {
-      const box = JSON.parse( text );
-      return box && ( box.v === 2 || box.v === 3 ) ? box.v : 0;
-    } catch ( error ) {
-      return 0;
-    }
+    return this.join( this.utf8( "e2eedb/lock/sign" ) , zero , this.utf8( collection ) , zero , this.utf8( parent ) , zero , key_id , nonce_r , read , nonce_w , write );
   },
 
   lockAssociated( label , collection , parent ) {
@@ -297,31 +289,28 @@ const DocsCrypto = {
     return this.join( this.utf8( label ) , zero , this.utf8( collection ) , zero , this.utf8( parent ) );
   },
 
-  // The lockbox text for key, wrapped by holder and signed (v3). Both need
-  // their write half. version 2 (unsigned) is only for checking the format.
-  sealLock( key , holder , nonce_r , nonce_w , version ) {
+  // The lockbox text for key, wrapped by holder and signed. Both need their
+  // write half.
+  sealLock( key , holder , nonce_r , nonce_w ) {
     const sodium = this.sodium;
     const wrap_write = this.holderWrap( holder , true );
     if ( !key.seed || !wrap_write ) throw this.fail( "read_only" );
     const parent = this.holderParent( holder );
     nonce_r = nonce_r || sodium.randombytes_buf( this.NONCE_BYTES );
     nonce_w = nonce_w || sodium.randombytes_buf( this.NONCE_BYTES );
-    const read = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( this.join( key.read , key.verify ) , this.lockAssociated( "e2eedb/v2/lock-r" , key.collection , parent ) , null , nonce_r , this.holderWrap( holder , false ) );
-    const write = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( key.seed , this.lockAssociated( "e2eedb/v2/lock-w" , key.collection , parent ) , null , nonce_w , wrap_write );
-    const box = {
-      v: version === 2 ? 2 : 3 , parent: parent , by: this.b64( holder.id ) , key_id: this.b64( key.id ) ,
+    const read = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( this.join( key.read , key.verify ) , this.lockAssociated( "e2eedb/lock/read" , key.collection , parent ) , null , nonce_r , this.holderWrap( holder , false ) );
+    const write = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( key.seed , this.lockAssociated( "e2eedb/lock/write" , key.collection , parent ) , null , nonce_w , wrap_write );
+    return JSON.stringify( {
+      parent: parent , by: this.b64( holder.id ) , key_id: this.b64( key.id ) ,
       nonce_r: this.b64( nonce_r ) , read: this.b64( read ) , nonce_w: this.b64( nonce_w ) , write: this.b64( write ) ,
-    };
-    if ( box.v === 3 ) {
-      box.sig = this.b64( sodium.crypto_sign_detached( this.lockSigned( key.collection , parent , key.id , nonce_r , read , nonce_w , write ) , this.holderSigner( holder ).sign ) );
-    }
-    return JSON.stringify( box );
+      sig: this.b64( sodium.crypto_sign_detached( this.lockSigned( key.collection , parent , key.id , nonce_r , read , nonce_w , write ) , this.holderSigner( holder ).sign ) ) ,
+    } );
   },
 
   // collection's keys from its lockbox: the write half too when holder has
-  // one. Errors: "wrong_key" (wrapped by another key), "unsigned_lock" (an
-  // unsigned v2 lockbox met by a read-only holder, which cannot trust it) or
-  // "corrupt".
+  // one, after checking the holder's signature. Errors: "wrong_key" (wrapped
+  // by another key) or "corrupt" (changed, unsigned, or made for another
+  // place).
   openLock( text , collection , holder ) {
     const sodium = this.sodium;
     let box;
@@ -331,25 +320,22 @@ const DocsCrypto = {
       throw this.fail( "corrupt" );
     }
     const parent = this.holderParent( holder );
-    if ( !box || ( box.v !== 2 && box.v !== 3 ) || box.parent !== parent ) throw this.fail( "corrupt" );
+    if ( !box || box.parent !== parent ) throw this.fail( "corrupt" );
     if ( box.by !== this.b64( holder.id ) ) throw this.fail( "wrong_key" );
-    if ( box.v === 2 && !this.holderWrap( holder , true ) ) throw this.fail( "unsigned_lock" );
     let opened , seed = null;
-    if ( box.v === 3 ) {
-      let valid = false;
-      try {
-        const signed = this.lockSigned( collection , parent , this.unb64( box.key_id ) , this.unb64( box.nonce_r ) , this.unb64( box.read ) , this.unb64( box.nonce_w ) , this.unb64( box.write ) );
-        valid = sodium.crypto_sign_verify_detached( this.unb64( box.sig ) , signed , this.holderSigner( holder ).verify );
-      } catch ( error ) {
-        valid = false;
-      }
-      if ( !valid ) throw this.fail( "corrupt" );
-    }
+    let valid = false;
     try {
-      opened = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt( null , this.unb64( box.read ) , this.lockAssociated( "e2eedb/v2/lock-r" , collection , parent ) , this.unb64( box.nonce_r ) , this.holderWrap( holder , false ) );
+      const signed = this.lockSigned( collection , parent , this.unb64( box.key_id ) , this.unb64( box.nonce_r ) , this.unb64( box.read ) , this.unb64( box.nonce_w ) , this.unb64( box.write ) );
+      valid = sodium.crypto_sign_verify_detached( this.unb64( box.sig ) , signed , this.holderSigner( holder ).verify );
+    } catch ( error ) {
+      valid = false;
+    }
+    if ( !valid ) throw this.fail( "corrupt" );
+    try {
+      opened = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt( null , this.unb64( box.read ) , this.lockAssociated( "e2eedb/lock/read" , collection , parent ) , this.unb64( box.nonce_r ) , this.holderWrap( holder , false ) );
       const wrap_write = this.holderWrap( holder , true );
       if ( wrap_write ) {
-        seed = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt( null , this.unb64( box.write ) , this.lockAssociated( "e2eedb/v2/lock-w" , collection , parent ) , this.unb64( box.nonce_w ) , wrap_write );
+        seed = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt( null , this.unb64( box.write ) , this.lockAssociated( "e2eedb/lock/write" , collection , parent ) , this.unb64( box.nonce_w ) , wrap_write );
       }
     } catch ( error ) {
       throw this.fail( "corrupt" );
@@ -385,7 +371,7 @@ const DocsCrypto = {
   },
 
   keyringAssociated( id ) {
-    return this.join( this.utf8( "e2eedb/v1/keyring" ) , id );
+    return this.join( this.utf8( "e2eedb/keyring" ) , id );
   },
 
   passphraseKey( passphrase , salt , ops , mem ) {
@@ -401,7 +387,7 @@ const DocsCrypto = {
     const wrapping = this.passphraseKey( passphrase , salt , this.KEYRING_OPS , this.KEYRING_MEM );
     const wrapped = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( key.master , this.keyringAssociated( key.id ) , null , nonce , wrapping );
     return JSON.stringify( {
-      v: 1 , alg: "argon2id13" , ops: this.KEYRING_OPS , mem: this.KEYRING_MEM ,
+      alg: "argon2id13" , ops: this.KEYRING_OPS , mem: this.KEYRING_MEM ,
       salt: this.b64( salt ) , nonce: this.b64( nonce ) , key_id: this.b64( key.id ) , wrapped: this.b64( wrapped ) ,
     } );
   },
@@ -421,7 +407,7 @@ const DocsCrypto = {
     } catch ( error ) {
       throw fail( "corrupt" );
     }
-    if ( ring.v !== 1 || ring.alg !== "argon2id13" || !( ring.ops >= 1 && ring.ops <= this.MAX_OPS ) || !( ring.mem >= this.MIN_MEM && ring.mem <= this.MAX_MEM ) ) throw fail( "corrupt" );
+    if ( ring.alg !== "argon2id13" || !( ring.ops >= 1 && ring.ops <= this.MAX_OPS ) || !( ring.mem >= this.MIN_MEM && ring.mem <= this.MAX_MEM ) ) throw fail( "corrupt" );
     const id = this.unb64( ring.key_id );
     const wrapping = this.passphraseKey( passphrase , this.unb64( ring.salt ) , ring.ops , ring.mem );
     let master;

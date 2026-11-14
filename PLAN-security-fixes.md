@@ -91,30 +91,24 @@ key. Other read-only holders then accept documents forged with that key.
 Holders of the master key or a write key are safe, because they also open the
 write half and reject the lockbox.
 
-Fix, as lockbox format v3:
+Fix: signed lockboxes (done; README.md, "Crypto format", "Lockboxes").
 
-1. Add `sig` to the lockbox: Ed25519 by the holder's write key over
-   `"e2eedb/v3/lock" || 0 || c || 0 || parent || key_id || nonce_r || read`.
-   - For a sub-folder, the holder's write key is the parent's `ws`, checked
-     with the parent's `vk`.
+1. Every lockbox carries `sig`, Ed25519 by the holder over
+   `"e2eedb/lock/sign" || 0 || c || 0 || parent || 0 || key_id || nonce_r || read || nonce_w || write`.
+   - For a sub-folder, the holder's key is the parent's `ws`, checked with the
+     parent's `vk`.
    - For a top-level folder, the master key derives a signing seed:
-     `BLAKE2b-256(key = M, "e2eedb/v3/lock-sign")`.
-2. Readers verify `sig` before trusting the read half. A read-only holder
-   accepts only a v3 lockbox. Full holders still open v2, because they check
-   the write half.
-3. Upgrade lockboxes as they are touched:
-   - `PrepareShare` and every lockbox rewrap (moves) write v3.
-   - Add a "re-seal all lockboxes" step that a master-key holder runs once.
-     The server accepts a v2-to-v3 replacement only when the new lockbox's
-   `key_id` matches the old one.
-4. Change the Go client (`client/crypto_collection.go`) and the browser
-   (`static/js/docs_crypto.js`) together. Add vectors to
-   `client/testdata/vectors.json` and keep `scripts/check_crypto.js` passing.
-5. Update the README "Crypto format" section. Until this ships, change the
-   claim "cannot forge a document even with the server's help" to say that it
-   holds for the shared folder itself, and not yet for its sub-folders.
-6. Test: build a forged v2 sub-folder lockbox from a read-only key. A
-   read-only client must refuse it.
+     `BLAKE2b-256(key = M, "e2eedb/lock/sign-seed")`.
+2. Every reader verifies `sig` before trusting the read half. A lockbox
+   without a valid one opens for nobody.
+3. The server sets a lockbox once (`409 lock_exists`) and replaces it only
+   with a move.
+4. The Go client (`client/crypto_collection.go`) and the browser
+   (`static/js/docs_crypto.js`) change together. `client/testdata/vectors.json`
+   pins them, and `scripts/check_crypto.js` holds the browser to them.
+5. Tests: `TestForgedChildLockbox` (`client/crypto_test.go`) and the forged
+   lockbox check in `scripts/check_crypto.js`. Both build a sub-folder
+   lockbox from a read-only key, which must be refused.
 
 ## E4 (low): the access-token view runs as the signed-in account
 

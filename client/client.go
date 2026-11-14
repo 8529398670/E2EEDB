@@ -291,19 +291,19 @@ func ( client *Client ) open( ctx context.Context , meta Meta , body string , ou
 	return
 }
 
-// openEnvelope opens either format: v1 with the master key, v2 with the
-// collection's keys.
+// openEnvelope opens either kind: a private envelope with the master key, a
+// collection envelope with the collection's keys.
 func ( client *Client ) openEnvelope( ctx context.Context , collection string , id string , envelope []byte ) ( plaintext []byte , err error ) {
-	switch EnvelopeVersion( envelope ) {
-	case envelopeV1:
+	switch EnvelopeKind( envelope ) {
+	case EnvelopeMaster:
 		if client.key == nil {
-			// Written before collection keys; only the master key opens
-			// it until its owner upgrades the collection (PrepareShare).
+			// Only the master key opens a private envelope, until its owner
+			// shares the collection (PrepareShare seals it again).
 			err = ErrWrongKey
 			return
 		}
 		plaintext , err = client.key.Open( collection , id , envelope )
-	case envelopeV2:
+	case EnvelopeCollection:
 		key , key_err := client.CollectionKey( ctx , collection , false )
 		if key_err != nil { return nil , key_err }
 		plaintext , err = key.Open( id , envelope )

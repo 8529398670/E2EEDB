@@ -53,7 +53,7 @@ type docListRow struct {
 // docWithBody is one document with its ciphertext.
 type docWithBody struct {
 	docMeta
-	Body string `json:"body" jsonschema_description:"Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it."`
+	Body string `json:"body" jsonschema_description:"Standard base64 (with padding) of the client's envelope. A collection envelope (what clients write): 0x02, the collection key's 16-byte id, a 24-byte nonce, XChaCha20-Poly1305 ciphertext of the JSON document, then a 64-byte Ed25519 signature. A private envelope (sealed by the master key alone, so never shareable): 0x01, the master key's id, nonce and ciphertext the same way, no signature. See README.md. The server stores it and never opens it."`
 }
 
 func ( docWithBody ) APIName() ( name string ) { name = "Doc"; return }
@@ -146,7 +146,7 @@ func ( handlers *Handlers ) checkScopeRoot( c fiber.Ctx ) ( refused *refusal ) {
 		refused = refuse( fiber.StatusNotFound , "no such collection" )
 	case err != nil:
 		refused = internalFailure( err )
-	case scope.Born != 0 && entry.Born != scope.Born:
+	case entry.Born != scope.Born:
 		refused = refuse( fiber.StatusNotFound , "no such collection" )
 	}
 	return
@@ -334,7 +334,7 @@ type collectionFields struct {
 	Name   *string `json:"name,omitempty" jsonschema_description:"1-128 characters, no control characters, no space at either end."`
 	Parent *string `json:"parent,omitempty" jsonschema_description:"Parent's id; \"\" for the top level."`
 	Before *string `json:"before,omitempty" jsonschema_description:"The sibling to go in front of; \"\" or absent for the end."`
-	Lock   *string `json:"lock,omitempty" jsonschema:"minLength=1,maxLength=2048" jsonschema_description:"A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists, except replacing an unsigned v2 lockbox with its signed v3 form (same key_id, parent and by)." error:"lock must be 1-2048 bytes"`
+	Lock   *string `json:"lock,omitempty" jsonschema:"minLength=1,maxLength=2048" jsonschema_description:"A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists." error:"lock must be 1-2048 bytes"`
 }
 
 type createCollectionRequest struct {
@@ -585,7 +585,7 @@ func ( handlers *Handlers ) getDoc( c fiber.Ctx , in *docPath ) ( reply *docWith
 
 type setDocRequest struct {
 	docPath
-	Body      string `json:"body" jsonschema_description:"Standard base64 (with padding) of the client's envelope. v1: 0x01, a 16-byte key id, a 24-byte nonce, then XChaCha20-Poly1305 ciphertext of the JSON document. v2 (collection keys): 0x02, the collection key's id, nonce and ciphertext the same way, then a 64-byte Ed25519 signature. See README.md. The server stores it and never opens it." error:"body must be a base64 v1 or v2 envelope (see README.md); the server stores ciphertext only"`
+	Body      string `json:"body" jsonschema_description:"Standard base64 (with padding) of the client's envelope. A collection envelope (what clients write): 0x02, the collection key's 16-byte id, a 24-byte nonce, XChaCha20-Poly1305 ciphertext of the JSON document, then a 64-byte Ed25519 signature. A private envelope (sealed by the master key alone, so never shareable): 0x01, the master key's id, nonce and ciphertext the same way, no signature. See README.md. The server stores it and never opens it." error:"body must be a base64 private or collection envelope (see README.md); the server stores ciphertext only"`
 	IfVersion *int64 `json:"if_version,omitempty" jsonschema:"minimum=0" jsonschema_description:"Write only if the document is at this version: 0 means only if there is no live document. Absent: unconditional. A mismatch is 409 version_conflict with current_version and live." error:"if_version must be 0 or more"`
 }
 
@@ -593,7 +593,7 @@ type setDocRequest struct {
 func envelope( encoded string ) ( body []byte , refused *refusal ) {
 	body , err := base64.StdEncoding.DecodeString( encoded )
 	if err != nil || docstore.ValidEnvelope( body ) == false {
-		refused = refuse( fiber.StatusBadRequest , "body must be a base64 v1 or v2 envelope (see README.md); the server stores ciphertext only" )
+		refused = refuse( fiber.StatusBadRequest , "body must be a base64 private or collection envelope (see README.md); the server stores ciphertext only" )
 		return
 	}
 	return
@@ -612,8 +612,8 @@ func ( handlers *Handlers ) setDoc( c fiber.Ctx , in *setDocRequest ) ( reply *d
 	var body []byte
 	if refused == nil { body , refused = envelope( in.Body ) }
 	if refused == nil { refused = handlers.checkScope( c , in.Collection , true ) }
-	if refused == nil && docScope( c ) != nil && body[ 0 ] != docstore.EnvelopeV2 {
-		refused = refuse( fiber.StatusBadRequest , "a scoped key writes v2 envelopes only" )
+	if refused == nil && docScope( c ) != nil && body[ 0 ] != docstore.EnvelopeCollection {
+		refused = refuse( fiber.StatusBadRequest , "a scoped key writes collection envelopes only" )
 	}
 	if refused != nil {
 		err = refused
@@ -663,7 +663,7 @@ type moveDocRequest struct {
 	docPath
 	ToCollection string `json:"to_collection" jsonschema:"minLength=1,maxLength=64" jsonschema_description:"The destination collection's id. It must exist." error:"to_collection must be 1-64 of A-Z a-z 0-9 _ -"`
 	ToID         string `json:"to_id,omitempty" jsonschema:"maxLength=128" jsonschema_description:"The document's id there. Default: the same id." error:"to_id must be 1-128 of A-Z a-z 0-9 _ - ."`
-	Body         string `json:"body" jsonschema_description:"Standard base64 of the document's v1 or v2 envelope, sealed for to_collection and to_id. See README.md." error:"body must be a base64 v1 or v2 envelope (see README.md); the server stores ciphertext only"`
+	Body         string `json:"body" jsonschema_description:"Standard base64 of the document's private or collection envelope, sealed for to_collection and to_id. See README.md." error:"body must be a base64 private or collection envelope (see README.md); the server stores ciphertext only"`
 	IfVersion    *int64 `json:"if_version,omitempty" jsonschema:"minimum=1" jsonschema_description:"Move only if the source is at this version." error:"if_version must be 1 or more"`
 }
 
@@ -699,8 +699,8 @@ func ( handlers *Handlers ) moveDoc( c fiber.Ctx , in *moveDocRequest ) ( reply 
 	for _ , place := range []string{ in.Collection , in.ToCollection } {
 		if refused == nil { refused = handlers.checkScope( c , place , true ) }
 	}
-	if refused == nil && docScope( c ) != nil && body[ 0 ] != docstore.EnvelopeV2 {
-		refused = refuse( fiber.StatusBadRequest , "a scoped key writes v2 envelopes only" )
+	if refused == nil && docScope( c ) != nil && body[ 0 ] != docstore.EnvelopeCollection {
+		refused = refuse( fiber.StatusBadRequest , "a scoped key writes collection envelopes only" )
 	}
 	if refused != nil {
 		err = refused

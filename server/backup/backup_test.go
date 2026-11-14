@@ -310,8 +310,8 @@ func TestBackupCarriesTheDocumentStore( t *testing.T ) {
 	store := openStore( t , cfg )
 	docs , err := docstore.Open( cfg.DocsPath )
 	if err != nil { t.Fatal( err ) }
-	body := make( []byte , docstore.EnvelopeMin )
-	body[ 0 ] = docstore.EnvelopeV1
+	body := make( []byte , docstore.EnvelopeMasterMin )
+	body[ 0 ] = docstore.EnvelopeMaster
 	limits := docstore.Limits{ MaxDocBytes: 1024 }
 	if _ , err = docs.Set( 1 , "notes" , "kept" , body , nil , limits ); err != nil { t.Fatal( err ) }
 

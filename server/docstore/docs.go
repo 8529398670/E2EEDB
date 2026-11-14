@@ -7,21 +7,23 @@ import (
 	time "time"
 )
 
-// Envelope format: the first byte of every document body. The rest of the
+// Envelope kind: the first byte of every document body. The rest of the
 // body is the client's business (see README.md, "Crypto format"); the server
 // only checks this byte and the minimum length, so a client sending
 // something that is plainly not an envelope (plaintext JSON, say) is refused
 // rather than stored.
 const (
-	EnvelopeV1 = 0x01
-	// EnvelopeMin is the smallest possible v1 envelope: version byte, 16-byte
+	// EnvelopeMaster is a private envelope, sealed by the account's master
+	// key alone.
+	EnvelopeMaster = 0x01
+	// EnvelopeMasterMin is the smallest private envelope: kind byte, 16-byte
 	// key id, 24-byte nonce, 16-byte tag around an empty plaintext.
-	EnvelopeMin = 1 + 16 + 24 + 16
-	// EnvelopeV2 is a document sealed with its collection's own keys and
-	// signed (README.md, "Crypto format"): a v1 envelope plus a 64-byte
+	EnvelopeMasterMin = 1 + 16 + 24 + 16
+	// EnvelopeCollection is a collection envelope, sealed with its
+	// collection's own keys and signed: the same shape plus a 64-byte
 	// Ed25519 signature.
-	EnvelopeV2    = 0x02
-	EnvelopeMinV2 = EnvelopeMin + 64
+	EnvelopeCollection    = 0x02
+	EnvelopeCollectionMin = EnvelopeMasterMin + 64
 )
 
 var (
@@ -48,12 +50,13 @@ func ValidDocID( id string ) bool {
 	return docIDPattern.MatchString( id ) && id != "." && id != ".."
 }
 
-// ValidEnvelope is whether body looks like a v1 or v2 envelope.
+// ValidEnvelope is whether body looks like a private or a collection
+// envelope.
 func ValidEnvelope( body []byte ) bool {
 	switch {
-	case len( body ) >= EnvelopeMin && body[ 0 ] == EnvelopeV1:
+	case len( body ) >= EnvelopeMasterMin && body[ 0 ] == EnvelopeMaster:
 		return true
-	case len( body ) >= EnvelopeMinV2 && body[ 0 ] == EnvelopeV2:
+	case len( body ) >= EnvelopeCollectionMin && body[ 0 ] == EnvelopeCollection:
 		return true
 	}
 	return false

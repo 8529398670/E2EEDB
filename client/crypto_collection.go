@@ -1,6 +1,6 @@
 package client
 
-// Collection keys: format v2 (README.md, "Crypto format"). Every collection
+// Collection keys (README.md, "Crypto format"). Every collection
 // has its own read key and its own write (signing) key. The master key opens
 // the top-level collections' lockboxes, and each collection's keys open its
 // children's, so a collection key reaches its own subtree and nothing else.
@@ -9,8 +9,8 @@ package client
 // server's help.
 //
 //	read key  rk (32 random bytes)
-//	  enc     = BLAKE2b-256( key = rk , "e2eedb/v2/enc" )
-//	  key_id  = BLAKE2b-128( key = rk , "e2eedb/v2/kid" )
+//	  enc     = BLAKE2b-256( key = rk , "e2eedb/collection/enc" )
+//	  key_id  = BLAKE2b-128( key = rk , "e2eedb/collection/kid" )
 //	write key ws (32 random bytes, an Ed25519 seed) -> verify key vk
 //
 // Like crypto.go, every primitive is libsodium's, so the browser
@@ -30,40 +30,30 @@ import (
 )
 
 const (
-	envelopeV2   = 0x02
-	signatureLen = ed25519.SignatureSize
-	envelopeMin2 = headerSize + nonceSize + chacha20poly1305.Overhead + signatureLen
+	// EnvelopeCollection is the first byte of a collection envelope: sealed
+	// by a collection's read key and signed by its write key. Every write
+	// uses it unless asked for a private envelope (Key.Seal).
+	EnvelopeCollection = 0x02
 
-	encLabelV2   = "e2eedb/v2/enc"
-	keyIDLabelV2 = "e2eedb/v2/kid"
-	wrapReadLabel  = "e2eedb/v2/wrap-r"
-	wrapWriteLabel = "e2eedb/v2/wrap-w"
-	lockReadLabel  = "e2eedb/v2/lock-r"
-	lockWriteLabel = "e2eedb/v2/lock-w"
-	lockSignLabel  = "e2eedb/v3/lock"
-	lockSeedLabel  = "e2eedb/v3/lock-sign"
+	signatureLen          = ed25519.SignatureSize
+	envelopeCollectionMin = headerSize + nonceSize + chacha20poly1305.Overhead + signatureLen
 
-	// lockboxV2 is unsigned: its read half is wrapped by the holder's read
-	// key alone, so a read-only holder could forge one. Readers that hold
-	// the write half still open it (they check the write half, which a
-	// read-only holder cannot make); read-only readers refuse it.
-	lockboxV2 = 2
-	// lockboxV3 adds sig, the holder's write key's signature over the
-	// lockbox, which every reader checks.
-	lockboxV3 = 3
+	collectionEncLabel = "e2eedb/collection/enc"
+	collectionKIDLabel = "e2eedb/collection/kid"
+	wrapReadLabel      = "e2eedb/lock/wrap-r"
+	wrapWriteLabel     = "e2eedb/lock/wrap-w"
+	lockReadLabel      = "e2eedb/lock/read"
+	lockWriteLabel     = "e2eedb/lock/write"
+	lockSignLabel      = "e2eedb/lock/sign"
+	lockSeedLabel      = "e2eedb/lock/sign-seed"
 
 	// AccessTokenPrefix starts every access token (NewAccessToken).
-	AccessTokenPrefix = "e2eedb-ck1."
+	AccessTokenPrefix = "e2eedb-ck."
 )
 
 // ErrReadOnly: the key in hand can read here but not write (no write key),
 // or the server refused a write for the same reason.
 var ErrReadOnly = errors.New( "e2eedb: this key is read-only" )
-
-// ErrLockUnsigned: a read-only key met a collection whose lockbox is from
-// before lockboxes were signed (format v2), which it cannot trust. The
-// account's owner opening the documents once (or UpgradeLocks) signs it.
-var ErrLockUnsigned = errors.New( "e2eedb: this collection's keys are not signed yet; its owner needs to open it once" )
 
 // CollectionKey is one collection's keys: always the read half, and the
 // write half when the holder may write. It opens that collection's documents
@@ -84,8 +74,8 @@ func newCollectionKey( collection string , read []byte , verify []byte , seed []
 	}
 	key = &CollectionKey{ collection: collection , verify: append( ed25519.PublicKey{} , verify... ) }
 	copy( key.read[ : ] , read )
-	copy( key.enc[ : ] , generichash( chacha20poly1305.KeySize , read , encLabelV2 ) )
-	copy( key.id[ : ] , generichash( keyIDSize , read , keyIDLabelV2 ) )
+	copy( key.enc[ : ] , generichash( chacha20poly1305.KeySize , read , collectionEncLabel ) )
+	copy( key.id[ : ] , generichash( keyIDSize , read , collectionKIDLabel ) )
 	if seed != nil {
 		key.sign = ed25519.NewKeyFromSeed( seed )
 		if string( key.sign.Public().( ed25519.PublicKey ) ) != string( key.verify ) {
@@ -124,10 +114,10 @@ func ( key *CollectionKey ) ReadOnly() ( result *CollectionKey ) {
 }
 
 func ( key *CollectionKey ) header() []byte {
-	return append( []byte{ envelopeV2 } , key.id[ : ]... )
+	return append( []byte{ EnvelopeCollection } , key.id[ : ]... )
 }
 
-// signed is what a v2 signature covers: the envelope before the signature,
+// signed is what a collection envelope's signature covers: the envelope before the signature,
 // then where the document lives.
 func signed( body []byte , collection string , id string ) []byte {
 	data := append( append( []byte{} , body... ) , collection... )
@@ -156,10 +146,10 @@ func ( key *CollectionKey ) sealWithNonce( id string , plaintext []byte , nonce 
 	return
 }
 
-// Open checks the signature and decrypts a v2 envelope written as id in this
-// collection.
+// Open checks the signature and decrypts a collection envelope written as id
+// in this collection.
 func ( key *CollectionKey ) Open( id string , envelope []byte ) ( plaintext []byte , err error ) {
-	if len( envelope ) < envelopeMin2 || envelope[ 0 ] != envelopeV2 {
+	if len( envelope ) < envelopeCollectionMin || envelope[ 0 ] != EnvelopeCollection {
 		err = ErrCorrupt
 		return
 	}
@@ -183,10 +173,11 @@ func ( key *CollectionKey ) Open( id string , envelope []byte ) ( plaintext []by
 	return
 }
 
-// EnvelopeVersion is an envelope's format byte (1 or 2), 0 if empty.
-func EnvelopeVersion( envelope []byte ) int {
+// EnvelopeKind is an envelope's first byte: EnvelopeMaster or
+// EnvelopeCollection, 0 if empty.
+func EnvelopeKind( envelope []byte ) byte {
 	if len( envelope ) == 0 { return 0 }
-	return int( envelope[ 0 ] )
+	return envelope[ 0 ]
 }
 
 // A lockHolder wraps lockboxes: the master key (for top-level collections)
@@ -205,7 +196,7 @@ func ( key *Key ) wrapRead() []byte   { return generichash( 32 , key.master[ : ]
 func ( key *Key ) wrapWrite() []byte  { return generichash( 32 , key.master[ : ] , wrapWriteLabel ) }
 
 // The master key signs top-level lockboxes with a key of its own, derived
-// from it: lock_seed = BLAKE2b-256( key = M , "e2eedb/v3/lock-sign" ).
+// from it: lock_seed = BLAKE2b-256( key = M , "e2eedb/lock/sign-seed" ).
 func ( key *Key ) lockSigner() ed25519.PrivateKey {
 	return ed25519.NewKeyFromSeed( generichash( ed25519.SeedSize , key.master[ : ] , lockSeedLabel ) )
 }
@@ -228,7 +219,6 @@ func ( key *CollectionKey ) lockVerifier() ed25519.PublicKey { return key.verify
 // lockbox is the text the server stores beside a collection. Byte fields are
 // standard base64.
 type lockbox struct {
-	V      int    `json:"v"`
 	Parent string `json:"parent"`
 	By     string `json:"by"`
 	KeyID  string `json:"key_id"`
@@ -236,7 +226,7 @@ type lockbox struct {
 	Read   string `json:"read"`
 	NonceW string `json:"nonce_w"`
 	Write  string `json:"write"`
-	Sig    string `json:"sig,omitempty"` // v3
+	Sig    string `json:"sig"`
 }
 
 func lockAD( label string , collection string , parent string ) []byte {
@@ -246,10 +236,10 @@ func lockAD( label string , collection string , parent string ) []byte {
 	return append( data , parent... )
 }
 
-// lockSigned is what a v3 lockbox's sig covers: where it belongs, which
-// keys it holds, and both wrapped halves.
+// lockSigned is what a lockbox's sig covers: where it belongs, which keys it
+// holds, and both wrapped halves.
 //
-//	"e2eedb/v3/lock" || 0 || c || 0 || parent || 0 || key_id (16) || nonce_r || read || nonce_w || write
+//	"e2eedb/lock/sign" || 0 || c || 0 || parent || 0 || key_id (16) || nonce_r || read || nonce_w || write
 func lockSigned( collection string , parent string , key_id []byte , nonce_r []byte , read []byte , nonce_w []byte , write []byte ) []byte {
 	data := append( []byte( lockSignLabel ) , 0 )
 	data = append( append( data , collection... ) , 0 )
@@ -260,8 +250,8 @@ func lockSigned( collection string , parent string , key_id []byte , nonce_r []b
 	return data
 }
 
-// sealLock wraps key's halves for holder, signed (v3). Both must be able to
-// write.
+// sealLock wraps key's halves for holder and signs them. Both must be able
+// to write.
 func sealLock( key *CollectionKey , holder lockHolder ) ( text string , err error ) {
 	nonce_r := make( []byte , nonceSize )
 	nonce_w := make( []byte , nonceSize )
@@ -272,12 +262,6 @@ func sealLock( key *CollectionKey , holder lockHolder ) ( text string , err erro
 }
 
 func sealLockWith( key *CollectionKey , holder lockHolder , nonce_r []byte , nonce_w []byte ) ( text string , err error ) {
-	text , err = sealLockVersion( key , holder , nonce_r , nonce_w , lockboxV3 )
-	return
-}
-
-// sealLockVersion is sealLockWith for a given format; only tests write v2.
-func sealLockVersion( key *CollectionKey , holder lockHolder , nonce_r []byte , nonce_w []byte , version int ) ( text string , err error ) {
 	wrap_write := holder.wrapWrite()
 	if key.sign == nil || wrap_write == nil {
 		err = ErrReadOnly
@@ -291,12 +275,10 @@ func sealLockVersion( key *CollectionKey , holder lockHolder , nonce_r []byte , 
 	read := read_aead.Seal( nil , nonce_r , append( append( []byte{} , key.read[ : ]... ) , key.verify... ) , lockAD( lockReadLabel , key.collection , parent ) )
 	write := write_aead.Seal( nil , nonce_w , key.sign.Seed() , lockAD( lockWriteLabel , key.collection , parent ) )
 	box := lockbox{
-		V: version , Parent: parent , By: holder.ID() , KeyID: key.ID() ,
+		Parent: parent , By: holder.ID() , KeyID: key.ID() ,
 		NonceR: b64.EncodeToString( nonce_r ) , Read: b64.EncodeToString( read ) ,
 		NonceW: b64.EncodeToString( nonce_w ) , Write: b64.EncodeToString( write ) ,
-	}
-	if version == lockboxV3 {
-		box.Sig = b64.EncodeToString( ed25519.Sign( holder.lockSigner() , lockSigned( key.collection , parent , key.id[ : ] , nonce_r , read , nonce_w , write ) ) )
+		Sig: b64.EncodeToString( ed25519.Sign( holder.lockSigner() , lockSigned( key.collection , parent , key.id[ : ] , nonce_r , read , nonce_w , write ) ) ) ,
 	}
 	encoded , err := json.Marshal( box )
 	text = string( encoded )
@@ -308,13 +290,8 @@ func sealLockVersion( key *CollectionKey , holder lockHolder , nonce_r []byte , 
 // ErrWrongKey; one made for another place, or changed, is ErrCorrupt.
 func openLock( text string , collection string , holder lockHolder ) ( key *CollectionKey , err error ) {
 	var box lockbox
-	if err = json.Unmarshal( []byte( text ) , &box ); err != nil || ( box.V != lockboxV2 && box.V != lockboxV3 ) {
+	if err = json.Unmarshal( []byte( text ) , &box ); err != nil {
 		err = ErrCorrupt
-		return
-	}
-	if box.V == lockboxV2 && holder.wrapWrite() == nil {
-		// Unsigned, and this holder cannot check the write half either.
-		err = ErrLockUnsigned
 		return
 	}
 	parent := holder.lockParent()
@@ -332,16 +309,14 @@ func openLock( text string , collection string , holder lockHolder ) ( key *Coll
 		err = ErrCorrupt
 		return
 	}
-	if box.V == lockboxV3 {
-		key_id , id_err := b64.DecodeString( box.KeyID )
-		nonce_w , nonce_w_err := b64.DecodeString( box.NonceW )
-		write , write_err := b64.DecodeString( box.Write )
-		sig , sig_err := b64.DecodeString( box.Sig )
-		if errors.Join( id_err , nonce_w_err , write_err , sig_err ) != nil || len( sig ) != signatureLen ||
-			ed25519.Verify( holder.lockVerifier() , lockSigned( collection , parent , key_id , nonce_r , read , nonce_w , write ) , sig ) == false {
-			err = fmt.Errorf( "%w: lockbox signature" , ErrCorrupt )
-			return
-		}
+	key_id , id_err := b64.DecodeString( box.KeyID )
+	nonce_w , nonce_w_err := b64.DecodeString( box.NonceW )
+	write , write_err := b64.DecodeString( box.Write )
+	sig , sig_err := b64.DecodeString( box.Sig )
+	if errors.Join( id_err , nonce_w_err , write_err , sig_err ) != nil || len( sig ) != signatureLen ||
+		ed25519.Verify( holder.lockVerifier() , lockSigned( collection , parent , key_id , nonce_r , read , nonce_w , write ) , sig ) == false {
+		err = fmt.Errorf( "%w: lockbox signature" , ErrCorrupt )
+		return
 	}
 	read_aead , err := chacha20poly1305.NewX( holder.wrapRead() )
 	if err != nil { return }
@@ -352,9 +327,7 @@ func openLock( text string , collection string , holder lockHolder ) ( key *Coll
 	}
 	var seed []byte
 	if wrap_write := holder.wrapWrite(); wrap_write != nil {
-		nonce_w , nonce_w_err := b64.DecodeString( box.NonceW )
-		write , write_err := b64.DecodeString( box.Write )
-		if errors.Join( nonce_w_err , write_err ) != nil || len( nonce_w ) != nonceSize {
+		if len( nonce_w ) != nonceSize {
 			err = ErrCorrupt
 			return
 		}
@@ -430,11 +403,4 @@ func ParseAccessToken( token string ) ( apiKey string , key *CollectionKey , err
 	}
 	apiKey = payload.APIKey
 	return
-}
-
-// lockVersion is a lockbox's format (2 or 3), 0 if it is not one.
-func lockVersion( text string ) int {
-	var box struct{ V int `json:"v"` }
-	if json.Unmarshal( []byte( text ) , &box ) != nil { return 0 }
-	return box.V
 }

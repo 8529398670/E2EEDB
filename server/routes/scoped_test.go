@@ -3,7 +3,6 @@ package routes
 import (
 	context "context"
 	base64 "encoding/base64"
-	json "encoding/json"
 	errors "errors"
 	strings "strings"
 	testing "testing"
@@ -35,20 +34,21 @@ func TestScopedAccessTokens( t *testing.T ) {
 	} {
 		if _ , err = owner.CreateCollection( ctx , folder ); err != nil { t.Fatalf( "create %s: %v" , folder.ID , err ) }
 	}
-	// A document from before collection keys: v1, the master key's own.
-	legacy , _ := owner.Key().Seal( "projects" , "old" , []byte( `{"customer":"legacy"}` ) )
-	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/projects/docs/old" , fiber.Map{ "body": base64.StdEncoding.EncodeToString( legacy ) } ); status != 200 {
-		t.Fatalf( "legacy write: %d %v" , status , reply )
+	// A private envelope: the master key's own, which no access token opens.
+	private , _ := owner.Key().Seal( "projects" , "old" , []byte( `{"customer":"private"}` ) )
+	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/projects/docs/old" , fiber.Map{ "body": base64.StdEncoding.EncodeToString( private ) } ); status != 200 {
+		t.Fatalf( "private write: %d %v" , status , reply )
 	}
 	for collection , customer := range map[ string ]string{ "alpha": "Alpha" , "notes": "Notes" , "private": "Secret" } {
 		if _ , err = owner.Set( ctx , collection , "a" , invoice{ Customer: customer } ); err != nil { t.Fatal( err ) }
 	}
 
-	// Share projects read-only: the legacy document is upgraded to v2.
+	// Share projects read-only: the private envelope is sealed again as a
+	// collection envelope.
 	read_key , err := owner.PrepareShare( ctx , "projects" , false )
 	if err != nil || read_key.CanWrite() { t.Fatalf( "prepare: %v" , err ) }
 	stored , _ := fixture.handlers.Docs.Get( fixture.alice.ID , "projects" , "old" )
-	if client.EnvelopeVersion( stored.Body ) != 2 { t.Fatal( "the v1 document was not upgraded" ) }
+	if client.EnvelopeKind( stored.Body ) != client.EnvelopeCollection { t.Fatal( "the private envelope was not sealed for sharing" ) }
 
 	// The scoped key, made the way the browser makes it.
 	browser := fixture.signIn( t , fixture.alice.ID )
@@ -69,7 +69,7 @@ func TestScopedAccessTokens( t *testing.T ) {
 
 	// It reads the whole subtree...
 	var back invoice
-	if _ , err = reader.Get( ctx , "projects" , "old" , &back ); err != nil || back.Customer != "legacy" { t.Fatalf( "legacy via token: %+v %v" , back , err ) }
+	if _ , err = reader.Get( ctx , "projects" , "old" , &back ); err != nil || back.Customer != "private" { t.Fatalf( "resealed via token: %+v %v" , back , err ) }
 	for collection , customer := range map[ string ]string{ "alpha": "Alpha" , "notes": "Notes" } {
 		if _ , err = reader.Get( ctx , collection , "a" , &back ); err != nil || back.Customer != customer { t.Fatalf( "%s via token: %+v %v" , collection , back , err ) }
 	}
@@ -104,7 +104,7 @@ func TestScopedAccessTokens( t *testing.T ) {
 	// A read/write token for the same collection.
 	write_key , err := owner.PrepareShare( ctx , "projects" , true )
 	if err != nil { t.Fatal( err ) }
-	writer_api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "writer" , models.KeyScope{ Collection: "projects" , Write: true } , time.Hour )
+	writer_api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "writer" , models.KeyScope{ Collection: "projects" , Write: true , Born: bornOf( t , fixture , "projects" ) } , time.Hour )
 	if err != nil { t.Fatal( err ) }
 	writer_token , _ := client.NewAccessToken( writer_api , write_key )
 	writer , err := client.NewScoped( base , writer_token )
@@ -161,7 +161,7 @@ func TestScopedKeysCannotSquatIDs( t *testing.T ) {
 	if _ , err = owner.CreateCollection( ctx , client.NewCollection{ ID: "shared" } ); err != nil { t.Fatal( err ) }
 	write_key , err := owner.PrepareShare( ctx , "shared" , true )
 	if err != nil { t.Fatal( err ) }
-	scoped_api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "sharee" , models.KeyScope{ Collection: "shared" , Write: true } , time.Hour )
+	scoped_api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "sharee" , models.KeyScope{ Collection: "shared" , Write: true , Born: bornOf( t , fixture , "shared" ) } , time.Hour )
 	if err != nil { t.Fatal( err ) }
 	token , _ := client.NewAccessToken( scoped_api , write_key )
 	sharee , err := client.NewScoped( base , token )
@@ -207,14 +207,10 @@ func TestScopedKeysDieWithTheirFolder( t *testing.T ) {
 	if status != 201 { t.Fatalf( "scoped key: %d %v" , status , reply ) }
 	scoped_api := reply[ "credential" ].( string )
 	scoped_id , _ , _ := strings.Cut( scoped_api , "." )
-	// A key as minted before born was kept: no Born.
-	legacy_api , legacy , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "legacy" , models.KeyScope{ Collection: "shared" , Write: true } , time.Hour )
-	if err != nil || legacy.Scope.Born != 0 { t.Fatalf( "legacy key: %v" , err ) }
-	filled , revoked , err := models.BackfillScopeBorn( fixture.store , func( user_id uint64 , collection string ) ( int64 , bool , error ) {
-		entry , get_err := fixture.handlers.Docs.GetCollection( user_id , collection )
-		return entry.Born , get_err == nil , nil
-	} )
-	if err != nil || filled != 1 || revoked != 0 { t.Fatalf( "backfill: %d %d %v" , filled , revoked , err ) }
+	// A key without its folder's born value is never minted.
+	if _ , _ , err = models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "no born" , models.KeyScope{ Collection: "shared" , Write: true } , time.Hour ); errors.Is( err , models.ErrScopeBorn ) == false {
+		t.Fatalf( "scoped key without born: %v" , err )
+	}
 
 	if _ , err = owner.DeleteCollection( ctx , "shared" ); err != nil { t.Fatalf( "delete: %v" , err ) }
 	stored , err := models.GetAPIKey( fixture.store , scoped_id )
@@ -223,9 +219,7 @@ func TestScopedKeysDieWithTheirFolder( t *testing.T ) {
 	// The same id, made again: neither key reaches it, even if one were
 	// somehow live again.
 	if _ , err = owner.Set( ctx , "shared" , "fresh" , invoice{ Customer: "new" } ); err != nil { t.Fatalf( "recreate: %v" , err ) }
-	for _ , credential := range []string{ scoped_api , legacy_api } {
-		if status , _ := fixture.withKey( t , credential , fiber.MethodGet , "/api/collections/shared/docs" , nil ); status == 200 { t.Fatal( "an old key lists the new folder" ) }
-	}
+	if status , _ := fixture.withKey( t , scoped_api , fiber.MethodGet , "/api/collections/shared/docs" , nil ); status == 200 { t.Fatal( "an old key lists the new folder" ) }
 	// Born alone also keeps an unrevoked key out: a key for the old folder,
 	// with its revocation undone, still gets 404.
 	if err = fixture.store.Write( func( tx *db.Tx ) ( tx_err error ) {
@@ -241,57 +235,10 @@ func TestScopedKeysDieWithTheirFolder( t *testing.T ) {
 	if status , _ := fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections/shared/docs/fresh/delete" , fiber.Map{} ); status != 404 { t.Fatalf( "old key deleted in the new folder: %d" , status ) }
 }
 
-// A sub-collection lockbox from before lockboxes were signed (v2) is refused
-// to a read-only access token -- it could have been planted by another one --
-// until a master-key client signs it (UpgradeLocks), which the server allows
-// as the one in-place lockbox change.
-func TestUnsignedLockboxesAreUpgraded( t *testing.T ) {
-	fixture := newAuthFixture( t )
-	base := serve( t , fixture )
-	api_key := issueKey( t , fixture , fixture.alice , models.RoleUser )
-	master_text , _ := client.GenerateKey()
-	owner , err := client.New( base , api_key , master_text )
+// bornOf is collection's born value, which a scoped key is minted with.
+func bornOf( t *testing.T , fixture *authFixture , collection string ) int64 {
+	t.Helper()
+	entry , err := fixture.handlers.Docs.GetCollection( fixture.alice.ID , collection )
 	if err != nil { t.Fatal( err ) }
-	ctx := context.Background()
-	if _ , err = owner.CreateCollection( ctx , client.NewCollection{ ID: "projects" } ); err != nil { t.Fatal( err ) }
-	kid , err := owner.CreateCollection( ctx , client.NewCollection{ ID: "kid" , Parent: "projects" } )
-	if err != nil { t.Fatal( err ) }
-	signed := kid.Lock
-	if signed == "" {
-		collections , _ := owner.Collections( ctx )
-		for _ , entry := range collections { if entry.ID == "kid" { signed = entry.Lock } }
-	}
-	// The same lockbox as v2 wrote it: no sig.
-	var box map[ string ]any
-	if err = json.Unmarshal( []byte( signed ) , &box ); err != nil || box[ "v" ] != float64( 3 ) { t.Fatalf( "new lockbox is not v3: %s" , signed ) }
-	box[ "v" ] = 2
-	delete( box , "sig" )
-	unsigned , _ := json.Marshal( box )
-	if _ , err = owner.DeleteCollection( ctx , "kid" ); err != nil { t.Fatal( err ) }
-	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections" , fiber.Map{ "id": "kid" , "parent": "projects" , "lock": string( unsigned ) } ); status != 200 {
-		t.Fatalf( "v2 lockbox: %d %v" , status , reply )
-	}
-	writer , _ := client.New( base , api_key , master_text )
-	if _ , err = writer.Set( ctx , "kid" , "a" , invoice{ Customer: "under kid" } ); err != nil { t.Fatalf( "owner writes under a v2 lockbox: %v" , err ) }
-
-	// Share projects read-only, the way it was done before PrepareShare
-	// signed lockboxes: the reader is refused the unsigned one.
-	read_key , err := writer.CollectionKey( ctx , "projects" , false )
-	if err != nil { t.Fatal( err ) }
-	reader_api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "reader" , models.KeyScope{ Collection: "projects" } , time.Hour )
-	if err != nil { t.Fatal( err ) }
-	token , _ := client.NewAccessToken( reader_api , read_key.ReadOnly() )
-	reader , _ := client.NewScoped( base , token )
-	var back invoice
-	if _ , err = reader.Get( ctx , "kid" , "a" , &back ); errors.Is( err , client.ErrLockUnsigned ) == false { t.Fatalf( "reader opened a v2 lockbox: %v" , err ) }
-	// A read-only key cannot sign it, and the server refuses its attempt.
-	if upgraded , err := reader.UpgradeLocks( ctx ); err != nil || upgraded != 0 { t.Fatalf( "reader upgrade: %d %v" , upgraded , err ) }
-
-	upgraded , err := writer.UpgradeLocks( ctx )
-	if err != nil || upgraded != 1 { t.Fatalf( "upgrade: %d %v" , upgraded , err ) }
-	if again , err := writer.UpgradeLocks( ctx ); err != nil || again != 0 { t.Fatalf( "second upgrade: %d %v" , again , err ) }
-	fresh , _ := client.NewScoped( base , token )
-	if _ , err = fresh.Get( ctx , "kid" , "a" , &back ); err != nil || back.Customer != "under kid" { t.Fatalf( "reader after upgrade: %+v %v" , back , err ) }
-	// Any other in-place change is still refused.
-	if status , _ := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/kid" , fiber.Map{ "lock": string( unsigned ) } ); status != 409 { t.Fatalf( "v3 replaced in place: %d" , status ) }
+	return entry.Born
 }

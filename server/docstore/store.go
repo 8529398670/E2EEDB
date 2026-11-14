@@ -5,7 +5,7 @@
 // What it stores per document is only what routing and sync need: the account
 // it belongs to, its collection id and its own id, a version, a change sequence
 // number, when it last changed, its size, and the ciphertext. It never parses
-// the ciphertext beyond checking its first byte names the envelope format (see
+// the ciphertext beyond checking its first byte names the envelope kind (see
 // ValidEnvelope), and it has no key that could open it. That is why this
 // package imports no crypto: the server's own key (server/encryption) has
 // nothing to do here, and rotating it leaves docs.db alone.
@@ -117,6 +117,14 @@ func Snapshot( path string , out string ) ( err error ) {
 // migrations are the schema, one step per version: PRAGMA user_version is how
 // many have run. Append; never edit one that has shipped.
 var migrations = []string{
+	// docs: every document and tombstone. keyrings: each account's wrapped
+	// master key. collections: the folder tree. lock is a folder's lockbox,
+	// opaque text the client wraps (README.md, "Crypto format"), "" for none
+	// yet. by_key is the id of the scoped API key that made it ("" when the
+	// account itself did), so a client can refuse to write into a folder
+	// someone it shared with made. born is random and never changes: it
+	// tells a folder from a later one that reuses its id, so a scoped key
+	// minted for one never reaches the other.
 	`CREATE TABLE docs (
 		user_id    INTEGER NOT NULL,
 		collection TEXT    NOT NULL,
@@ -140,11 +148,8 @@ var migrations = []string{
 		key   TEXT PRIMARY KEY,
 		value INTEGER NOT NULL
 	);
-	INSERT INTO meta ( key , value ) VALUES ( 'seq' , 0 ) , ( 'horizon' , 0 );`,
-
-	// 2: folders. Every collection that holds a document becomes a top-level
-	// folder named after itself.
-	`CREATE TABLE collections (
+	INSERT INTO meta ( key , value ) VALUES ( 'seq' , 0 ) , ( 'horizon' , 0 );
+	CREATE TABLE collections (
 		user_id    INTEGER NOT NULL,
 		id         TEXT    NOT NULL,
 		name       TEXT    NOT NULL,
@@ -153,31 +158,16 @@ var migrations = []string{
 		version    INTEGER NOT NULL,
 		seq        INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
+		lock       TEXT    NOT NULL DEFAULT '',
+		by_key     TEXT    NOT NULL DEFAULT '',
+		born       INTEGER NOT NULL,
 		PRIMARY KEY ( user_id , id )
 	) WITHOUT ROWID;
 	CREATE INDEX collections_by_parent ON collections ( user_id , parent , position );
 	CREATE TABLE trees (
 		user_id INTEGER PRIMARY KEY,
 		seq     INTEGER NOT NULL
-	);
-	INSERT INTO collections ( user_id , id , name , parent , position , version , seq , updated_at )
-		SELECT user_id , collection , collection , '' ,
-			ROW_NUMBER() OVER ( PARTITION BY user_id ORDER BY collection ) - 1 , 1 , 0 , MAX( updated_at )
-		FROM docs WHERE deleted = 0 GROUP BY user_id , collection;`,
-
-	// 3: collection keys. lock is the collection's lockbox, opaque text the
-	// client wraps (README.md, "Crypto format"); "" for none yet.
-	`ALTER TABLE collections ADD COLUMN lock TEXT NOT NULL DEFAULT '';`,
-
-	// 4: who made a folder, and which folder this is. by_key is the id of
-	// the scoped API key that created it ("" when the account itself did),
-	// so a client can refuse to write into a folder someone it shared with
-	// made. born is random and never changes: it tells a folder from a later
-	// one that reuses its id, so a scoped key minted for one never reaches
-	// the other.
-	`ALTER TABLE collections ADD COLUMN by_key TEXT NOT NULL DEFAULT '';
-	ALTER TABLE collections ADD COLUMN born INTEGER NOT NULL DEFAULT 0;
-	UPDATE collections SET born = ( random() & 9223372036854775807 ) | 1;`,
+	);`,
 }
 
 func ( store *Store ) migrate() ( err error ) {

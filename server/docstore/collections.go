@@ -4,8 +4,6 @@ import (
 	rand "crypto/rand"
 	sql "database/sql"
 	binary "encoding/binary"
-	json "encoding/json"
-	os "os"
 	errors "errors"
 	strconv "strconv"
 	strings "strings"
@@ -229,7 +227,7 @@ func ( store *Store ) UpdateCollection( user_id uint64 , id string , change Coll
 		case parent != current.Parent && current.Lock != "" && change.Lock == nil:
 			tx_err = ErrLockRequired
 			return
-		case change.Lock != nil && parent == current.Parent && current.Lock != "" && *change.Lock != current.Lock && signsLock( current.Lock , *change.Lock ) == false:
+		case change.Lock != nil && parent == current.Parent && current.Lock != "" && *change.Lock != current.Lock:
 			tx_err = ErrLockExists
 			return
 		case change.Lock != nil:
@@ -334,22 +332,6 @@ func ( store *Store ) MoveDoc( user_id uint64 , from string , id string , to str
 		return
 	} )
 	return
-}
-
-// signsLock is whether replacement is the signed form (v3) of the unsigned
-// lockbox current (v2): the same keys (key_id) for the same parent, which is
-// the one change to a lockbox allowed without a move. The server cannot open
-// either, so it checks only what the client will check again.
-func signsLock( current string , replacement string ) bool {
-	type header struct {
-		V      int    `json:"v"`
-		Parent string `json:"parent"`
-		By     string `json:"by"`
-		KeyID  string `json:"key_id"`
-	}
-	var old , next header
-	if json.Unmarshal( []byte( current ) , &old ) != nil || json.Unmarshal( []byte( replacement ) , &next ) != nil { return false }
-	return old.V == 2 && next.V == 3 && old.KeyID != "" && next.KeyID == old.KeyID && next.Parent == old.Parent && next.By == old.By
 }
 
 // newBorn is a folder's born value: random, never 0.
@@ -572,66 +554,4 @@ func touchTree( tx *sql.Tx , user_id uint64 ) ( seq int64 , err error ) {
 	if seq , err = nextSeq( tx ); err != nil { return }
 	err = markTree( tx , user_id , "" , seq )
 	return
-}
-
-// AuditEntry is one folder AuditNested reports.
-type AuditEntry struct {
-	UserID uint64
-	ID     string
-	Name   string
-	Parent string
-	ByKey  string
-}
-
-// AuditNested lists, from the store at path (opened read-only, so it works
-// with a server running), every folder that sits inside another folder and
-// whose id is not a random one. Such a folder is where someone holding a
-// read/write access token could have taken an id the account's own code
-// writes to by name, before scoped keys were held to random ids. Browsers
-// and client.CreateCollection always use random ids, so this list is short:
-// check each one is a folder you made.
-func AuditNested( path string ) ( entries []AuditEntry , err error ) {
-	if _ , err = os.Stat( path ); err != nil { return }
-	handle , err := sql.Open( "sqlite" , dsn( path , true ) )
-	if err != nil { return }
-	defer handle.Close()
-	has_by_key := false
-	if columns , column_err := handle.Query( `SELECT name FROM pragma_table_info( 'collections' )` ); column_err == nil {
-		for columns.Next() {
-			var name string
-			if columns.Scan( &name ) == nil && name == "by_key" { has_by_key = true }
-		}
-		columns.Close()
-	}
-	by_key := "''"
-	if has_by_key { by_key = "by_key" }
-	rows , err := handle.Query( `SELECT user_id , id , name , parent , ` + by_key + ` FROM collections WHERE parent != '' ORDER BY user_id , parent , id` )
-	if err != nil { return }
-	defer rows.Close()
-	entries = []AuditEntry{}
-	for rows.Next() {
-		var entry AuditEntry
-		if err = rows.Scan( &entry.UserID , &entry.ID , &entry.Name , &entry.Parent , &entry.ByKey ); err != nil { return }
-		if ValidRandomID( entry.ID ) || randomServerID( entry.ID ) { continue }
-		entries = append( entries , entry )
-	}
-	err = rows.Err()
-	return
-}
-
-// randomServerID is the shape of an id the server picks for a folder made
-// without one (routes.newCollectionID): 16 of A-Z a-z 0-9 with at least one
-// digit and both cases, which a word or a name almost never has.
-func randomServerID( id string ) bool {
-	if len( id ) != 16 { return false }
-	var upper , lower , digit bool
-	for _ , r := range id {
-		switch {
-		case r >= 'A' && r <= 'Z': upper = true
-		case r >= 'a' && r <= 'z': lower = true
-		case r >= '0' && r <= '9': digit = true
-		default: return false
-		}
-	}
-	return upper && lower && digit
 }

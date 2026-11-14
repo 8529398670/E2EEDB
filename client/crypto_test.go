@@ -23,23 +23,21 @@ type vectors struct {
 	DocID      string `json:"doc_id"`
 	Plaintext  string `json:"plaintext"`
 	Nonce      string `json:"nonce"`
-	Envelope   string `json:"envelope"`
+	// The private envelope: sealed by the master key alone.
+	Envelope   string `json:"envelope_private"`
 	Passphrase string `json:"passphrase"`
 	Keyring    string `json:"keyring"`
-	// Format v2: collection "notes" (top level) and "notes-2024" under it.
+	// Collection keys: "notes" (top level) and "notes-2024" under it.
 	ReadKey      string `json:"read_key"`
 	WriteKey     string `json:"write_key"`
 	VerifyKey    string `json:"verify_key"`
 	ReadKeyID    string `json:"read_key_id"`
-	EnvelopeV2   string `json:"envelope_v2"`
+	EnvelopeCollection string `json:"envelope_collection"`
 	Lockbox      string `json:"lockbox"`
 	Child        string `json:"child"`
 	ChildRead    string `json:"child_read_key"`
 	ChildWrite   string `json:"child_write_key"`
 	ChildLockbox string `json:"child_lockbox"`
-	// The same child lockbox in the unsigned format from before v3, which
-	// holders of the write half still open and read-only holders refuse.
-	ChildLockboxV2 string `json:"child_lockbox_v2"`
 	APIKey       string `json:"api_key"`
 	AccessToken  string `json:"access_token_read_only"`
 }
@@ -58,22 +56,19 @@ func fixedVectors( t *testing.T ) ( result vectors ) {
 	if err != nil { t.Fatal( err ) }
 	notes := fixedCollectionKey( t , "notes" , 0x40 )
 	child := fixedCollectionKey( t , "notes-2024" , 0x60 )
-	envelope_v2 , err := notes.sealWithNonce( "doc-1" , []byte( plaintext ) , nonce )
+	envelope_collection , err := notes.sealWithNonce( "doc-1" , []byte( plaintext ) , nonce )
 	if err != nil { t.Fatal( err ) }
 	nonce_w := bytes.Repeat( []byte{ 0x42 } , nonceSize )
 	lock , err := sealLockWith( notes , key , nonce , nonce_w )
 	if err != nil { t.Fatal( err ) }
 	child_lock , err := sealLockWith( child , notes , nonce , nonce_w )
 	if err != nil { t.Fatal( err ) }
-	child_lock_v2 , err := sealLockVersion( child , notes , nonce , nonce_w , lockboxV2 )
-	if err != nil { t.Fatal( err ) }
 	token , err := NewAccessToken( "kid.secret" , notes.ReadOnly() )
 	if err != nil { t.Fatal( err ) }
 	result = vectors{
-		ChildLockboxV2: child_lock_v2 ,
 		ReadKey: b64.EncodeToString( notes.read[ : ] ) , WriteKey: b64.EncodeToString( notes.sign.Seed() ) ,
 		VerifyKey: b64.EncodeToString( notes.verify ) , ReadKeyID: notes.ID() ,
-		EnvelopeV2: b64.EncodeToString( envelope_v2 ) , Lockbox: lock ,
+		EnvelopeCollection: b64.EncodeToString( envelope_collection ) , Lockbox: lock ,
 		Child: "notes-2024" , ChildRead: b64.EncodeToString( child.read[ : ] ) , ChildWrite: b64.EncodeToString( child.sign.Seed() ) ,
 		ChildLockbox: child_lock , APIKey: "kid.secret" , AccessToken: token ,
 		MasterKey: key.Export() , KeyID: key.ID() , Collection: "notes" , DocID: "doc-1" , Plaintext: plaintext ,
@@ -116,23 +111,19 @@ func TestVectors( t *testing.T ) {
 	unwrapped , err := UnwrapKey( stored.Keyring , stored.Passphrase )
 	if err != nil || unwrapped.Export() != stored.MasterKey { t.Fatalf( "unwrap vector: %v" , err ) }
 
-	// v2: the master key opens the top-level lockbox, its keys open the
+	// Collection keys: the master key opens the top-level lockbox, its keys open the
 	// child's, and the read-only token opens the document but cannot write.
 	notes , err := openLock( stored.Lockbox , stored.Collection , key )
 	if err != nil || notes.CanWrite() == false { t.Fatalf( "open lockbox: %v" , err ) }
-	envelope_v2 , _ := b64.DecodeString( stored.EnvelopeV2 )
-	if plaintext , err = notes.Open( stored.DocID , envelope_v2 ); err != nil || string( plaintext ) != stored.Plaintext { t.Fatalf( "open v2: %q %v" , plaintext , err ) }
+	envelope_collection , _ := b64.DecodeString( stored.EnvelopeCollection )
+	if plaintext , err = notes.Open( stored.DocID , envelope_collection ); err != nil || string( plaintext ) != stored.Plaintext { t.Fatalf( "open collection envelope: %q %v" , plaintext , err ) }
 	child , err := openLock( stored.ChildLockbox , stored.Child , notes )
 	if err != nil || b64.EncodeToString( child.read[ : ] ) != stored.ChildRead { t.Fatalf( "open child lockbox: %v" , err ) }
 	api_key , reader , err := ParseAccessToken( stored.AccessToken )
 	if err != nil || api_key != stored.APIKey || reader.CanWrite() { t.Fatalf( "token: %v" , err ) }
-	if plaintext , err = reader.Open( stored.DocID , envelope_v2 ); err != nil || string( plaintext ) != stored.Plaintext { t.Fatalf( "reader open: %v" , err ) }
+	if plaintext , err = reader.Open( stored.DocID , envelope_collection ); err != nil || string( plaintext ) != stored.Plaintext { t.Fatalf( "reader open: %v" , err ) }
 	child_read , err := openLock( stored.ChildLockbox , stored.Child , reader )
 	if err != nil || child_read.CanWrite() { t.Fatalf( "reader child lockbox: %v" , err ) }
-	// The unsigned v2 lockbox: the write half's holder still opens it, a
-	// read-only holder refuses it.
-	if child , err = openLock( stored.ChildLockboxV2 , stored.Child , notes ); err != nil || child.CanWrite() == false { t.Fatalf( "v2 child lockbox: %v" , err ) }
-	if _ , err = openLock( stored.ChildLockboxV2 , stored.Child , reader ); errors.Is( err , ErrLockUnsigned ) == false { t.Fatalf( "reader opened a v2 lockbox: %v" , err ) }
 }
 
 // forger is what a read-only holder of parent can make lockboxes with: the
@@ -152,33 +143,39 @@ func ( holder forger ) lockVerifier() ed25519.PublicKey { return holder.sign.Pub
 
 // A read-only key, even with the server's help, cannot plant a sub-collection
 // lockbox other holders accept: it can wrap the read half, but cannot sign as
-// the parent (v3), and an unsigned one (v2) is refused to read-only holders
-// and fails the write-half check for everyone else.
+// the parent, and a lockbox without the signature is refused.
 func TestForgedChildLockbox( t *testing.T ) {
 	parent , _ := generateCollectionKey( "parent" )
 	_ , own_sign , _ := ed25519.GenerateKey( nil )
 	fake := forger{ parent: parent.ReadOnly() , sign: own_sign , write: bytes.Repeat( []byte{ 7 } , 32 ) }
 	planted , _ := generateCollectionKey( "child" )
-	for _ , version := range []int{ lockboxV2 , lockboxV3 } {
-		lock , err := sealLockVersion( planted , fake , bytes.Repeat( []byte{ 1 } , nonceSize ) , bytes.Repeat( []byte{ 2 } , nonceSize ) , version )
-		if err != nil { t.Fatal( err ) }
-		if _ , err = openLock( lock , "child" , parent.ReadOnly() ); err == nil { t.Fatalf( "v%d: another read-only holder accepted a forged lockbox" , version ) }
-		if _ , err = openLock( lock , "child" , parent ); err == nil { t.Fatalf( "v%d: the parent's full holder accepted a forged lockbox" , version ) }
-	}
-	// The real one opens for both.
+	forged , err := sealLockWith( planted , fake , bytes.Repeat( []byte{ 1 } , nonceSize ) , bytes.Repeat( []byte{ 2 } , nonceSize ) )
+	if err != nil { t.Fatal( err ) }
+	if _ , err = openLock( forged , "child" , parent.ReadOnly() ); err == nil { t.Fatal( "another read-only holder accepted a forged lockbox" ) }
+	if _ , err = openLock( forged , "child" , parent ); err == nil { t.Fatal( "the parent's full holder accepted a forged lockbox" ) }
+	// The real one opens for both, and stops opening once its signature is
+	// stripped.
 	real , _ := generateCollectionKey( "child" )
 	lock , _ := sealLock( real , parent )
-	if _ , err := openLock( lock , "child" , parent.ReadOnly() ); err != nil { t.Fatalf( "reader: %v" , err ) }
-	if _ , err := openLock( lock , "child" , parent ); err != nil { t.Fatalf( "writer: %v" , err ) }
+	if _ , err = openLock( lock , "child" , parent.ReadOnly() ); err != nil { t.Fatalf( "reader: %v" , err ) }
+	if _ , err = openLock( lock , "child" , parent ); err != nil { t.Fatalf( "writer: %v" , err ) }
+	var box lockbox
+	json.Unmarshal( []byte( lock ) , &box )
+	box.Sig = ""
+	unsigned , _ := json.Marshal( box )
+	for _ , holder := range []*CollectionKey{ parent , parent.ReadOnly() } {
+		if _ , err = openLock( string( unsigned ) , "child" , holder ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "unsigned lockbox: %v" , err ) }
+	}
 }
 
+// The private envelope.
 func TestSealOpen( t *testing.T ) {
 	encoded , err := GenerateKey()
 	if err != nil { t.Fatal( err ) }
 	key , _ := ParseKey( encoded )
 	envelope , err := key.Seal( "notes" , "a" , []byte( `{"x":1}` ) )
 	if err != nil { t.Fatal( err ) }
-	if envelope[ 0 ] != envelopeV1 || len( envelope ) != envelopeMin + 7 { t.Fatalf( "envelope shape: %d bytes" , len( envelope ) ) }
+	if envelope[ 0 ] != EnvelopeMaster || len( envelope ) != envelopeMin + 7 { t.Fatalf( "envelope shape: %d bytes" , len( envelope ) ) }
 
 	if plain , err := key.Open( "notes" , "a" , envelope ); err != nil || string( plain ) != `{"x":1}` { t.Fatalf( "open: %q %v" , plain , err ) }
 	// Moved to another id or collection: refused, not shown.
@@ -234,7 +231,7 @@ func TestCollectionKeys( t *testing.T ) {
 	if err != nil { t.Fatal( err ) }
 
 	envelope , err := child.Seal( "a" , []byte( `{"x":1}` ) )
-	if err != nil || EnvelopeVersion( envelope ) != 2 { t.Fatalf( "seal: %v" , err ) }
+	if err != nil || EnvelopeKind( envelope ) != EnvelopeCollection { t.Fatalf( "seal: %v" , err ) }
 
 	// Master -> parent -> child.
 	opened_parent , err := openLock( parent_lock , "parent" , master )
@@ -273,5 +270,5 @@ func TestCollectionKeys( t *testing.T ) {
 		api_key , back , err := ParseAccessToken( token )
 		if err != nil || api_key != "id.secret" || back.CanWrite() != key.CanWrite() || back.ID() != key.ID() { t.Fatalf( "token: %v" , err ) }
 	}
-	if _ , _ , err = ParseAccessToken( "e2eedb-ck1.nope" ); err == nil { t.Fatal( "bad token accepted" ) }
+	if _ , _ , err = ParseAccessToken( "e2eedb-ck.nope" ); err == nil { t.Fatal( "bad token accepted" ) }
 }
