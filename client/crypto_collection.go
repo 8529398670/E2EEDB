@@ -95,6 +95,10 @@ func freshEpoch( above uint64 ) uint64 {
 func ( key *CollectionKey ) Epoch() uint64 { return key.epoch }
 
 func newCollectionKey( collection string , read []byte , verify []byte , seed []byte ) ( key *CollectionKey , err error ) {
+	if ValidCollectionID( collection ) == false {
+		err = ErrBadID
+		return
+	}
 	if len( read ) != 32 || len( verify ) != ed25519.PublicKeySize || ( seed != nil && len( seed ) != ed25519.SeedSize ) {
 		err = ErrCorrupt
 		return
@@ -167,6 +171,7 @@ func ( key *CollectionKey ) sealWithNonce( id string , plaintext []byte , nonce 
 		err = ErrReadOnly
 		return
 	}
+	if err = checkIDs( key.collection , id ); err != nil { return }
 	aead , err := chacha20poly1305.NewX( key.enc[ : ] )
 	if err != nil { return }
 	header := key.header()
@@ -178,6 +183,7 @@ func ( key *CollectionKey ) sealWithNonce( id string , plaintext []byte , nonce 
 // Open checks the signature and decrypts a collection envelope written as id
 // in this collection.
 func ( key *CollectionKey ) Open( id string , envelope []byte ) ( plaintext []byte , err error ) {
+	if err = checkIDs( key.collection , id ); err != nil { return }
 	if len( envelope ) < envelopeCollectionMin || envelope[ 0 ] != EnvelopeCollection {
 		err = ErrCorrupt
 		return

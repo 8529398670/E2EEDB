@@ -98,25 +98,49 @@ const DocsTree = {
       .sort( ( a , b ) => a.position - b.position || ( a.id < b.id ? -1 : 1 ) );
   },
 
-  // id and everything under it, parents first.
+  // How many steps a walk up or down the tree takes at most: one past the
+  // deepest the server allows. The tree is the server's word, and one that
+  // says A is in B and B in A must not hang the page.
+  maxSteps() {
+    return ( this.page && this.page.max_depth > 0 ? this.page.max_depth : 64 ) + 1;
+  },
+
+  // id and everything under it, parents first, each once.
   subtree( id ) {
     const result = [];
-    const walk = ( at ) => {
+    const seen = new Set();
+    const limit = this.maxSteps();
+    const walk = ( at , depth ) => {
+      if ( seen.has( at ) || depth > limit ) return;
+      seen.add( at );
       result.push( at );
-      this.children( at ).forEach( ( child ) => walk( child.id ) );
+      this.children( at ).forEach( ( child ) => walk( child.id , depth + 1 ) );
     };
-    if ( this.get( id ) ) walk( id );
+    if ( this.get( id ) ) walk( id , 1 );
     return result;
+  },
+
+  // id and the folders above it that this page has, nearest first. broken
+  // is true when the walk goes round in a loop, or on past maxSteps. A
+  // parent the page does not have (above an access key's folder) is where
+  // it stops.
+  ancestry( id ) {
+    const ids = [];
+    for ( let at = this.get( id ) ; at ; at = at.parent === "" ? null : this.get( at.parent ) ) {
+      if ( ids.includes( at.id ) || ids.length >= this.maxSteps() ) return { ids: ids , broken: true };
+      ids.push( at.id );
+    }
+    return { ids: ids , broken: false };
+  },
+
+  // Whether id's place in the tree is one the page cannot show.
+  broken( id ) {
+    return this.ancestry( id ).broken;
   },
 
   // "Work / Invoices / 2026", for a folder picker and messages.
   path( id ) {
-    const names = [];
-    for ( let at = this.get( id ) ; at ; at = this.get( at.parent ) ) {
-      names.unshift( at.name );
-      if ( names.length > 64 ) break;
-    }
-    return names.join( " / " );
+    return this.ancestry( id ).ids.map( ( at ) => this.get( at ).name ).reverse().join( " / " );
   },
 
   // The sibling after id, leaving out skip: where "after id" is "before that".
@@ -131,12 +155,12 @@ const DocsTree = {
   // Opens every folder above id, so it shows.
   reveal( id ) {
     let changed = false;
-    for ( let at = this.get( this.get( id ) ? this.get( id ).parent : "" ) ; at ; at = this.get( at.parent ) ) {
-      if ( !this.opened.has( at.id ) ) {
-        this.opened.add( at.id );
+    this.ancestry( id ).ids.slice( 1 ).forEach( ( at ) => {
+      if ( !this.opened.has( at ) ) {
+        this.opened.add( at );
         changed = true;
       }
-    }
+    } );
     if ( changed ) {
       this.saveOpened();
       this.render();
@@ -429,13 +453,23 @@ const DocsTree = {
           // With a key, the folder gets its own keys now; without, the
           // first write gives it them.
           const change = { name: values.name , parent: parent };
-          if ( Docs.hasKey() ) {
-            change.id = DocsCrypto.newId();
-            const fresh = await Docs.newLock( change.id , parent );
-            change.lock = fresh.lock;
-            Docs.folderKeys.set( change.id , fresh.key );
+          if ( Docs.scope !== null ) {
+            // An access key's new folder gets its id from the server, and
+            // its keys in a second call: a lockbox names the id it is for.
+            const bare = await Api.createCollection( change );
+            if ( !DocsCrypto.validCollectionId( bare.id ) ) throw DocsCrypto.fail( "bad_id" );
+            const fresh = await Docs.newLock( bare.id , parent );
+            Docs.folderKeys.set( bare.id , fresh.key );
+            made = await Api.updateCollection( bare.id , { lock: fresh.lock } );
+          } else {
+            if ( Docs.hasKey() ) {
+              change.id = DocsCrypto.newId();
+              const fresh = await Docs.newLock( change.id , parent );
+              change.lock = fresh.lock;
+              Docs.folderKeys.set( change.id , fresh.key );
+            }
+            made = await Api.createCollection( change );
           }
-          made = await Api.createCollection( change );
         } catch ( error ) {
           throw new Error( error.code ? error.message : this.failed( error ) );
         }

@@ -28,27 +28,16 @@ const (
 
 var (
 	collectionPattern = regexp.MustCompile( `^[A-Za-z0-9_-]{1,64}$` )
-	docIDPattern      = regexp.MustCompile( `^[A-Za-z0-9_.-]{1,128}$` )
+	docIDPattern      = regexp.MustCompile( `^[A-Za-z0-9_-]{1,128}$` )
 )
 
 // ValidCollection is whether name may name a collection.
 func ValidCollection( name string ) bool { return collectionPattern.MatchString( name ) }
 
-// randomIDPattern is client.NewID's shape: 16 random bytes, unpadded
-// URL-safe base64.
-var randomIDPattern = regexp.MustCompile( `^[A-Za-z0-9_-]{22}$` )
-
-// ValidRandomID is whether id has the shape of a random id (client.NewID,
-// the browser's DocsCrypto.newId). A scoped key may only make folders with
-// such ids, so it cannot take an id the account's own code writes to by name
-// ("invoices") before that code makes it.
-func ValidRandomID( id string ) bool { return randomIDPattern.MatchString( id ) }
-
-// ValidDocID is whether id may name a document. "." and ".." are refused so
-// an id is never a path segment with a meaning of its own.
-func ValidDocID( id string ) bool {
-	return docIDPattern.MatchString( id ) && id != "." && id != ".."
-}
+// ValidDocID is whether id may name a document: no dots, so an id is never
+// a path segment with a meaning of its own, and never looks like a file
+// name a cache (Cloudflare's, by extension) would keep.
+func ValidDocID( id string ) bool { return docIDPattern.MatchString( id ) }
 
 // ValidEnvelope is whether body looks like a private or a collection
 // envelope.
@@ -216,7 +205,12 @@ func setTx( tx *sql.Tx , user_id uint64 , collection string , id string , body [
 	}
 	seq , err := nextSeq( tx , user_id )
 	if err != nil { return }
-	doc = Doc{ Collection: collection , ID: id , Version: row.version + 1 , Seq: seq , UpdatedAt: fromMillis( millis( now ) ) , Size: len( body ) }
+	// A document's first version is its change number, not 1: one made
+	// again after its tombstone was purged then starts above every version
+	// the old one had, so a stale client's if_version never matches it.
+	version := row.version + 1
+	if row.found == false { version = seq }
+	doc = Doc{ Collection: collection , ID: id , Version: version , Seq: seq , UpdatedAt: fromMillis( millis( now ) ) , Size: len( body ) }
 	_ , err = tx.Exec( `INSERT INTO docs ( user_id , collection , doc_id , version , seq , updated_at , deleted , size , body )
 		VALUES ( ? , ? , ? , ? , ? , ? , 0 , ? , ? )
 		ON CONFLICT ( user_id , collection , doc_id ) DO UPDATE SET
@@ -259,7 +253,7 @@ func deleteTx( tx *sql.Tx , user_id uint64 , collection string , id string , if_
 // Get is one live document, body included.
 func ( store *Store ) Get( user_id uint64 , collection string , id string ) ( doc Doc , err error ) {
 	var updated int64
-	err = store.db.QueryRow( `SELECT version , seq , updated_at , size , body FROM docs
+	err = store.read.QueryRow( `SELECT version , seq , updated_at , size , body FROM docs
 		WHERE user_id = ? AND collection = ? AND doc_id = ? AND deleted = 0` ,
 		user_id , collection , id ).Scan( &doc.Version , &doc.Seq , &updated , &doc.Size , &doc.Body )
 	if errors.Is( err , sql.ErrNoRows ) {
@@ -279,12 +273,12 @@ func ( store *Store ) Get( user_id uint64 , collection string , id string ) ( do
 // times the largest document into memory; the caller's next page carries on
 // from where it stopped.
 func ( store *Store ) List( user_id uint64 , collection string , offset int , limit int , with_bodies bool , max_bytes int ) ( docs []Doc , total int , err error ) {
-	err = store.db.QueryRow( `SELECT COUNT(*) FROM docs WHERE user_id = ? AND collection = ? AND deleted = 0` ,
+	err = store.read.QueryRow( `SELECT COUNT(*) FROM docs WHERE user_id = ? AND collection = ? AND deleted = 0` ,
 		user_id , collection ).Scan( &total )
 	if err != nil { return }
 	body_column := "NULL"
 	if with_bodies { body_column = "body" }
-	rows , err := store.db.Query( `SELECT doc_id , version , seq , updated_at , size , `+ body_column +` FROM docs
+	rows , err := store.read.Query( `SELECT doc_id , version , seq , updated_at , size , `+ body_column +` FROM docs
 		WHERE user_id = ? AND collection = ? AND deleted = 0 ORDER BY doc_id LIMIT ? OFFSET ?` ,
 		user_id , collection , limit , offset )
 	if err != nil { return }
@@ -325,7 +319,7 @@ func ( usage Usage ) Charged() int64 { return usage.Bytes + int64( usage.Tombsto
 // Usage is what the account's documents add up to, from the running totals
 // (one row, however many documents there are).
 func ( store *Store ) Usage( user_id uint64 ) ( usage Usage , err error ) {
-	usage , err = scanUsage( store.db.QueryRow( usageQuery , user_id ) )
+	usage , err = scanUsage( store.read.QueryRow( usageQuery , user_id ) )
 	return
 }
 
@@ -358,7 +352,7 @@ func ( store *Store ) Changes( user_id uint64 , since int64 , limit int ) ( docs
 func ( store *Store ) ChangesIn( user_id uint64 , root string , since int64 , limit int ) ( docs []Doc , more bool , err error ) {
 	if since > 0 {
 		var horizon int64
-		err = store.db.QueryRow( `SELECT horizon FROM counters WHERE user_id = ?` , user_id ).Scan( &horizon )
+		err = store.read.QueryRow( `SELECT horizon FROM counters WHERE user_id = ?` , user_id ).Scan( &horizon )
 		if errors.Is( err , sql.ErrNoRows ) { err = nil }
 		if err != nil { return }
 		if since < horizon {
@@ -377,7 +371,7 @@ func ( store *Store ) ChangesIn( user_id uint64 , root string , since int64 , li
 			WHERE user_id = ? AND seq > ? AND collection IN ( SELECT id FROM sub ) ORDER BY seq LIMIT ?`
 		arguments = []any{ user_id , root , user_id , user_id , since , limit + 1 }
 	}
-	rows , err := store.db.Query( query , arguments... )
+	rows , err := store.read.Query( query , arguments... )
 	if err != nil { return }
 	defer rows.Close()
 	docs = []Doc{}

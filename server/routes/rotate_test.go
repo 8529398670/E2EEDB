@@ -3,6 +3,7 @@ package routes
 import (
 	context "context"
 	base64 "encoding/base64"
+	json "encoding/json"
 	errors "errors"
 	http "net/http"
 	strings "strings"
@@ -190,11 +191,14 @@ func TestRotateCommitChecks( t *testing.T ) {
 		if _ , err := owner.CreateCollection( ctx , folder ); err != nil { t.Fatal( err ) }
 	}
 	if _ , err := owner.Set( ctx , "child" , "a" , invoice{ Customer: "A" } ); err != nil { t.Fatal( err ) }
-	// Lockbox text the server cannot read keys from is fine for these
-	// checks: it never opens one.
-	lock := `{"key_id":"` + base64.StdEncoding.EncodeToString( make( []byte , 16 ) ) + `"}`
-	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "child": lock } } ); status != 409 || reply[ "error" ] != "not_rotating" {
+	// Lockbox text of the right shape is all these checks need: the server
+	// never opens one.
+	lock , child_lock := shapedLock( "" ) , shapedLock( "root" )
+	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "child": child_lock } } ); status != 409 || reply[ "error" ] != "not_rotating" {
 		t.Fatalf( "child first: %d %v" , status , reply )
+	}
+	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "root": `{"key_id":"x"}` } } ); status != 400 || reply[ "error" ] != "bad_lock" {
+		t.Fatalf( "malformed lockbox: %d %v" , status , reply )
 	}
 	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "root": lock } } ); status != 200 || reply[ "started" ] != true {
 		t.Fatalf( "start: %d %v" , status , reply )
@@ -202,13 +206,78 @@ func TestRotateCommitChecks( t *testing.T ) {
 	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate/commit" , fiber.Map{} ); status != 409 || reply[ "error" ] != "rotate_incomplete" || reply[ "collections" ] != float64( 1 ) {
 		t.Fatalf( "commit with a folder left: %d %v" , status , reply )
 	}
-	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "child": lock } } ); status != 200 || len( reply[ "pending" ].( []any ) ) != 0 {
+	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "child": child_lock } } ); status != 200 || len( reply[ "pending" ].( []any ) ) != 0 {
 		t.Fatalf( "child: %d %v" , status , reply )
 	}
-	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "child": lock } } ); status != 409 || reply[ "error" ] != "lock_exists" {
+	// Sent again, it replaces the one staged.
+	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "child": child_lock } } ); status != 200 {
 		t.Fatalf( "child twice: %d %v" , status , reply )
 	}
 	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate/commit" , fiber.Map{} ); status != 409 || reply[ "error" ] != "rotate_incomplete" || reply[ "docs" ] != float64( 1 ) {
 		t.Fatalf( "commit with a document left: %d %v" , status , reply )
+	}
+}
+
+// shapedLock is lockbox text of the right shape for a folder under parent.
+// Nothing opens it.
+func shapedLock( parent string ) string {
+	field := func( size int ) string { return base64.StdEncoding.EncodeToString( make( []byte , size ) ) }
+	text , _ := json.Marshal( fiber.Map{
+		"parent": parent , "by": field( 16 ) , "key_id": field( 16 ) , "epoch": 1 ,
+		"nonce_r": field( 24 ) , "read": field( 80 ) , "nonce_w": field( 24 ) , "write": field( 48 ) , "sig": field( 64 ) ,
+	} )
+	return string( text )
+}
+
+// A rotation that has resealed nothing can be called off, through the API,
+// by the account only; the folders keep their keys and work as before.
+func TestRotateAbort( t *testing.T ) {
+	fixture := newAuthFixture( t )
+	base := serve( t , fixture )
+	api_key := issueKey( t , fixture , fixture.alice , models.RoleUser )
+	master_text , _ := client.GenerateKey()
+	owner , _ := client.New( base , api_key , master_text )
+	ctx := context.Background()
+	if _ , err := owner.CreateCollection( ctx , client.NewCollection{ ID: "root" } ); err != nil { t.Fatal( err ) }
+	if _ , err := owner.Set( ctx , "root" , "a" , invoice{ Customer: "A" } ); err != nil { t.Fatal( err ) }
+	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate/abort" , fiber.Map{} ); status != 409 || reply[ "error" ] != "not_rotating" {
+		t.Fatalf( "abort with none: %d %v" , status , reply )
+	}
+	if status , reply := fixture.withKey( t , api_key , fiber.MethodPost , "/api/collections/root/rotate" , fiber.Map{ "locks": fiber.Map{ "root": shapedLock( "" ) } } ); status != 200 {
+		t.Fatalf( "start: %d %v" , status , reply )
+	}
+	if err := owner.AbortRotation( ctx , "root" ); err != nil { t.Fatalf( "abort: %v" , err ) }
+	var got invoice
+	if _ , err := owner.Get( ctx , "root" , "a" , &got ); err != nil || got.Customer != "A" { t.Fatalf( "read after abort: %+v %v" , got , err ) }
+	if _ , err := owner.Set( ctx , "root" , "b" , invoice{ Customer: "B" } ); err != nil { t.Fatalf( "write after abort: %v" , err ) }
+	// A rotation run to the end after that still works.
+	if _ , err := owner.RotateKeys( ctx , "root" ); err != nil { t.Fatalf( "rotate after abort: %v" , err ) }
+}
+
+// Starting a rotation cuts off every access key for a collection in the
+// subtree by itself: here the store starts it directly, so no revocation
+// runs at all, and the key is still refused.
+func TestRotationStartCutsOffKeysWithoutRevoking( t *testing.T ) {
+	fixture := newAuthFixture( t )
+	base := serve( t , fixture )
+	api_key := issueKey( t , fixture , fixture.alice , models.RoleUser )
+	master_text , _ := client.GenerateKey()
+	owner , _ := client.New( base , api_key , master_text )
+	ctx := context.Background()
+	for _ , folder := range []client.NewCollection{ { ID: "root" } , { ID: "child" , Parent: "root" } } {
+		if _ , err := owner.CreateCollection( ctx , folder ); err != nil { t.Fatal( err ) }
+	}
+	keys := map[ string ]string{}
+	for _ , id := range []string{ "root" , "child" } {
+		api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , id , models.KeyScope{ Collection: id , Write: true , Born: bornOf( t , fixture , id ) } , time.Hour )
+		if err != nil { t.Fatal( err ) }
+		keys[ id ] = api
+		if status , reply := fixture.withKey( t , api , fiber.MethodGet , "/api/collections/" + id + "/docs" , nil ); status != 200 { t.Fatalf( "before: %d %v" , status , reply ) }
+	}
+	if _ , err := fixture.handlers.Docs.StageRotation( fixture.alice.ID , "root" , map[ string ]string{ "root": shapedLock( "" ) } ); err != nil { t.Fatal( err ) }
+	for id , api := range keys {
+		if status , reply := fixture.withKey( t , api , fiber.MethodGet , "/api/collections/" + id + "/docs" , nil ); status != 404 {
+			t.Fatalf( "%s's key after the rotation started: %d %v" , id , status , reply )
+		}
 	}
 }

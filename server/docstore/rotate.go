@@ -78,28 +78,20 @@ func lockKeyID( lock string ) ( key_id []byte ) {
 }
 
 // rotatingAt is the folder at or above id that has a next lockbox, "" when
-// none does.
-func rotatingAt( tx *sql.Tx , user_id uint64 , id string ) ( at string , err error ) {
-	for steps := 0 ; id != "" && steps < 1000 ; steps++ {
-		var parent , next string
-		err = tx.QueryRow( `SELECT parent , next_lock FROM collections WHERE user_id = ? AND id = ?` , user_id , id ).Scan( &parent , &next )
-		if errors.Is( err , sql.ErrNoRows ) {
-			err = nil
-			return
-		}
-		if err != nil { return }
-		if next != "" {
-			at = id
-			return
-		}
-		id = parent
-	}
+// none does, nearest first, in one query.
+func rotatingAt( db querier , user_id uint64 , id string ) ( at string , err error ) {
+	err = db.QueryRow( `WITH RECURSIVE up ( id , parent , next_lock , step ) AS (
+			SELECT id , parent , next_lock , 0 FROM collections WHERE user_id = ? AND id = ?
+			UNION ALL SELECT c.id , c.parent , c.next_lock , up.step + 1 FROM collections c JOIN up ON c.id = up.parent
+			WHERE c.user_id = ? AND up.parent != '' AND up.step < ?
+		) SELECT id FROM up WHERE next_lock != '' ORDER BY step LIMIT 1` , user_id , id , user_id , maxWalk ).Scan( &at )
+	if errors.Is( err , sql.ErrNoRows ) { err = nil }
 	return
 }
 
 // refuseRotating is ErrRotating when id, or a folder above it, is in a
 // rotation.
-func refuseRotating( tx *sql.Tx , user_id uint64 , id string ) ( err error ) {
+func refuseRotating( tx querier , user_id uint64 , id string ) ( err error ) {
 	at , err := rotatingAt( tx , user_id , id )
 	if err == nil && at != "" { err = ErrRotating }
 	return
@@ -128,18 +120,19 @@ func checkEnvelopeKey( tx *sql.Tx , user_id uint64 , collection string , body []
 }
 
 // InRotation is whether id, or a folder above it, has a rotation under way.
+// It reads a snapshot and takes no lock.
 func ( store *Store ) InRotation( user_id uint64 , id string ) ( rotating bool , err error ) {
-	tx , err := store.db.Begin()
-	if err != nil { return }
-	defer tx.Rollback()
-	at , err := rotatingAt( tx , user_id , id )
+	at , err := rotatingAt( store.read , user_id , id )
 	rotating = at != ""
 	return
 }
 
 // StageRotation sets next lockboxes on root's subtree: locks maps folder ids
-// to lockboxes, each one set once (ErrLockExists after). The first call must
-// carry root's own, which starts the rotation; it is refused (ErrRotating)
+// to lockboxes (ErrBadLock for one that is not), and one sent again for a
+// folder replaces the one it had. The first call must
+// carry root's own, which starts the rotation and gives every folder in the
+// subtree a new Born, cutting off every scoped key for one of them; it is
+// refused (ErrRotating)
 // when a folder above root, or one under it, is already in one. After that,
 // each folder's parent must have its next lockbox first
 // (ErrRotateParentFirst). A folder outside root's subtree is ErrNoCollection.
@@ -185,15 +178,23 @@ func ( store *Store ) StageRotation( user_id uint64 , root string , locks map[ s
 			}
 			rotation.Started = true
 		}
-		for id := range locks {
-			if next[ id ] != "" {
-				tx_err = ErrLockExists
-				return
-			}
+		// A folder already staged takes the new lockbox in place of the one
+		// it had: a rotation is never stuck on one that turned out wrong.
+		for id , lock := range locks {
+			if tx_err = checkLock( lock , parents[ id ] ); tx_err != nil { return }
 		}
 		var seq int64
 		if len( locks ) > 0 {
 			if seq , tx_err = touchTree( tx , user_id ); tx_err != nil { return }
+		}
+		if rotation.Started {
+			// Every folder in the subtree is born again, in this same step:
+			// a scoped key for one of them (KeyScope.Born) stops working now,
+			// whether or not revoking it afterwards works, and so does one
+			// minted while this was starting.
+			for _ , id := range ids {
+				if _ , tx_err = tx.Exec( `UPDATE collections SET born = ? WHERE user_id = ? AND id = ?` , newBorn() , user_id , id ); tx_err != nil { return }
+			}
 		}
 		for _ , id := range ids {
 			lock , given := locks[ id ]
@@ -265,6 +266,57 @@ func ( store *Store ) CommitRotation( user_id uint64 , root string ) ( ids []str
 			if _ , tx_err = tx.Exec( `UPDATE collections SET lock = next_lock , next_lock = '' , version = version + 1 , seq = ? , updated_at = ?
 				WHERE user_id = ? AND id = ?` , seq , millis( now ) , user_id , id ); tx_err != nil { return }
 		}
+		return
+	} )
+	return
+}
+
+// ErrRotateResealed: an abort asked after documents were sealed with the
+// new keys, which would no longer open once those keys were dropped.
+var ErrRotateResealed = errors.New( "rotate_resealed" )
+
+// AbortRotation drops every next lockbox in root's subtree, ending a
+// rotation nothing has been sealed with yet: root's keys stay what they
+// were. Once any collection envelope there names its folder's new keys it is
+// ErrRotateResealed; finish the rotation instead. root must be the
+// rotation's root (ErrRotating inside one, ErrNotRotating with none).
+func ( store *Store ) AbortRotation( user_id uint64 , root string ) ( ids []string , err error ) {
+	now := time.Now()
+	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
+		entry , found , tx_err := readCollection( tx , user_id , root )
+		if tx_err != nil { return }
+		if found == false {
+			tx_err = ErrNoCollection
+			return
+		}
+		if entry.NextLock == "" {
+			tx_err = ErrNotRotating
+			return
+		}
+		if tx_err = refuseRotating( tx , user_id , entry.Parent ); tx_err != nil { return }
+		if ids , tx_err = subtree( tx , user_id , root ); tx_err != nil { return }
+		for _ , id := range ids {
+			row , _ , read_err := readCollection( tx , user_id , id )
+			if read_err != nil {
+				tx_err = read_err
+				return
+			}
+			want := lockKeyID( row.NextLock )
+			if want == nil { continue }
+			var resealed int
+			tx_err = tx.QueryRow( `SELECT COUNT(*) FROM docs WHERE user_id = ? AND collection = ? AND deleted = 0
+				AND substr( body , 1 , 1 ) = x'02' AND substr( body , 2 , 16 ) = ?` , user_id , id , want ).Scan( &resealed )
+			if tx_err != nil { return }
+			if resealed > 0 {
+				tx_err = ErrRotateResealed
+				return
+			}
+		}
+		seq , tx_err := touchTree( tx , user_id )
+		if tx_err != nil { return }
+		_ , tx_err = tx.Exec( shareSub + `UPDATE collections SET next_lock = '' , version = version + 1 , seq = ? , updated_at = ?
+			WHERE user_id = ? AND id IN ( SELECT id FROM sub ) AND next_lock != ''` ,
+			user_id , root , user_id , seq , millis( now ) , user_id )
 		return
 	} )
 	return

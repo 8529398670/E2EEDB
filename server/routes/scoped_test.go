@@ -12,6 +12,7 @@ import (
 
 	client "github.com/8529398670/E2EEDB/client"
 	db "github.com/8529398670/E2EEDB/server/db"
+	docstore "github.com/8529398670/E2EEDB/server/docstore"
 	models "github.com/8529398670/E2EEDB/server/models"
 )
 
@@ -173,8 +174,11 @@ func TestScopedKeysCannotSquatIDs( t *testing.T ) {
 	sharee , err := client.NewScoped( base , token )
 	if err != nil { t.Fatal( err ) }
 
-	// The id the owner's service will use is refused...
-	if _ , err = sharee.CreateCollection( ctx , client.NewCollection{ ID: "invoices" , Parent: "shared" } ); err == nil { t.Fatal( "a scoped key made a folder named by id" ) }
+	// The id the owner's service will use is refused, even one shaped
+	// like a random id...
+	for _ , id := range []string{ "invoices" , "customer_invoices_2025" , client.NewID() } {
+		if _ , err = sharee.CreateCollection( ctx , client.NewCollection{ ID: id , Parent: "shared" } ); err == nil { t.Fatalf( "a scoped key made a folder named %s" , id ) }
+	}
 	// ...so the service's first write makes its own folder, out of reach.
 	if _ , err = owner.Set( ctx , "invoices" , "inv1" , invoice{ Customer: "TOP SECRET" } ); err != nil { t.Fatalf( "owner set: %v" , err ) }
 	var stolen invoice
@@ -182,8 +186,10 @@ func TestScopedKeysCannotSquatIDs( t *testing.T ) {
 
 	// A folder the sharee made, even under a random id the owner's code
 	// somehow used, is refused to a master-key write unless asked for.
-	guessed := client.NewID()
-	if _ , err = sharee.CreateCollection( ctx , client.NewCollection{ ID: guessed , Parent: "shared" } ); err != nil { t.Fatalf( "sharee folder: %v" , err ) }
+	made , err := sharee.CreateCollection( ctx , client.NewCollection{ Parent: "shared" } )
+	if err != nil { t.Fatalf( "sharee folder: %v" , err ) }
+	guessed := made.ID
+	if made.Lock == "" { t.Fatal( "the sharee's folder has no lockbox" ) }
 	fresh_owner , _ := client.New( base , api_key , master_text )
 	if _ , err = fresh_owner.Set( ctx , guessed , "x" , invoice{ Customer: "private" } ); errors.Is( err , client.ErrSharedCollection ) == false {
 		t.Fatalf( "owner wrote into a sharee's folder: %v" , err )
@@ -301,4 +307,75 @@ func TestScopedKeysSeeOnlyTheirShare( t *testing.T ) {
 	fixture.cfg.Docs.MaxCollections = 5
 	status , reply = fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "name": "three" , "parent": "shared" } )
 	if status != 413 || reply[ "error" ] != "share_too_many_collections" || reply[ "max_collections" ] != float64( 0 ) { t.Fatalf( "account full, scoped: %d %v" , status , reply ) }
+}
+
+// A scoped key's new folder gets its id from the server. The one id it may
+// send is that of a folder deleted from inside its own, to undo the delete.
+func TestScopedCreateIDs( t *testing.T ) {
+	fixture := newAuthFixture( t )
+	base := serve( t , fixture )
+	api_key := issueKey( t , fixture , fixture.alice , models.RoleUser )
+	master_text , _ := client.GenerateKey()
+	owner , _ := client.New( base , api_key , master_text )
+	ctx := context.Background()
+	for _ , folder := range []client.NewCollection{ { ID: "shared" } , { ID: "elsewhere" } , { ID: "mine" , Parent: "elsewhere" } } {
+		if _ , err := owner.CreateCollection( ctx , folder ); err != nil { t.Fatal( err ) }
+	}
+	write_key , _ := owner.PrepareShare( ctx , "shared" , true )
+	scoped_api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "sharee" , models.KeyScope{ Collection: "shared" , Write: true , Born: bornOf( t , fixture , "shared" ) } , time.Hour )
+	if err != nil { t.Fatal( err ) }
+	token , _ := client.NewAccessToken( scoped_api , write_key )
+	sharee , _ := client.NewScoped( base , token )
+
+	if status , reply := fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "id": "customer_invoices_2025" , "parent": "shared" } ); status != 400 || reply[ "error" ] != "id_not_reusable" {
+		t.Fatalf( "chosen id: %d %v" , status , reply )
+	}
+	if status , reply := fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "parent": "shared" , "lock": shapedLock( "shared" ) } ); status != 400 {
+		t.Fatalf( "lockbox with no id: %d %v" , status , reply )
+	}
+	status , reply := fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "parent": "shared" , "name": "plain" } )
+	if status != 200 || reply[ "id" ] == "customer_invoices_2025" || len( reply[ "id" ].( string ) ) != 16 { t.Fatalf( "server id: %d %v" , status , reply ) }
+
+	// Made, deleted and made again under its id, keys and all.
+	made , err := sharee.CreateCollection( ctx , client.NewCollection{ Name: "sub" , Parent: "shared" } )
+	if err != nil { t.Fatal( err ) }
+	if _ , err = sharee.Set( ctx , made.ID , "a" , invoice{ Customer: "A" } ); err != nil { t.Fatal( err ) }
+	if _ , err = sharee.DeleteCollection( ctx , made.ID ); err != nil { t.Fatal( err ) }
+	if status , reply := fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "id": made.ID , "parent": "shared" , "name": "sub" , "lock": made.Lock } ); status != 200 {
+		t.Fatalf( "undo: %d %v" , status , reply )
+	}
+	// The owner's folder deleted outside the share stays out of reach.
+	if _ , err = owner.DeleteCollection( ctx , "mine" ); err != nil { t.Fatal( err ) }
+	if status , reply := fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "id": "mine" , "parent": "shared" } ); status != 400 || reply[ "error" ] != "id_not_reusable" {
+		t.Fatalf( "an id deleted elsewhere: %d %v" , status , reply )
+	}
+}
+
+// An access key's max_depth counts from its own folder, in the list and in
+// too_deep, so neither says how deep that folder sits.
+func TestScopedMaxDepthIsRelative( t *testing.T ) {
+	fixture := newAuthFixture( t )
+	base := serve( t , fixture )
+	api_key := issueKey( t , fixture , fixture.alice , models.RoleUser )
+	master_text , _ := client.GenerateKey()
+	owner , _ := client.New( base , api_key , master_text )
+	ctx := context.Background()
+	for _ , folder := range []client.NewCollection{ { ID: "top" } , { ID: "mid" , Parent: "top" } , { ID: "shared" , Parent: "mid" } } {
+		if _ , err := owner.CreateCollection( ctx , folder ); err != nil { t.Fatal( err ) }
+	}
+	scoped_api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "sharee" , models.KeyScope{ Collection: "shared" , Write: true , Born: bornOf( t , fixture , "shared" ) } , time.Hour )
+	if err != nil { t.Fatal( err ) }
+	account := fixture.handlers.docLimits().MaxDepth
+	if account == 0 { account = docstore.DefaultMaxDepth }
+	status , reply := fixture.withKey( t , scoped_api , fiber.MethodGet , "/api/collections" , nil )
+	if status != 200 || reply[ "max_depth" ] != float64( account - 2 ) { t.Fatalf( "list: %d %v, want max_depth %d" , status , reply[ "max_depth" ] , account - 2 ) }
+	// Fill the share to its depth, then one more.
+	parent := "shared"
+	for depth := 2 ; depth <= account - 2 ; depth++ {
+		status , reply = fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "parent": parent } )
+		if status != 200 { t.Fatalf( "depth %d: %d %v" , depth , status , reply ) }
+		parent = reply[ "id" ].( string )
+	}
+	status , reply = fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "parent": parent } )
+	if status != 400 || reply[ "error" ] != "too_deep" || reply[ "max_depth" ] != float64( account - 2 ) { t.Fatalf( "too deep: %d %v" , status , reply ) }
 }

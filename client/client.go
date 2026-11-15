@@ -413,10 +413,27 @@ func collectionPath( id string ) string {
 
 // CreateCollection makes a folder. Writing a document into a collection id
 // with no folder also makes one, at the top level, named after the id.
+//
+// A scoped client (NewScoped) gets the new folder's id from the server and
+// gives it keys in a second call, since a lockbox names its id. The one id
+// it may set is that of a folder deleted from inside its own collection,
+// to make it again.
 func ( client *Client ) CreateCollection( ctx context.Context , folder NewCollection ) ( collection Collection , err error ) {
-	if folder.ID == "" { folder.ID = NewID() }
 	holder , err := client.holder( ctx , nil , folder.Parent , mintOwn )
 	if err != nil { return }
+	request := map[string]any{}
+	if folder.Name != "" { request[ "name" ] = folder.Name }
+	if folder.Parent != "" { request[ "parent" ] = folder.Parent }
+	if folder.Before != "" { request[ "before" ] = folder.Before }
+	two_step := client.key == nil && folder.ID == ""
+	switch {
+	case two_step:
+		if err = client.call( ctx , http.MethodPost , "/api/collections" , request , &collection ); err != nil { return }
+		if ValidCollectionID( collection.ID ) == false { return collection , fmt.Errorf( "%w: server gave folder id %q" , ErrCorrupt , collection.ID ) }
+		folder.ID = collection.ID
+	case folder.ID == "":
+		folder.ID = NewID()
+	}
 	key , err := generateCollectionKey( folder.ID , client.freshEpochFor( folder.ID ) )
 	if err != nil { return }
 	// The owner tag only under keys that are the master key's own: a folder
@@ -426,11 +443,13 @@ func ( client *Client ) CreateCollection( ctx context.Context , folder NewCollec
 	if key.owned { own = client.ownTag( key ) }
 	lock , err := sealLock( key , holder , own )
 	if err != nil { return }
-	request := map[string]any{ "id": folder.ID , "lock": lock }
-	if folder.Name != "" { request[ "name" ] = folder.Name }
-	if folder.Parent != "" { request[ "parent" ] = folder.Parent }
-	if folder.Before != "" { request[ "before" ] = folder.Before }
-	if err = client.call( ctx , http.MethodPost , "/api/collections" , request , &collection ); err != nil { return }
+	if two_step {
+		err = client.call( ctx , http.MethodPost , collectionPath( folder.ID ) , map[string]any{ "lock": lock } , &collection )
+	} else {
+		request[ "id" ] , request[ "lock" ] = folder.ID , lock
+		err = client.call( ctx , http.MethodPost , "/api/collections" , request , &collection )
+	}
+	if err != nil { return }
 	if err = client.noteEpoch( folder.ID , false , key.epoch ); err != nil { return }
 	client.remember( key )
 	return

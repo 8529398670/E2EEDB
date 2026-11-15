@@ -41,9 +41,9 @@ func same( a []string , b ...string ) bool {
 // read-only key included) can swap a folder's keys under its readers.
 func TestLockIsSetOnce( t *testing.T ) {
 	store , _ := open( t )
-	if _ , err := store.CreateCollection( 1 , "notes" , CollectionChange{ Lock: name( `{"key_id":"a"}` ) } , limits ); err != nil { t.Fatal( err ) }
-	if _ , err := store.UpdateCollection( 1 , "notes" , CollectionChange{ Lock: name( `{"key_id":"a"}` ) } , limits ); err != nil { t.Fatalf( "same lockbox again: %v" , err ) }
-	if _ , err := store.UpdateCollection( 1 , "notes" , CollectionChange{ Lock: name( `{"key_id":"b"}` ) } , limits ); errors.Is( err , ErrLockExists ) == false { t.Fatalf( "replaced in place: %v" , err ) }
+	if _ , err := store.CreateCollection( 1 , "notes" , CollectionChange{ Lock: name( shapedLock( "" , 1 ) ) } , limits ); err != nil { t.Fatal( err ) }
+	if _ , err := store.UpdateCollection( 1 , "notes" , CollectionChange{ Lock: name( shapedLock( "" , 1 ) ) } , limits ); err != nil { t.Fatalf( "same lockbox again: %v" , err ) }
+	if _ , err := store.UpdateCollection( 1 , "notes" , CollectionChange{ Lock: name( shapedLock( "" , 2 ) ) } , limits ); errors.Is( err , ErrLockExists ) == false { t.Fatalf( "replaced in place: %v" , err ) }
 }
 
 func TestSetMakesAFolder( t *testing.T ) {
@@ -163,7 +163,7 @@ func TestMoveDoc( t *testing.T ) {
 	store.Set( 1 , "archive" , "b" , envelope( 1 , 60 ) , nil , limits )
 
 	moved , gone , err := store.MoveDoc( 1 , "inbox" , "a" , "archive" , "a" , envelope( 7 , 70 ) , version( 1 ) , limits )
-	if err != nil || moved.Collection != "archive" || moved.Version != 1 || gone.Deleted == false { t.Fatalf( "move: %+v %+v %v" , moved , gone , err ) }
+	if err != nil || moved.Collection != "archive" || moved.Version != moved.Seq || gone.Deleted == false { t.Fatalf( "move: %+v %+v %v" , moved , gone , err ) }
 	got , err := store.Get( 1 , "archive" , "a" )
 	if err != nil || got.Body[ 1 ] != 7 { t.Fatalf( "moved doc: %+v %v" , got , err ) }
 	if _ , err = store.Get( 1 , "inbox" , "a" ); errors.Is( err , ErrNotFound ) == false { t.Fatalf( "source still there: %v" , err ) }

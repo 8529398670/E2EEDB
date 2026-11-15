@@ -30,7 +30,7 @@ import (
 type docMeta struct {
 	Collection string    `json:"collection"`
 	ID         string    `json:"id"`
-	Version    int64     `json:"version" jsonschema_description:"Goes up by one on every write and delete."`
+	Version    int64     `json:"version" jsonschema_description:"Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version."`
 	Seq        int64     `json:"seq" jsonschema_description:"Change number, for GET /api/changes?since=."`
 	UpdatedAt  time.Time `json:"updated_at"`
 	Size       int       `json:"size" jsonschema_description:"Bytes of ciphertext; 0 for a delete."`
@@ -80,7 +80,7 @@ type collectionPath struct {
 // docPath is a document's collection and id in a route's path.
 type docPath struct {
 	collectionPath
-	DocID string `json:"doc_id" path:"doc_id" jsonschema:"minLength=1,maxLength=128" jsonschema_description:"1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default." error:"id must be 1-128 of A-Z a-z 0-9 _ - ."`
+	DocID string `json:"doc_id" path:"doc_id" jsonschema:"minLength=1,maxLength=128" jsonschema_description:"1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default." error:"id must be 1-128 of A-Z a-z 0-9 _ -"`
 }
 
 // check is what the schema cannot say: which characters an id may have.
@@ -94,7 +94,7 @@ func ( path collectionPath ) check() ( refused *refusal ) {
 func ( path docPath ) check() ( refused *refusal ) {
 	if refused = path.collectionPath.check(); refused != nil { return }
 	if docstore.ValidDocID( path.DocID ) == false {
-		refused = refuse( fiber.StatusBadRequest , "id must be 1-128 of A-Z a-z 0-9 _ - ." )
+		refused = refuse( fiber.StatusBadRequest , "id must be 1-128 of A-Z a-z 0-9 _ -" )
 	}
 	return
 }
@@ -173,6 +173,31 @@ func ( handlers *Handlers ) docLimitsFor( c fiber.Ctx ) ( limits docstore.Limits
 	return
 }
 
+// maxDepthFor is how deep folders may nest as the caller sees it. For an
+// access key that counts from its own folder (depth 1), so neither this
+// nor a too_deep says how deep that folder sits in the account's tree.
+func ( handlers *Handlers ) maxDepthFor( c fiber.Ctx ) ( depth int , err error ) {
+	depth = handlers.docLimits().MaxDepth
+	if depth <= 0 { depth = docstore.DefaultMaxDepth }
+	scope := docScope( c )
+	if scope == nil { return }
+	root_depth , err := handlers.Docs.Depth( docOwner( c ) , scope.Collection )
+	if err != nil { return }
+	depth = max( depth - root_depth + 1 , 1 )
+	return
+}
+
+// docRefusalFor is docRefusal for the caller: a too_deep carries the
+// max_depth the caller sees (maxDepthFor).
+func ( handlers *Handlers ) docRefusalFor( c fiber.Ctx , cause error ) ( refused *refusal ) {
+	if errors.Is( cause , docstore.ErrTooDeep ) {
+		depth , err := handlers.maxDepthFor( c )
+		if err != nil { return internalFailure( err ) }
+		return refuse( fiber.StatusBadRequest , "too_deep" , fiber.Map{ "max_depth": depth } )
+	}
+	return handlers.docRefusal( cause )
+}
+
 // docRefusal turns what the store said no with into an answer.
 func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 	var conflict *docstore.ConflictError
@@ -198,6 +223,14 @@ func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 		refused = refuse( fiber.StatusConflict , "lock_required" )
 	case errors.Is( cause , docstore.ErrLockExists ):
 		refused = refuse( fiber.StatusConflict , "lock_exists" )
+	case errors.Is( cause , docstore.ErrLockMismatch ):
+		refused = refuse( fiber.StatusConflict , "lock_mismatch" )
+	case errors.Is( cause , docstore.ErrNotReusable ):
+		refused = refuse( fiber.StatusBadRequest , "id_not_reusable" )
+	case errors.Is( cause , docstore.ErrBadLock ):
+		refused = refuse( fiber.StatusBadRequest , "bad_lock" )
+	case errors.Is( cause , docstore.ErrRotateResealed ):
+		refused = refuse( fiber.StatusConflict , "rotate_resealed" )
 	case errors.Is( cause , docstore.ErrRotating ):
 		refused = refuse( fiber.StatusConflict , "rotating" )
 	case errors.Is( cause , docstore.ErrNotRotating ):
@@ -267,7 +300,7 @@ type listCollectionsReply struct {
 	QuotaBytes     int64 `json:"quota_bytes" jsonschema_description:"0: no quota. For an access key, what its shared folder may hold."`
 	MaxDocBytes    int   `json:"max_doc_bytes" jsonschema_description:"Largest one document may be, in ciphertext bytes."`
 	MaxCollections int   `json:"max_collections" jsonschema_description:"Most folders an account may have; for an access key, its shared folder (0: only the account's limit)."`
-	MaxDepth       int   `json:"max_depth" jsonschema_description:"How deep folders may nest; a top-level folder is depth 1."`
+	MaxDepth       int   `json:"max_depth" jsonschema_description:"How deep folders may nest; a top-level folder is depth 1. For an access key, counted from its own folder (depth 1)."`
 }
 
 // pagedOf is the Paged of a list the database cut itself.
@@ -339,6 +372,7 @@ func ( handlers *Handlers ) listCollections( c fiber.Ctx , in *Page ) ( reply *l
 		// An access key sees its share's limits, not the account's.
 		docs := handlers.cfg().Docs
 		reply.QuotaBytes , reply.MaxCollections = docs.ShareQuotaBytes , docs.ShareMaxCollections
+		if reply.MaxDepth , err = handlers.maxDepthFor( c ); err != nil { return nil , err }
 	}
 	return
 }
@@ -370,11 +404,11 @@ type collectionFields struct {
 	Name   *string `json:"name,omitempty" jsonschema_description:"1-128 characters, no control characters, no space at either end."`
 	Parent *string `json:"parent,omitempty" jsonschema_description:"Parent's id; \"\" for the top level."`
 	Before *string `json:"before,omitempty" jsonschema_description:"The sibling to go in front of; \"\" or absent for the end."`
-	Lock   *string `json:"lock,omitempty" jsonschema:"minLength=1,maxLength=2048" jsonschema_description:"A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists." error:"lock must be 1-2048 bytes"`
+	Lock   *string `json:"lock,omitempty" jsonschema:"minLength=1,maxLength=2048" jsonschema_description:"A lockbox, wrapped by the client for parent (400 bad_lock when it is not one, or names another parent; see README.md, Lockboxes). On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it), holding the same keys (409 lock_mismatch when its key_id differs). Replacing one without a move is 409 lock_exists." error:"lock must be 1-2048 bytes"`
 }
 
 type createCollectionRequest struct {
-	ID string `json:"id,omitempty" jsonschema:"maxLength=64" jsonschema_description:"1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key may only send a random 22-character id (client.NewID), so it cannot take an id the account's own code writes to by name." error:"id must be 1-64 of A-Z a-z 0-9 _ -"`
+	ID string `json:"id,omitempty" jsonschema:"maxLength=64" jsonschema_description:"1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key gets a random one from the server, so it cannot take an id the account's own code writes to by name, and sends its lockbox in a second call (POST /api/collections/{id} with lock). The one id a scoped key may send is that of a folder deleted from inside its own collection, to undo the delete (400 id_not_reusable otherwise)." error:"id must be 1-64 of A-Z a-z 0-9 _ -"`
 	collectionFields
 }
 
@@ -440,13 +474,19 @@ func ( handlers *Handlers ) createCollection( c fiber.Ctx , in *createCollection
 		err = refuse( fiber.StatusBadRequest , "id must be 1-64 of A-Z a-z 0-9 _ -" )
 		return
 	}
-	if docScope( c ) != nil {
-		// A scoped key makes folders only inside its own, and only with a
-		// random id: one it chose ("invoices") could be an id the account's
-		// own code later writes to by name, sealing those documents with keys
-		// the key's holder has.
-		if in.ID != "" && docstore.ValidRandomID( in.ID ) == false {
-			err = refuse( fiber.StatusBadRequest , "a scoped key's folder id must be a random 22-character id (client.NewID)" )
+	if scope := docScope( c ); scope != nil {
+		// A scoped key makes folders only inside its own, and the server
+		// picks the id: one the key chose ("invoices") could be an id the
+		// account's own code later writes to by name, sealing those
+		// documents with keys the key's holder has. A lockbox names the id
+		// it is for, so it comes in a second call, once the id is known.
+		// The one id it may give is that of a folder deleted from inside its
+		// own, to undo the delete.
+		switch {
+		case in.ID != "":
+			change.ReuseIn = &docstore.ScopeRoot{ Root: scope.Collection , Born: scope.Born }
+		case change.Lock != nil:
+			err = refuse( fiber.StatusBadRequest , "a scoped key's new folder gets its id from the server: make it without a lock, then give it one" )
 			return
 		}
 		parent := ""
@@ -459,7 +499,7 @@ func ( handlers *Handlers ) createCollection( c fiber.Ctx , in *createCollection
 	}
 	entry , create_err := handlers.Docs.CreateCollection( docOwner( c ) , id , change , handlers.docLimitsFor( c ) )
 	if create_err != nil {
-		err = handlers.docRefusal( create_err )
+		err = handlers.docRefusalFor( c , create_err )
 		return
 	}
 	row := newCollectionRow( entry )
@@ -502,7 +542,7 @@ func ( handlers *Handlers ) updateCollection( c fiber.Ctx , in *updateCollection
 	}
 	entry , update_err := handlers.Docs.UpdateCollection( docOwner( c ) , id , change , handlers.docLimitsFor( c ) )
 	if update_err != nil {
-		err = handlers.docRefusal( update_err )
+		err = handlers.docRefusalFor( c , update_err )
 		return
 	}
 	row := newCollectionRow( entry )
@@ -567,7 +607,7 @@ func ( handlers *Handlers ) deleteCollection( c fiber.Ctx , in *deleteCollection
 
 type rotateRequest struct {
 	collectionPath
-	Locks map[ string ]string `json:"locks" jsonschema_description:"Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call." error:"locks must map collection ids to lockboxes"`
+	Locks map[ string ]string `json:"locks" jsonschema_description:"Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call; see README.md, Lockboxes). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call. Sending one again for a collection replaces the one it had." error:"locks must map collection ids to lockboxes"`
 }
 
 type rotateReply struct {
@@ -589,11 +629,13 @@ const rotateMaxLocks = 500
 //     tag="Documents", errors=(403, 404, 409),
 //     description="Sets the lockboxes of new keys for the collection and the collections under it, parents first, "
 //         "in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and "
-//         "revokes every access key scoped to a collection in the subtree. Meanwhile collection envelopes written "
+//         "revokes every access key scoped to a collection in the subtree, which stop working at once. Meanwhile collection envelopes written "
 //         "there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, "
 //         "moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 "
-//         "rotating: a collection above or under it is already being rotated. 409 lock_exists: that collection "
-//         "already has its new lockbox. 409 rotate_parent_first. An access key cannot rotate (403).",
+//         "rotating: a collection above or under it is already being rotated. A collection already staged takes "
+//         "the new lockbox in place of its old one. 400 bad_lock: a lockbox that is not one, or is for another "
+//         "parent. 409 rotate_parent_first. An access key cannot rotate (403). POST .../rotate/abort undoes it "
+//         "before anything is resealed.",
 // )
 func ( handlers *Handlers ) rotateKeys( c fiber.Ctx , in *rotateRequest ) ( reply *rotateReply , err error ) {
 	if refused := in.check(); refused != nil {
@@ -665,7 +707,50 @@ func ( handlers *Handlers ) commitRotation( c fiber.Ctx , in *collectionPath ) (
 		return
 	}
 	handlers.audit( c , logs.KindAdmin , "collection keys rotated" , fiber.Map{ "collection": in.Collection , "collections": len( ids ) } )
+	// The start already cut these keys off (each folder was born again);
+	// revoking any left over, a second time, keeps the keys list true.
+	revoked , revoke_err := models.RevokeScopedKeys( handlers.Store , docOwner( c ) , ids )
+	for _ , key_id := range revoked {
+		handlers.audit( c , logs.KindAdmin , "api key revoked: its collection's keys were rotated" , fiber.Map{ "key_id": key_id , "collection": in.Collection } )
+	}
+	if revoke_err != nil {
+		err = revoke_err
+		return
+	}
 	reply = &commitRotationReply{ Collections: ids }
+	return
+}
+
+type abortRotationReply struct {
+	Collections []string `json:"collections" jsonschema_description:"Every collection back on only its old keys, parents first."`
+}
+
+// abortRotation calls off a rotation nothing has been resealed under yet:
+// every new lockbox in the subtree goes, and the old keys stay.
+//
+// @route("POST /api/collections/{collection}/rotate/abort", summary="Call off rotating a collection's keys",
+//     tag="Documents", errors=(403, 404, 409),
+//     description="Drops every new lockbox in the subtree, so the collections keep the keys they had. 409 "
+//         "rotate_resealed: a collection envelope there is already sealed with the new keys and would no longer "
+//         "open; finish the rotation instead. 409 not_rotating, and 409 rotating when it is inside another "
+//         "collection's rotation. Access keys revoked when it started stay revoked. An access key cannot (403).",
+// )
+func ( handlers *Handlers ) abortRotation( c fiber.Ctx , in *collectionPath ) ( reply *abortRotationReply , err error ) {
+	if refused := in.check(); refused != nil {
+		err = refused
+		return
+	}
+	if docScope( c ) != nil {
+		err = refuse( fiber.StatusForbidden , "an access key cannot rotate keys" )
+		return
+	}
+	ids , abort_err := handlers.Docs.AbortRotation( docOwner( c ) , in.Collection )
+	if abort_err != nil {
+		err = handlers.docRefusal( abort_err )
+		return
+	}
+	handlers.audit( c , logs.KindAdmin , "collection keys rotation called off" , fiber.Map{ "collection": in.Collection , "collections": len( ids ) } )
+	reply = &abortRotationReply{ Collections: ids }
 	return
 }
 
@@ -814,7 +899,7 @@ func ( handlers *Handlers ) deleteDoc( c fiber.Ctx , in *deleteDocRequest ) ( re
 type moveDocRequest struct {
 	docPath
 	ToCollection string `json:"to_collection" jsonschema:"minLength=1,maxLength=64" jsonschema_description:"The destination collection's id. It must exist." error:"to_collection must be 1-64 of A-Z a-z 0-9 _ -"`
-	ToID         string `json:"to_id,omitempty" jsonschema:"maxLength=128" jsonschema_description:"The document's id there. Default: the same id." error:"to_id must be 1-128 of A-Z a-z 0-9 _ - ."`
+	ToID         string `json:"to_id,omitempty" jsonschema:"maxLength=128" jsonschema_description:"The document's id there. Default: the same id." error:"to_id must be 1-128 of A-Z a-z 0-9 _ -"`
 	Body         string `json:"body" jsonschema_description:"Standard base64 of the document's private or collection envelope, sealed for to_collection and to_id. See README.md." error:"body must be a base64 private or collection envelope (see README.md); the server stores ciphertext only"`
 	IfVersion    *int64 `json:"if_version,omitempty" jsonschema:"minimum=1" jsonschema_description:"Move only if the source is at this version." error:"if_version must be 1 or more"`
 }
@@ -844,7 +929,7 @@ func ( handlers *Handlers ) moveDoc( c fiber.Ctx , in *moveDocRequest ) ( reply 
 		refused = refuse( fiber.StatusBadRequest , "to_collection must be 1-64 of A-Z a-z 0-9 _ -" )
 	}
 	if refused == nil && docstore.ValidDocID( to_id ) == false {
-		refused = refuse( fiber.StatusBadRequest , "to_id must be 1-128 of A-Z a-z 0-9 _ - ." )
+		refused = refuse( fiber.StatusBadRequest , "to_id must be 1-128 of A-Z a-z 0-9 _ -" )
 	}
 	var body []byte
 	if refused == nil { body , refused = envelope( in.Body ) }

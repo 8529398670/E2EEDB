@@ -265,7 +265,7 @@
             "type": "string"
           },
           "version": {
-            "description": "Goes up by one on every write and delete.",
+            "description": "Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version.",
             "type": "integer"
           }
         },
@@ -305,7 +305,7 @@
             "type": "string"
           },
           "version": {
-            "description": "Goes up by one on every write and delete.",
+            "description": "Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version.",
             "type": "integer"
           }
         },
@@ -341,7 +341,7 @@
             "type": "string"
           },
           "version": {
-            "description": "Goes up by one on every write and delete.",
+            "description": "Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version.",
             "type": "integer"
           }
         },
@@ -4845,7 +4845,7 @@
                       "type": "integer"
                     },
                     "max_depth": {
-                      "description": "How deep folders may nest; a top-level folder is depth 1.",
+                      "description": "How deep folders may nest; a top-level folder is depth 1. For an access key, counted from its own folder (depth 1).",
                       "type": "integer"
                     },
                     "max_doc_bytes": {
@@ -4942,12 +4942,12 @@
                     "type": "string"
                   },
                   "id": {
-                    "description": "1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key may only send a random 22-character id (client.NewID), so it cannot take an id the account's own code writes to by name.",
+                    "description": "1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key gets a random one from the server, so it cannot take an id the account's own code writes to by name, and sends its lockbox in a second call (POST /api/collections/{id} with lock). The one id a scoped key may send is that of a folder deleted from inside its own collection, to undo the delete (400 id_not_reusable otherwise).",
                     "maxLength": 64,
                     "type": "string"
                   },
                   "lock": {
-                    "description": "A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists.",
+                    "description": "A lockbox, wrapped by the client for parent (400 bad_lock when it is not one, or names another parent; see README.md, Lockboxes). On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it), holding the same keys (409 lock_mismatch when its key_id differs). Replacing one without a move is 409 lock_exists.",
                     "maxLength": 2048,
                     "minLength": 1,
                     "type": [
@@ -5069,7 +5069,7 @@
                     ]
                   },
                   "lock": {
-                    "description": "A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists.",
+                    "description": "A lockbox, wrapped by the client for parent (400 bad_lock when it is not one, or names another parent; see README.md, Lockboxes). On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it), holding the same keys (409 lock_mismatch when its key_id differs). Replacing one without a move is 409 lock_exists.",
                     "maxLength": 2048,
                     "minLength": 1,
                     "type": [
@@ -5340,7 +5340,7 @@
                             "type": "string"
                           },
                           "version": {
-                            "description": "Goes up by one on every write and delete.",
+                            "description": "Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version.",
                             "type": "integer"
                           }
                         },
@@ -5421,7 +5421,7 @@
             }
           },
           {
-            "description": "1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default.",
+            "description": "1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default.",
             "in": "path",
             "name": "doc_id",
             "required": true,
@@ -5488,7 +5488,7 @@
             }
           },
           {
-            "description": "1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default.",
+            "description": "1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default.",
             "in": "path",
             "name": "doc_id",
             "required": true,
@@ -5595,7 +5595,7 @@
             }
           },
           {
-            "description": "1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default.",
+            "description": "1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default.",
             "in": "path",
             "name": "doc_id",
             "required": true,
@@ -5695,7 +5695,7 @@
             }
           },
           {
-            "description": "1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default.",
+            "description": "1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default.",
             "in": "path",
             "name": "doc_id",
             "required": true,
@@ -5816,7 +5816,7 @@
     },
     "/api/collections/{collection}/rotate": {
       "post": {
-        "description": "Sets the lockboxes of new keys for the collection and the collections under it, parents first, in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and revokes every access key scoped to a collection in the subtree. Meanwhile collection envelopes written there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 rotating: a collection above or under it is already being rotated. 409 lock_exists: that collection already has its new lockbox. 409 rotate_parent_first. An access key cannot rotate (403).",
+        "description": "Sets the lockboxes of new keys for the collection and the collections under it, parents first, in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and revokes every access key scoped to a collection in the subtree, which stop working at once. Meanwhile collection envelopes written there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 rotating: a collection above or under it is already being rotated. A collection already staged takes the new lockbox in place of its old one. 400 bad_lock: a lockbox that is not one, or is for another parent. 409 rotate_parent_first. An access key cannot rotate (403). POST .../rotate/abort undoes it before anything is resealed.",
         "operationId": "post_api_collections_collection_rotate",
         "parameters": [
           {
@@ -5845,7 +5845,7 @@
                     "additionalProperties": {
                       "type": "string"
                     },
-                    "description": "Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call.",
+                    "description": "Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call; see README.md, Lockboxes). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call. Sending one again for a collection replaces the one it had.",
                     "type": "object"
                   }
                 },
@@ -5925,6 +5925,99 @@
           }
         ],
         "summary": "Start rotating a collection's keys",
+        "tags": [
+          "Documents"
+        ]
+      }
+    },
+    "/api/collections/{collection}/rotate/abort": {
+      "post": {
+        "description": "Drops every new lockbox in the subtree, so the collections keep the keys they had. 409 rotate_resealed: a collection envelope there is already sealed with the new keys and would no longer open; finish the rotation instead. 409 not_rotating, and 409 rotating when it is inside another collection's rotation. Access keys revoked when it started stay revoked. An access key cannot (403).",
+        "operationId": "post_api_collections_collection_rotate_abort",
+        "parameters": [
+          {
+            "description": "The collection's id: 1-64 of A-Z a-z 0-9 _ -",
+            "in": "path",
+            "name": "collection",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "csrf_token": {
+                    "description": "From GET /api/me. Browser sessions only.",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "collections": {
+                      "description": "Every collection back on only its old keys, parents first.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "collections"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "summary": "Call off rotating a collection's keys",
         "tags": [
           "Documents"
         ]

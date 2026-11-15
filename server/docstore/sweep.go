@@ -38,6 +38,9 @@ func ( store *Store ) Sweep( now time.Time , tombstone_days int , max_tombstones
 		result , tx_err := tx.Exec( `DELETE FROM docs WHERE deleted = 1 AND updated_at < ?` , cutoff )
 		if tx_err != nil { return }
 		swept.Tombstones , _ = result.RowsAffected()
+		// A deleted folder's id stays reusable by a scoped key (undo) as
+		// long as its documents' tombstones last.
+		_ , tx_err = tx.Exec( `DELETE FROM graves WHERE deleted_at < ?` , cutoff )
 		return
 	} )
 	if err != nil { return }
@@ -54,7 +57,7 @@ func ( store *Store ) Sweep( now time.Time , tombstone_days int , max_tombstones
 	for _ , user_id := range owners {
 		if exists( user_id ) { continue }
 		err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
-			for _ , table := range []string{ "docs" , "usage" , "collections" , "trees" , "keyrings" , "counters" } {
+			for _ , table := range accountTables {
 				if _ , tx_err = tx.Exec( `DELETE FROM `+ table +` WHERE user_id = ?` , user_id ); tx_err != nil { return }
 			}
 			return
@@ -68,7 +71,7 @@ func ( store *Store ) Sweep( now time.Time , tombstone_days int , max_tombstones
 // capTombstones purges the oldest tombstones of each account holding more
 // than limit, one account per transaction, moving its horizon past them.
 func ( store *Store ) capTombstones( limit int ) ( purged int64 , err error ) {
-	rows , err := store.db.Query( `SELECT user_id FROM usage WHERE collection = '' AND tombs > ?` , limit )
+	rows , err := store.read.Query( `SELECT user_id FROM usage WHERE collection = '' AND tombs > ?` , limit )
 	if err != nil { return }
 	over := []uint64{}
 	for rows.Next() {
@@ -102,9 +105,17 @@ func ( store *Store ) capTombstones( limit int ) ( purged int64 , err error ) {
 	return
 }
 
-// owners is every account with a document or a keyring here.
+// accountTables are the tables with rows of each account.
+var accountTables = []string{ "docs" , "usage" , "collections" , "graves" , "trees" , "keyrings" , "counters" }
+
+// owners is every account with a row in any of accountTables.
 func ( store *Store ) owners() ( result []uint64 , err error ) {
-	rows , err := store.db.Query( `SELECT DISTINCT user_id FROM docs UNION SELECT user_id FROM collections UNION SELECT user_id FROM keyrings` )
+	query := ""
+	for index , table := range accountTables {
+		if index > 0 { query += " UNION " }
+		query += "SELECT user_id FROM " + table
+	}
+	rows , err := store.read.Query( query )
 	if err != nil { return }
 	defer rows.Close()
 	for rows.Next() {

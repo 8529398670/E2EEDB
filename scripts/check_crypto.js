@@ -112,6 +112,17 @@ page.sodium.ready.then( () => {
   try { C.openCollection( token.key , vectors.doc_id , C.b64( bytes ) ); } catch ( error ) { refused = error.code; }
   check( "forged collection envelope refused" , refused === "corrupt" );
 
+  // Ids the server would not take are refused before any crypto: a NUL
+  // would make collection || 0 || id ambiguous.
+  for ( const [ collection , id ] of [ [ "notes" , "a\u0000b" ] , [ "no\u0000tes" , "a" ] , [ "notes" , "a.pdf" ] , [ "notes" , "" ] ] ) {
+    refused = "";
+    try { C.seal( master , collection , id , "{}" , nonce ); } catch ( error ) { refused = error.code; }
+    check( "bad id " + JSON.stringify( [ collection , id ] ) + " refused" , refused === "bad_id" );
+  }
+  refused = "";
+  try { C.openCollection( token.key , "a\u0000b" , vectors.envelope_collection ); } catch ( error ) { refused = error.code; }
+  check( "bad id refused on open" , refused === "bad_id" );
+
   if ( failed > 0 ) process.exit( 1 );
   console.log( "ok: browser crypto matches the Go vectors" );
 } ).catch( ( error ) => {

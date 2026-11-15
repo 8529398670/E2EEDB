@@ -25,7 +25,7 @@ type Keyring struct {
 // GetKeyring is the account's keyring, or ErrNotFound.
 func ( store *Store ) GetKeyring( user_id uint64 ) ( keyring Keyring , err error ) {
 	var updated int64
-	err = store.db.QueryRow( `SELECT body , version , updated_at FROM keyrings WHERE user_id = ?` , user_id ).
+	err = store.read.QueryRow( `SELECT body , version , updated_at FROM keyrings WHERE user_id = ?` , user_id ).
 		Scan( &keyring.Body , &keyring.Version , &updated )
 	if errors.Is( err , sql.ErrNoRows ) {
 		err = ErrNotFound

@@ -329,10 +329,16 @@ func ( handlers *Handlers ) mountDeclared( app *fiber.App ) {
 	} , handlers.moveDoc , handlers.Guard.RequireLogin )
 	apidoc.Mount( app , "POST" , "/api/collections/{collection}/rotate" , apidoc.Op{
 		Summary: "Start rotating a collection's keys",
-		Description: "Sets the lockboxes of new keys for the collection and the collections under it, parents first, in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and revokes every access key scoped to a collection in the subtree. Meanwhile collection envelopes written there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 rotating: a collection above or under it is already being rotated. 409 lock_exists: that collection already has its new lockbox. 409 rotate_parent_first. An access key cannot rotate (403).",
+		Description: "Sets the lockboxes of new keys for the collection and the collections under it, parents first, in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and revokes every access key scoped to a collection in the subtree, which stop working at once. Meanwhile collection envelopes written there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 rotating: a collection above or under it is already being rotated. A collection already staged takes the new lockbox in place of its old one. 400 bad_lock: a lockbox that is not one, or is for another parent. 409 rotate_parent_first. An access key cannot rotate (403). POST .../rotate/abort undoes it before anything is resealed.",
 		Tag: "Documents",
 		Errors: []int{ 400 , 401 , 403 , 404 , 409 },
 	} , handlers.rotateKeys , handlers.Guard.RequireLogin )
+	apidoc.Mount( app , "POST" , "/api/collections/{collection}/rotate/abort" , apidoc.Op{
+		Summary: "Call off rotating a collection's keys",
+		Description: "Drops every new lockbox in the subtree, so the collections keep the keys they had. 409 rotate_resealed: a collection envelope there is already sealed with the new keys and would no longer open; finish the rotation instead. 409 not_rotating, and 409 rotating when it is inside another collection's rotation. Access keys revoked when it started stay revoked. An access key cannot (403).",
+		Tag: "Documents",
+		Errors: []int{ 400 , 401 , 403 , 404 , 409 },
+	} , handlers.abortRotation , handlers.Guard.RequireLogin )
 	apidoc.Mount( app , "POST" , "/api/collections/{collection}/rotate/commit" , apidoc.Op{
 		Summary: "Finish rotating a collection's keys",
 		Description: "Once every collection in the subtree has its new lockbox and every collection envelope in them is sealed with the new keys, the new lockboxes replace the old ones, all at once. 409 rotate_incomplete (with collections and docs: how many are left). 409 not_rotating: no rotation of this collection is under way. 409 rotating: it is inside one; commit that one's collection.",

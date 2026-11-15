@@ -13,7 +13,9 @@
 // SQLite runs in WAL mode, so readers never wait on the writer. Every write is
 // one IMMEDIATE transaction, which takes the write lock up front: the checks a
 // write makes (its expected version, the account's quota) and the write itself
-// see the same state.
+// see the same state. Lookups that write nothing go through a second,
+// read-only handle whose transactions are deferred, so they never queue
+// behind a writer.
 package docstore
 
 import (
@@ -28,8 +30,18 @@ import (
 
 // Store is one open docs.db.
 type Store struct {
+	// db is for writes: its transactions take the write lock at once.
 	db   *sql.DB
+	// read is read-only, with deferred transactions, for every lookup.
+	read *sql.DB
 	path string
+}
+
+// querier is a *sql.DB or a *sql.Tx, for lookups that run either inside a
+// write or on their own.
+type querier interface {
+	Query( query string , arguments ...any ) ( *sql.Rows , error )
+	QueryRow( query string , arguments ...any ) *sql.Row
 }
 
 // Errors a caller tells apart.
@@ -55,16 +67,19 @@ func ( conflict *ConflictError ) Error() string { return ErrConflict.Error() }
 func ( conflict *ConflictError ) Unwrap() error { return ErrConflict }
 
 // dsn opens path in WAL mode. busy_timeout lets a second writer wait for the
-// first rather than fail, and _txlock=immediate makes BeginTx take the write
-// lock at once, which only writes use (reads run outside a transaction).
+// first rather than fail. For the write handle, _txlock=immediate makes
+// BeginTx take the write lock at once; the read-only handle keeps SQLite's
+// deferred transactions, which in WAL mode read a snapshot and wait on no
+// one.
 func dsn( path string , read_only bool ) ( result string ) {
 	result = "file:" + path +
 		"?_pragma=busy_timeout(5000)" +
 		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=synchronous(NORMAL)" +
-		"&_txlock=immediate"
+		"&_pragma=synchronous(NORMAL)"
 	if read_only {
 		result += "&mode=ro"
+	} else {
+		result += "&_txlock=immediate"
 	}
 	return
 }
@@ -81,13 +96,19 @@ func Open( path string ) ( store *Store , err error ) {
 	if err = store.migrate(); err != nil {
 		handle.Close()
 		store = nil
+		return
+	}
+	// Opened after the migrations, so the file is already in WAL mode.
+	if store.read , err = sql.Open( "sqlite" , dsn( path , true ) ); err != nil {
+		handle.Close()
+		store = nil
 	}
 	return
 }
 
 // Close closes the store.
 func ( store *Store ) Close() ( err error ) {
-	err = store.db.Close()
+	err = errors.Join( store.read.Close() , store.db.Close() )
 	return
 }
 
@@ -132,6 +153,11 @@ var migrations = []string{
 	// minted for one never reaches the other. next_lock is the lockbox of
 	// the keys a rotation (StageRotation) is moving the folder to, "" when
 	// none is under way.
+	//
+	// graves: the folders deleted lately, each with the folders it was in
+	// then (above: " id:born " for itself and each one over it), so a
+	// scoped key may make one again under its old id (undo) only when it
+	// was inside that key's folder. Swept with the tombstones.
 	//
 	// usage: running totals of each account's documents, per collection and
 	// (collection "") for the whole account, kept by the triggers below so
@@ -183,6 +209,13 @@ var migrations = []string{
 		user_id INTEGER PRIMARY KEY,
 		seq     INTEGER NOT NULL
 	);
+	CREATE TABLE graves (
+		user_id    INTEGER NOT NULL,
+		id         TEXT    NOT NULL,
+		above      TEXT    NOT NULL,
+		deleted_at INTEGER NOT NULL,
+		PRIMARY KEY ( user_id , id )
+	) WITHOUT ROWID;
 	CREATE TABLE usage (
 		user_id    INTEGER NOT NULL,
 		collection TEXT    NOT NULL,

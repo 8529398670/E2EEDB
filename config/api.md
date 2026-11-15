@@ -55,6 +55,7 @@ An error reply is a JSON object whose `error` says what went wrong.
 | POST | [`/api/collections/{collection}/docs/{doc_id}/delete`](#post-apicollectionscollectiondocsdoc_iddelete) | Delete a document | browser session or API key, anyone signed in |
 | POST | [`/api/collections/{collection}/docs/{doc_id}/move`](#post-apicollectionscollectiondocsdoc_idmove) | Move a document to another collection | browser session or API key, anyone signed in |
 | POST | [`/api/collections/{collection}/rotate`](#post-apicollectionscollectionrotate) | Start rotating a collection's keys | browser session or API key, anyone signed in |
+| POST | [`/api/collections/{collection}/rotate/abort`](#post-apicollectionscollectionrotateabort) | Call off rotating a collection's keys | browser session or API key, anyone signed in |
 | POST | [`/api/collections/{collection}/rotate/commit`](#post-apicollectionscollectionrotatecommit) | Finish rotating a collection's keys | browser session or API key, anyone signed in |
 | GET | [`/api/keyring`](#get-apikeyring) | Your wrapped master key | browser session only, anyone signed in |
 | POST | [`/api/keyring`](#post-apikeyring) | Set or change your passphrase | browser session only, anyone signed in |
@@ -121,7 +122,7 @@ Every collection (folder) in your account, each parent's children together in th
 | `collections[].version` | integer | yes |  | Goes up by one on every rename or move. |
 | `doc_count` | integer | yes |  |  |
 | `max_collections` | integer | yes |  | Most folders an account may have; for an access key, its shared folder (0: only the account's limit). |
-| `max_depth` | integer | yes |  | How deep folders may nest; a top-level folder is depth 1. |
+| `max_depth` | integer | yes |  | How deep folders may nest; a top-level folder is depth 1. For an access key, counted from its own folder (depth 1). |
 | `max_doc_bytes` | integer | yes |  | Largest one document may be, in ciphertext bytes. |
 | `next` | integer or null | yes |  | Offset of the next page, or null on the last one. |
 | `quota_bytes` | integer | yes |  | 0: no quota. For an access key, what its shared folder may hold. |
@@ -146,8 +147,8 @@ A folder, empty until a document is written into it. Writing a document into an 
 |---|---|---|---|---|
 | `before` | string or null | no |  | The sibling to go in front of; "" or absent for the end. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `id` | string | no | at most 64 characters | 1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key may only send a random 22-character id (client.NewID), so it cannot take an id the account's own code writes to by name. |
-| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists. |
+| `id` | string | no | at most 64 characters | 1-64 of A-Z a-z 0-9 _ -. Default: random. A scoped key gets a random one from the server, so it cannot take an id the account's own code writes to by name, and sends its lockbox in a second call (POST /api/collections/{id} with lock). The one id a scoped key may send is that of a folder deleted from inside its own collection, to undo the delete (400 id_not_reusable otherwise). |
+| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent (400 bad_lock when it is not one, or names another parent; see README.md, Lockboxes). On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it), holding the same keys (409 lock_mismatch when its key_id differs). Replacing one without a move is 409 lock_exists. |
 | `name` | string or null | no |  | 1-128 characters, no control characters, no space at either end. |
 | `parent` | string or null | no |  | Parent's id; "" for the top level. |
 
@@ -179,7 +180,7 @@ Give any of name, parent, before and lock. Its documents are not touched: they s
 | `before` | string or null | no |  | The sibling to go in front of; "" or absent for the end. |
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
 | `if_version` | integer or null | no | at least 1 | Change only if the collection is at this version. |
-| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent. On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it). Replacing one without a move is 409 lock_exists. |
+| `lock` | string or null | no | 1 to 2048 characters | A lockbox, wrapped by the client for parent (400 bad_lock when it is not one, or names another parent; see README.md, Lockboxes). On an update: on a collection that has none yet, or wrapped again for the new parent, which a move of a collection with a lockbox must send (409 lock_required without it), holding the same keys (409 lock_mismatch when its key_id differs). Replacing one without a move is 409 lock_exists. |
 | `name` | string or null | no |  | 1-128 characters, no control characters, no space at either end. |
 | `parent` | string or null | no |  | Parent's id; "" for the top level. |
 
@@ -251,7 +252,7 @@ Live documents by id. Deleted ones are left out; GET /api/changes reports them.
 | `docs[].seq` | integer | yes |  | Change number, for GET /api/changes?since=. |
 | `docs[].size` | integer | yes |  | Bytes of ciphertext; 0 for a delete. |
 | `docs[].updated_at` | string (date-time) | yes |  |  |
-| `docs[].version` | integer | yes |  | Goes up by one on every write and delete. |
+| `docs[].version` | integer | yes |  | Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version. |
 | `next` | integer or null | yes |  | Offset of the next page, or null on the last one. |
 | `total` | integer | yes |  |  |
 
@@ -269,7 +270,7 @@ One document
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
 | `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
-| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
+| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default. |
 
 **Reply 200**: Success
 
@@ -291,7 +292,7 @@ Too big is 413 doc_too_large (with max_bytes), over your quota 413 quota_exceede
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
 | `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
-| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
+| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default. |
 
 **Request body**
 
@@ -321,7 +322,7 @@ Leaves a tombstone that GET /api/changes reports for docs.tombstone_days. Writin
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
 | `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
-| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
+| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default. |
 
 **Request body**
 
@@ -350,7 +351,7 @@ In one step: the document is written at to_collection/to_id and the old one beco
 | Name | In | Type | Required | Limits | Description |
 |---|---|---|---|---|---|
 | `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
-| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - . ; chosen by the client, random by default. |
+| `doc_id` | path | string | yes | 1 to 128 characters | 1-128 of A-Z a-z 0-9 _ - (no dots); chosen by the client, random by default. |
 
 **Request body**
 
@@ -373,7 +374,7 @@ In one step: the document is written at to_collection/to_id and the old one beco
 
 Start rotating a collection's keys
 
-Sets the lockboxes of new keys for the collection and the collections under it, parents first, in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and revokes every access key scoped to a collection in the subtree. Meanwhile collection envelopes written there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 rotating: a collection above or under it is already being rotated. 409 lock_exists: that collection already has its new lockbox. 409 rotate_parent_first. An access key cannot rotate (403).
+Sets the lockboxes of new keys for the collection and the collections under it, parents first, in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and revokes every access key scoped to a collection in the subtree, which stop working at once. Meanwhile collection envelopes written there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 rotating: a collection above or under it is already being rotated. A collection already staged takes the new lockbox in place of its old one. 400 bad_lock: a lockbox that is not one, or is for another parent. 409 rotate_parent_first. An access key cannot rotate (403). POST .../rotate/abort undoes it before anything is resealed.
 
 |  |  |
 |---|---|
@@ -391,7 +392,7 @@ Sets the lockboxes of new keys for the collection and the collections under it, 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
-| `locks` | map of string | yes |  | Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call. |
+| `locks` | map of string | yes |  | Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call; see README.md, Lockboxes). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call. Sending one again for a collection replaces the one it had. |
 
 **Reply 200**: Success
 
@@ -400,6 +401,35 @@ Sets the lockboxes of new keys for the collection and the collections under it, 
 | `pending` | array of string | yes |  | Collections in the subtree still without a new lockbox. |
 | `revoked` | array of string | yes |  | Access keys revoked because they reached a collection whose keys are changing (only on the call that began it). Share again once it is done. |
 | `started` | boolean | yes |  | This call began the rotation. |
+
+### POST /api/collections/{collection}/rotate/abort
+
+Call off rotating a collection's keys
+
+Drops every new lockbox in the subtree, so the collections keep the keys they had. 409 rotate_resealed: a collection envelope there is already sealed with the new keys and would no longer open; finish the rotation instead. 409 not_rotating, and 409 rotating when it is inside another collection's rotation. Access keys revoked when it started stay revoked. An access key cannot (403).
+
+|  |  |
+|---|---|
+| Who may call | browser session or API key, anyone signed in |
+| Errors | 400, 401, 403, 404, 409, 429, 503 |
+
+**Parameters**
+
+| Name | In | Type | Required | Limits | Description |
+|---|---|---|---|---|---|
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
+
+**Request body**
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
+
+**Reply 200**: Success
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `collections` | array of string | yes |  | Every collection back on only its old keys, parents first. |
 
 ### POST /api/collections/{collection}/rotate/commit
 
@@ -2176,7 +2206,7 @@ The shapes the routes above refer to by name.
 | `seq` | integer | yes |  | Change number, for GET /api/changes?since=. |
 | `size` | integer | yes |  | Bytes of ciphertext; 0 for a delete. |
 | `updated_at` | string (date-time) | yes |  |  |
-| `version` | integer | yes |  | Goes up by one on every write and delete. |
+| `version` | integer | yes |  | Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version. |
 
 ### DocChange
 
@@ -2188,7 +2218,7 @@ The shapes the routes above refer to by name.
 | `seq` | integer | yes |  | Change number, for GET /api/changes?since=. |
 | `size` | integer | yes |  | Bytes of ciphertext; 0 for a delete. |
 | `updated_at` | string (date-time) | yes |  |  |
-| `version` | integer | yes |  | Goes up by one on every write and delete. |
+| `version` | integer | yes |  | Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version. |
 
 ### DocMeta
 
@@ -2199,7 +2229,7 @@ The shapes the routes above refer to by name.
 | `seq` | integer | yes |  | Change number, for GET /api/changes?since=. |
 | `size` | integer | yes |  | Bytes of ciphertext; 0 for a delete. |
 | `updated_at` | string (date-time) | yes |  |  |
-| `version` | integer | yes |  | Goes up by one on every write and delete. |
+| `version` | integer | yes |  | Goes up by one on every write and delete. A new document starts at its change number (seq), so one made again after its tombstone was purged never repeats an old version. |
 
 ### Error
 

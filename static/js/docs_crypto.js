@@ -121,7 +121,23 @@ const DocsCrypto = {
     return this.sodium.to_base64( this.sodium.randombytes_buf( 16 ) , this.sodium.base64_variants.URLSAFE_NO_PADDING );
   },
 
+  // The ids the server takes. Ids go into the associated data as
+  // collection || 0 || id and into URL paths, so every one is checked first:
+  // a NUL would make the join ambiguous, and /docs/ links decode %00.
+  validCollectionId( id ) {
+    return typeof id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test( id );
+  },
+
+  validDocId( id ) {
+    return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test( id );
+  },
+
+  checkIds( collection , id ) {
+    if ( !this.validCollectionId( collection ) || !this.validDocId( id ) ) throw this.fail( "bad_id" );
+  },
+
   associated( header , collection , id ) {
+    this.checkIds( collection , id );
     return this.join( header , this.utf8( collection ) , new Uint8Array( [ 0 ] ) , this.utf8( id ) );
   },
 
@@ -186,6 +202,7 @@ const DocsCrypto = {
   // One collection's keys. seed (the write half) may be null: read-only.
   collectionKey( collection , read , verify , seed ) {
     const sodium = this.sodium;
+    if ( !this.validCollectionId( collection ) ) throw this.fail( "bad_id" );
     if ( read.length !== 32 || verify.length !== 32 || ( seed && seed.length !== 32 ) ) throw this.fail( "corrupt" );
     const key = {
       collection: collection ,
@@ -257,6 +274,7 @@ const DocsCrypto = {
   },
 
   signed( body , collection , id ) {
+    this.checkIds( collection , id );
     return this.join( body , this.utf8( collection ) , new Uint8Array( [ 0 ] ) , this.utf8( id ) );
   },
 
@@ -324,6 +342,7 @@ const DocsCrypto = {
   },
 
   lockAssociated( label , collection , parent ) {
+    if ( !this.validCollectionId( collection ) || ( parent !== "" && !this.validCollectionId( parent ) ) ) throw this.fail( "bad_id" );
     const zero = new Uint8Array( [ 0 ] );
     return this.join( this.utf8( label ) , zero , this.utf8( collection ) , zero , this.utf8( parent ) );
   },

@@ -80,6 +80,13 @@ Known limits, by design:
   a Go client without `client.WithState`, which remembers only while the
   process runs. A dishonest server can hand such a client the old lockbox,
   whose keys a revoked access token still holds.
+- **A rotation signs again what it finds.** The reseal pass opens every
+  document under the old keys and seals it under the new ones, so a document
+  the server planted with a revoked holder's old write key before the
+  reseal comes out signed with the new keys. Revoked access keys are cut off
+  the moment the rotation starts, so this takes a dishonest server working
+  with the holder, and it can date such a document to before the rotation.
+  A sharee's real writes look the same, so the client cannot tell them apart.
 - **The keyring can be guessed against.** Anyone holding the database can try
   passphrases offline. Argon2id makes each guess expensive, but a weak
   passphrase is still weak. Use a long one, or never set one: services use the
@@ -91,10 +98,7 @@ Known limits, by design:
   them unless asked to. It knows them by the owner tag in each lockbox,
   which only your master key makes, not by anything the server says. The
   Documents screen marks them in the folder list once your key is unlocked.
-  Making a folder with an id that is already taken is
-  refused, so someone who already knows one of your folder ids can learn that
-  it exists, even outside what you shared. Ids are random and never shown to
-  them, so they would have to get it some other way. What a key adds is
+  What a key adds is
   capped (`docs.share_quota_mb`, `docs.share_max_collections`), so it cannot
   use up your quota or folder limit. You can still add to a shared folder
   past that cap.
@@ -104,8 +108,10 @@ Known limits, by design:
   has its own counter, so nobody sees another account's activity.
 - **The web page trusts the server it came from.** The browser runs the
   JavaScript the server sends, so a dishonest server could send a page that
-  takes the master key (or an access token) as you type it. Only the Go client,
-  built from source you hold, is safe from that.
+  takes the master key (or an access token) as you type it. Behind a proxy
+  such as Cloudflare, the proxy can change the page too, so it is trusted
+  the same way (see "Deploying behind Cloudflare"). Only the Go client, built
+  from source you hold, is safe from that.
 - **An opened access token stays in the tab.** Opening Documents with an access
   token keeps it in that tab's `sessionStorage`, so a reload stays open, until
   the tab is closed. Close the tab on a shared computer.
@@ -157,9 +163,13 @@ and write, name it, and set when it expires. It shows an **access key**
 Whoever gets it pastes it under **Have an access key?** on the signed-out page
 (no account needed), or, in Go, uses `client.NewScoped( baseURL , token )`. A
 scoped key cannot move, delete or leave its own collection, or make one at the
-top level. It can make, move and delete collections inside its own, always
-with random ids (22 characters, as `client.NewID()` makes), so it cannot take
-an id your own code writes to by name. A collection made that way has no
+top level. It can make, move and delete collections inside its own. The
+server picks the id of each one it makes, so it cannot take an id your own
+code writes to by name, and the client sends the new collection's lockbox in
+a second call, once it knows the id. The one id it may send itself is that of
+a collection deleted from inside its own, to undo the delete
+(`400 id_not_reusable` otherwise); the server remembers those for as long as
+it keeps tombstones. A collection made that way has no
 owner tag in its lockbox (see "Lockboxes"), and the Go client will not write
 your documents into one, or into anything under one, unless you pass
 `client.AllowShared()` (`ErrSharedCollection` otherwise). The Documents
@@ -256,6 +266,10 @@ Change numbers are counted per account.
 `if_version` on a write or delete: absent means unconditional, `0` means only
 if there is no live document, and `n` means only if the live document is at
 version `n`. A mismatch is `409 version_conflict` with `current_version`.
+A version goes up by one on every write and delete. A new document's first
+version is its change number, not 1, so a document made again after its
+tombstone was purged starts above every version the old one had, and a stale
+client's `if_version` cannot match it.
 
 ## Crypto format
 
@@ -399,7 +413,8 @@ everything under it is read-only too.
 The server sets a lockbox only once (`409 lock_exists`). The one exception is
 a move: moving a collection to another parent sends its lockbox wrapped again
 for that parent, and the server refuses the move without one
-(`409 lock_required`).
+(`409 lock_required`), or with one that names another `key_id`
+(`409 lock_mismatch`): a move re-wraps the same keys and never swaps them.
 
 ### Rotating keys
 
@@ -419,7 +434,12 @@ It runs in three steps, because the documents are too much for one request:
 1. `POST /api/collections/{R}/rotate` with `locks`, the new lockboxes, parents
    first, in as many calls as it takes. The call that carries `R`'s starts
    the rotation and revokes every access key scoped to a collection in the
-   subtree.
+   subtree. In the same step the server gives each of those collections a
+   new internal `born` value, which every access key is tied to (the same
+   check that stops a key reaching a later collection that reuses a deleted
+   one's id), so those keys stop working at once, even if revoking one fails
+   or a key was being made at that moment. The commit revokes any left over
+   again.
 2. The client seals every collection envelope in the subtree again with the
    new keys, each with `if_version`, through the ordinary write route.
 3. `POST /api/collections/{R}/rotate/commit`. Once every collection has a
@@ -438,6 +458,21 @@ lockboxes, and no access key can be made for them (`409 rotating`).
 A rotation stopped half way stays as it is: documents open with either
 keys, and starting it again on `R` finishes it (the new keys already staged
 are kept). Private envelopes are not touched: only the master key opens them.
+
+The server checks the shape of every lockbox it is given, as `lock` or
+`next_lock`: one JSON object with every field above at its right size, and
+`parent` naming the collection's real parent (`400 bad_lock` otherwise). It
+still cannot open one. Sending a `next_lock` again for a collection already
+staged replaces it.
+
+**Calling it off.** `POST /api/collections/{R}/rotate/abort` (or
+`client.AbortRotation`) drops every `next_lock` in the subtree, so the
+collections keep their keys, as long as no collection envelope there is
+sealed with the new keys yet (`409 rotate_resealed` once one is: finish the
+rotation instead). Access keys revoked when it started stay revoked. The
+client that calls it off forgets the rotation; any other client that saw it
+staged cannot tell this from a server rolling the keys back, so it refuses the
+old keys until a new rotation of `R` runs.
 
 **Rolling it back.** Each `next_lock` carries an epoch one more than its
 `lock` (see "Lockboxes"). Every client remembers the highest epoch it has
@@ -506,3 +541,54 @@ access key may grow its shared folder (`share_quota_mb`,
 that reaches either cap, or the account's own, gets `413
 share_quota_exceeded` or `413 share_too_many_collections`. The hourly `docs` job purges old
 tombstones and the documents of deleted accounts.
+
+## Deploying behind Cloudflare
+
+**Use a Tunnel.** With `cloudflared` on the same host, nothing listens on the
+internet and every request comes in over the tunnel. In
+`config/config.yaml`:
+
+```yaml
+server:
+  host: 127.0.0.1
+  public_url: https://db.example.com
+  secure_cookies: true
+  trust_proxy: true
+  trusted_proxies: [127.0.0.1, "::1"]
+  proxy_header: CF-Connecting-IP
+```
+
+When the app runs in Docker and `cloudflared` on the host, trust the bridge
+gateway exactly (for example `172.17.0.1`, from
+`docker network inspect bridge`), never a range such as `172.16.0.0/12`,
+which trusts every container. Then sign in once and check **Logs**: the
+addresses there should be your visitors', not `127.0.0.1` or the gateway's.
+
+**Without a Tunnel.** Set SSL/TLS to **Full (strict)** with a Cloudflare
+Origin CA certificate on this server, turn on **Authenticated Origin Pulls**,
+and firewall the port so only Cloudflare's address ranges reach it. Never use
+**Flexible**: Cloudflare would fetch the page over plain http, and the page's
+JavaScript is what holds your keys.
+
+**Dashboard settings.**
+
+- Add a Cache Rule that bypasses the cache for the whole hostname, and turn
+  on **Cache Deception Armor**. The server already sends `no-store`, and
+  document ids have no dots, so nothing here looks like a file Cloudflare
+  caches by extension; the rule makes sure.
+- Turn off **Rocket Loader**, **Email Address Obfuscation** and automatic
+  **Web Analytics** injection. Each one rewrites the page or adds script to
+  it, and the page's content security policy refuses what they add.
+- Add a rate-limiting rule on `POST /api/login*`, in front of the server's
+  own limit.
+- Keep challenges (Bot Fight Mode, Under Attack, managed challenges) off
+  `/api/*`: the Go client and other services cannot answer one.
+- Leave Cloudflare's own HSTS setting off: the server sends its own header
+  when `secure_cookies` is on.
+
+**What Cloudflare can see.** It terminates TLS, so it sees every request:
+ciphertext, ids, the folder tree, API keys and session cookies, but never a
+master key or a collection's keys. It also serves the web page, and can
+change it, so for the browser it is now trusted the same way this server is
+(see "Known limits"). The Go client does not run anything it is sent, so
+Cloudflare is no more to it than the server is.

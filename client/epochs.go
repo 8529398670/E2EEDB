@@ -68,8 +68,9 @@ func ( client *Client ) loadState() ( err error ) {
 
 // saveState writes this client's epochs into the state file, keeping what
 // is already there (the higher of each), through a temporary file renamed
-// over it.
-func ( client *Client ) saveState() ( err error ) {
+// over it. The collections in aborted take this client's Next as it is:
+// it called their rotation off (AbortRotation).
+func ( client *Client ) saveState( aborted ...string ) ( err error ) {
 	client.stateMutex.Lock()
 	defer client.stateMutex.Unlock()
 	all , err := readState( client.statePath )
@@ -81,6 +82,11 @@ func ( client *Client ) saveState() ( err error ) {
 	for id , mark := range client.marks {
 		had := mine[ id ]
 		mine[ id ] = epochMark{ Lock: max( had.Lock , mark.Lock ) , Next: max( had.Next , mark.Next ) }
+	}
+	for _ , id := range aborted {
+		entry := mine[ id ]
+		entry.Next = entry.Lock
+		mine[ id ] = entry
 	}
 	client.mutex.Unlock()
 	all[ account ] = mine

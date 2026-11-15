@@ -733,14 +733,19 @@ const Docs = {
   },
 
   onUseNewKey() {
-    const value = Dom.get( "docs-new-key-value" );
-    const key = DocsCrypto.parseKey( value.textContent );
-    Dom.text( value , "" );
-    Dom.show( Dom.get( "docs-new-key-box" ) , false );
+    const key = DocsCrypto.parseKey( Dom.get( "docs-new-key-value" ).textContent );
+    this.clearNewKey();
     if ( key ) this.unlockWith( key );
   },
 
+  // Takes a generated master key out of the page, used or not.
+  clearNewKey() {
+    Dom.text( Dom.get( "docs-new-key-value" ) , "" );
+    Dom.show( Dom.get( "docs-new-key-box" ) , false );
+  },
+
   lock() {
+    this.clearNewKey();
     if ( this.scope ) {
       App.leaveAccess();
       return;
@@ -785,6 +790,12 @@ const Docs = {
   // ---- lists ---------------------------------------------------------------
 
   async showCollection( id ) {
+    // A folder the server puts in a loop of parents (A in B in A) is not
+    // shown: its place makes no sense, so neither would its keys.
+    if ( DocsTree.get( id ) && DocsTree.broken( id ) ) {
+      App.showError( I18n.get( "docs.error_tree_broken" ) );
+      return;
+    }
     if ( this.collection !== id ) this.picked.clear();
     this.collection = id;
     DocsTree.reveal( id );

@@ -143,6 +143,7 @@ func ( key *Key ) Seal( collection string , id string , plaintext []byte ) ( env
 }
 
 func ( key *Key ) sealWithNonce( collection string , id string , plaintext []byte , nonce []byte ) ( envelope []byte , err error ) {
+	if err = checkIDs( collection , id ); err != nil { return }
 	aead , err := chacha20poly1305.NewX( key.enc[ : ] )
 	if err != nil { return }
 	header := key.header()
@@ -152,6 +153,7 @@ func ( key *Key ) sealWithNonce( collection string , id string , plaintext []byt
 
 // Open decrypts a private envelope written for collection/id.
 func ( key *Key ) Open( collection string , id string , envelope []byte ) ( plaintext []byte , err error ) {
+	if err = checkIDs( collection , id ); err != nil { return }
 	if len( envelope ) < envelopeMin || envelope[ 0 ] != EnvelopeMaster {
 		err = ErrCorrupt
 		return

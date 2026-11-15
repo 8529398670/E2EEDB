@@ -1,6 +1,7 @@
 package docstore
 
 import (
+	bytes "bytes"
 	rand "crypto/rand"
 	sql "database/sql"
 	binary "encoding/binary"
@@ -39,6 +40,8 @@ var (
 	ErrLockRequired = errors.New( "lock_required" )
 	// ErrLockExists: a folder's lockbox is set once, or replaced with a move.
 	ErrLockExists = errors.New( "lock_exists" )
+	// ErrLockMismatch: a move's lockbox holds other keys than the folder's.
+	ErrLockMismatch = errors.New( "lock_mismatch" )
 )
 
 // LockMaxBytes bounds a lockbox; a real one is about 400 bytes.
@@ -101,7 +104,22 @@ type CollectionChange struct {
 	Lock      *string
 	// ByKey records the scoped API key making the folder (create only).
 	ByKey     string
+	// ReuseIn, on a create, allows the id only if a folder with it was
+	// deleted while inside this one (Root, at Born): a scoped key undoing a
+	// delete in its own folder. ErrNotReusable otherwise.
+	ReuseIn   *ScopeRoot
 }
+
+// ScopeRoot is the folder a scoped key is for, as it was when the key was
+// made.
+type ScopeRoot struct {
+	Root string
+	Born int64
+}
+
+// ErrNotReusable: a scoped key asked for an id that was not a folder
+// deleted from inside its own.
+var ErrNotReusable = errors.New( "id_not_reusable" )
 
 // ErrDeleteTooLarge: the folders hold more live documents than one delete
 // may tombstone (DeleteOptions.MaxDocs). Errors carry a *DeleteTooLarge.
@@ -139,9 +157,9 @@ type DeletedTree struct {
 // Collections is one page of an account's folders, each parent's children
 // together in their order, and how many there are in all.
 func ( store *Store ) Collections( user_id uint64 , offset int , limit int ) ( result []Collection , total int , err error ) {
-	err = store.db.QueryRow( `SELECT COUNT(*) FROM collections WHERE user_id = ?` , user_id ).Scan( &total )
+	err = store.read.QueryRow( `SELECT COUNT(*) FROM collections WHERE user_id = ?` , user_id ).Scan( &total )
 	if err != nil { return }
-	result , err = scanCounted( store.db.Query( `SELECT `+ countedColumns +` FROM collections c
+	result , err = scanCounted( store.read.Query( `SELECT `+ countedColumns +` FROM collections c
 		LEFT JOIN usage u ON u.user_id = c.user_id AND u.collection = c.id
 		WHERE c.user_id = ? ORDER BY c.parent , c.position , c.id LIMIT ? OFFSET ?` ,
 		user_id , limit , offset ) )
@@ -151,7 +169,7 @@ func ( store *Store ) Collections( user_id uint64 , offset int , limit int ) ( r
 // CollectionsIn is root and every folder under it, with their counts, in
 // the order Collections gives; empty when root does not exist.
 func ( store *Store ) CollectionsIn( user_id uint64 , root string ) ( result []Collection , err error ) {
-	result , err = scanCounted( store.db.Query( shareSub + `SELECT `+ countedColumns +` FROM collections c
+	result , err = scanCounted( store.read.Query( shareSub + `SELECT `+ countedColumns +` FROM collections c
 		LEFT JOIN usage u ON u.user_id = c.user_id AND u.collection = c.id
 		WHERE c.user_id = ? AND c.id IN ( SELECT id FROM sub ) ORDER BY c.parent , c.position , c.id` ,
 		user_id , root , user_id , user_id ) )
@@ -183,7 +201,7 @@ func scanCounted( rows *sql.Rows , query_err error ) ( result []Collection , err
 // 0 when they never changed (folders carried over from before there were
 // folders count as unchanged).
 func ( store *Store ) TreeSeq( user_id uint64 ) ( seq int64 , err error ) {
-	err = store.db.QueryRow( `SELECT seq FROM trees WHERE user_id = ?` , user_id ).Scan( &seq )
+	err = store.read.QueryRow( `SELECT seq FROM trees WHERE user_id = ?` , user_id ).Scan( &seq )
 	if errors.Is( err , sql.ErrNoRows ) { err = nil }
 	return
 }
@@ -191,7 +209,7 @@ func ( store *Store ) TreeSeq( user_id uint64 ) ( seq int64 , err error ) {
 // GetCollection is one folder, without its counts.
 func ( store *Store ) GetCollection( user_id uint64 , id string ) ( entry Collection , err error ) {
 	var updated int64
-	err = store.db.QueryRow( `SELECT id , name , parent , position , version , lock , next_lock , by_key , born , updated_at FROM collections WHERE user_id = ? AND id = ?` ,
+	err = store.read.QueryRow( `SELECT id , name , parent , position , version , lock , next_lock , by_key , born , updated_at FROM collections WHERE user_id = ? AND id = ?` ,
 		user_id , id ).Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.NextLock , &entry.ByKey , &entry.Born , &updated )
 	if errors.Is( err , sql.ErrNoRows ) {
 		err = ErrNoCollection
@@ -206,6 +224,16 @@ func ( store *Store ) GetCollection( user_id uint64 , id string ) ( entry Collec
 func ( store *Store ) CreateCollection( user_id uint64 , id string , change CollectionChange , limits Limits ) ( entry Collection , err error ) {
 	now := time.Now()
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
+		if change.ReuseIn != nil {
+			// Checked first, so it says nothing about ids outside the key's
+			// folder, in use or not.
+			var above string
+			tx_err = tx.QueryRow( `SELECT above FROM graves WHERE user_id = ? AND id = ?` , user_id , id ).Scan( &above )
+			if errors.Is( tx_err , sql.ErrNoRows ) || ( tx_err == nil && strings.Contains( above , graveMark( change.ReuseIn.Root , change.ReuseIn.Born ) ) == false ) {
+				tx_err = ErrNotReusable
+			}
+			if tx_err != nil { return }
+		}
 		if _ , found , read_err := readCollection( tx , user_id , id ); read_err != nil || found {
 			tx_err = read_err
 			if found { tx_err = &ConflictError{ Current: 1 , Live: true } }
@@ -238,10 +266,13 @@ func ( store *Store ) CreateCollection( user_id uint64 , id string , change Coll
 			if tx_err = refuseRotating( tx , user_id , parent ); tx_err != nil { return }
 		}
 		if tx_err = checkName( tx , user_id , parent , name , "" ); tx_err != nil { return }
+		lock := ""
+		if change.Lock != nil {
+			lock = *change.Lock
+			if tx_err = checkLock( lock , parent ); tx_err != nil { return }
+		}
 		seq , tx_err := touchTree( tx , user_id )
 		if tx_err != nil { return }
-		lock := ""
-		if change.Lock != nil { lock = *change.Lock }
 		_ , tx_err = tx.Exec( `INSERT INTO collections ( user_id , id , name , parent , position , version , seq , updated_at , lock , by_key , born )
 			VALUES ( ? , ? , ? , ? , 0 , 1 , ? , ? , ? , ? , ? )` , user_id , id , name , parent , seq , millis( now ) , lock , change.ByKey , newBorn() )
 		if tx_err != nil { return }
@@ -293,6 +324,14 @@ func ( store *Store ) UpdateCollection( user_id uint64 , id string , change Coll
 			tx_err = ErrLockExists
 			return
 		case change.Lock != nil:
+			if tx_err = checkLock( *change.Lock , parent ); tx_err != nil { return }
+			// A move wraps the same keys again for the new parent; it never
+			// swaps them for others, which would leave the folders under it
+			// unopenable.
+			if current.Lock != "" && bytes.Equal( lockKeyID( *change.Lock ) , lockKeyID( current.Lock ) ) == false {
+				tx_err = ErrLockMismatch
+				return
+			}
 			lock = *change.Lock
 		}
 		if name != current.Name || parent != current.Parent {
@@ -355,6 +394,7 @@ func ( store *Store ) DeleteCollection( user_id uint64 , id string , options Del
 		}
 		deleted.Done = true
 		if deleted.Collections , tx_err = subtree( tx , user_id , id ); tx_err != nil { return }
+		if tx_err = bury( tx , user_id , id , now ); tx_err != nil { return }
 		_ , tx_err = tx.Exec( shareSub + `DELETE FROM collections WHERE user_id = ? AND id IN ( SELECT id FROM sub )` ,
 			user_id , id , user_id , user_id )
 		if tx_err != nil { return }
@@ -362,6 +402,59 @@ func ( store *Store ) DeleteCollection( user_id uint64 , id string , options Del
 		tx_err = place( tx , user_id , "" , current.Parent , "" )
 		return
 	} )
+	return
+}
+
+// graveMark is how a folder appears in a grave's above.
+func graveMark( id string , born int64 ) string { return " " + id + ":" + strconv.FormatInt( born , 10 ) + " " }
+
+// bury records a grave for root and every folder under it, before they go:
+// each with itself and every folder over it, as they are now.
+func bury( tx *sql.Tx , user_id uint64 , root string , now time.Time ) ( err error ) {
+	type node struct {
+		parent string
+		born   int64
+	}
+	nodes := map[ string ]node{}
+	read := func( query string ) ( read_err error ) {
+		rows , read_err := tx.Query( query , user_id , root , user_id , maxWalk )
+		if read_err != nil { return }
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var entry node
+			if read_err = rows.Scan( &id , &entry.parent , &entry.born ); read_err != nil { return }
+			nodes[ id ] = entry
+		}
+		read_err = rows.Err()
+		return
+	}
+	// root and the folders over it, then the folders under it.
+	if err = read( `WITH RECURSIVE up ( id , parent , born , step ) AS (
+			SELECT id , parent , born , 0 FROM collections WHERE user_id = ? AND id = ?
+			UNION ALL SELECT c.id , c.parent , c.born , up.step + 1 FROM collections c JOIN up ON c.id = up.parent
+			WHERE c.user_id = ? AND up.parent != '' AND up.step < ?
+		) SELECT id , parent , born FROM up` ); err != nil { return }
+	if err = read( `WITH RECURSIVE sub ( id , parent , born , depth ) AS (
+			SELECT id , parent , born , 0 FROM collections WHERE user_id = ? AND id = ?
+			UNION ALL SELECT c.id , c.parent , c.born , sub.depth + 1 FROM collections c JOIN sub ON c.parent = sub.id
+			WHERE c.user_id = ? AND sub.depth < ?
+		) SELECT id , parent , born FROM sub` ); err != nil { return }
+	ids , err := subtree( tx , user_id , root )
+	if err != nil { return }
+	for _ , id := range ids {
+		var above strings.Builder
+		above.WriteString( " " )
+		for at , steps := id , 0 ; at != "" && steps < maxWalk ; steps++ {
+			entry , found := nodes[ at ]
+			if found == false { break }
+			above.WriteString( strings.TrimPrefix( graveMark( at , entry.born ) , " " ) )
+			at = entry.parent
+		}
+		if _ , err = tx.Exec( `INSERT INTO graves ( user_id , id , above , deleted_at ) VALUES ( ? , ? , ? , ? )
+			ON CONFLICT ( user_id , id ) DO UPDATE SET above = excluded.above , deleted_at = excluded.deleted_at` ,
+			user_id , id , above.String() , millis( now ) ); err != nil { return }
+	}
 	return
 }
 
@@ -570,12 +663,13 @@ func checkMove( tx *sql.Tx , user_id uint64 , id string , parent string , limits
 	return
 }
 
-// subtree is id and every folder under it, id first, parents before children.
-func subtree( tx *sql.Tx , user_id uint64 , id string ) ( ids []string , err error ) {
-	rows , err := tx.Query( `WITH RECURSIVE sub ( id , depth ) AS (
+// subtree is id and every folder under it, id first, parents before
+// children, in one query.
+func subtree( db querier , user_id uint64 , id string ) ( ids []string , err error ) {
+	rows , err := db.Query( `WITH RECURSIVE sub ( id , depth ) AS (
 			SELECT id , 0 FROM collections WHERE user_id = ? AND id = ?
-			UNION ALL SELECT c.id , sub.depth + 1 FROM collections c JOIN sub ON c.parent = sub.id WHERE c.user_id = ?
-		) SELECT id FROM sub ORDER BY depth , id` , user_id , id , user_id )
+			UNION ALL SELECT c.id , sub.depth + 1 FROM collections c JOIN sub ON c.parent = sub.id WHERE c.user_id = ? AND sub.depth < ?
+		) SELECT id FROM sub ORDER BY depth , id` , user_id , id , user_id , maxWalk )
 	if err != nil { return }
 	defer rows.Close()
 	for rows.Next() {
@@ -589,26 +683,47 @@ func subtree( tx *sql.Tx , user_id uint64 , id string ) ( ids []string , err err
 
 // Within is whether id is root or a folder under root.
 func ( store *Store ) Within( user_id uint64 , root string , id string ) ( inside bool , err error ) {
-	for at , steps := id , 0 ; at != "" && steps < 1000 ; steps++ {
-		if at == root {
-			inside = true
-			return
-		}
-		if err = store.db.QueryRow( `SELECT parent FROM collections WHERE user_id = ? AND id = ?` , user_id , at ).Scan( &at ); err != nil {
-			if errors.Is( err , sql.ErrNoRows ) { err = nil }
-			return
-		}
+	ids , err := ancestors( store.read , user_id , id )
+	for _ , at := range ids {
+		if at == root { inside = true }
 	}
 	return
 }
 
-// Subtree is root and every folder under it, parents before children; empty
-// when root does not exist.
-func ( store *Store ) Subtree( user_id uint64 , root string ) ( ids []string , err error ) {
-	tx , err := store.db.Begin()
+// ancestors is id and every folder above it, nearest first, in one query.
+// The walk stops after maxWalk steps, so a cycle in the rows cannot hang it.
+func ancestors( db querier , user_id uint64 , id string ) ( ids []string , err error ) {
+	rows , err := db.Query( `WITH RECURSIVE up ( id , parent , step ) AS (
+			SELECT id , parent , 0 FROM collections WHERE user_id = ? AND id = ?
+			UNION ALL SELECT c.id , c.parent , up.step + 1 FROM collections c JOIN up ON c.id = up.parent
+			WHERE c.user_id = ? AND up.parent != '' AND up.step < ?
+		) SELECT id FROM up ORDER BY step` , user_id , id , user_id , maxWalk )
 	if err != nil { return }
-	defer tx.Rollback()
-	ids , err = subtree( tx , user_id , root )
+	defer rows.Close()
+	for rows.Next() {
+		var entry string
+		if err = rows.Scan( &entry ); err != nil { return }
+		ids = append( ids , entry )
+	}
+	err = rows.Err()
+	return
+}
+
+// Depth is how deep id is: 1 for a top-level folder, 0 when it does not
+// exist.
+func ( store *Store ) Depth( user_id uint64 , id string ) ( depth int , err error ) {
+	ids , err := ancestors( store.read , user_id , id )
+	depth = len( ids )
+	return
+}
+
+// maxWalk bounds a walk up or down the tree: far past any depth limit.
+const maxWalk = 1000
+
+// Subtree is root and every folder under it, parents before children; empty
+// when root does not exist. It reads a snapshot and takes no lock.
+func ( store *Store ) Subtree( user_id uint64 , root string ) ( ids []string , err error ) {
+	ids , err = subtree( store.read , user_id , root )
 	return
 }
 

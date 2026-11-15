@@ -43,7 +43,7 @@ func TestGoClientEndToEnd( t *testing.T ) {
 
 	id := client.NewID()
 	meta , err := store.Set( ctx , "invoices" , id , invoice{ Customer: "ACME secret customer" , Total: 12.5 } , client.MustNotExist() )
-	if err != nil || meta.Version != 1 { t.Fatalf( "set: %+v %v" , meta , err ) }
+	if err != nil || meta.Version != meta.Seq { t.Fatalf( "set: %+v %v" , meta , err ) }
 
 	// What the server holds is not the plaintext.
 	stored , err := fixture.handlers.Docs.Get( fixture.alice.ID , "invoices" , id )
@@ -56,8 +56,8 @@ func TestGoClientEndToEnd( t *testing.T ) {
 	// A stale write is a ConflictError carrying the current version.
 	_ , err = store.Set( ctx , "invoices" , id , invoice{ Total: 1 } , client.MustNotExist() )
 	var conflict *client.ConflictError
-	if errors.As( err , &conflict ) == false || conflict.Current != 1 { t.Fatalf( "conflict: %v" , err ) }
-	if _ , err = store.Set( ctx , "invoices" , id , invoice{ Customer: "B" , Total: 2 } , client.IfVersion( 1 ) ); err != nil { t.Fatal( err ) }
+	if errors.As( err , &conflict ) == false || conflict.Current != meta.Version { t.Fatalf( "conflict: %v" , err ) }
+	if _ , err = store.Set( ctx , "invoices" , id , invoice{ Customer: "B" , Total: 2 } , client.IfVersion( meta.Version ) ); err != nil { t.Fatal( err ) }
 
 	seen := 0
 	err = store.Each( ctx , "invoices" , func( meta client.Meta , data json.RawMessage ) error {

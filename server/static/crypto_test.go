@@ -23,3 +23,12 @@ func TestBrowserKeyHandling( t *testing.T ) {
 	output , err := exec.Command( node , "../../scripts/check_docs_keys.js" ).CombinedOutput()
 	if err != nil { t.Fatalf( "%s" , output ) }
 }
+
+// The folder tree (docs_tree.js) against a server that reports a loop of
+// parents: it shows the folder as broken instead of hanging the tab.
+func TestBrowserTreeSurvivesALoop( t *testing.T ) {
+	node , err := exec.LookPath( "node" )
+	if err != nil { t.Skip( "node is not installed" ) }
+	output , err := exec.Command( node , "../../scripts/check_docs_tree.js" ).CombinedOutput()
+	if err != nil { t.Fatalf( "%s" , output ) }
+}

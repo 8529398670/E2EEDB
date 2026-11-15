@@ -65,6 +65,27 @@ func TestDeleteTombstoneAndRecreate( t *testing.T ) {
 	if err != nil || back.Version != 3 { t.Fatalf( "recreate: %+v %v" , back , err ) }
 }
 
+// A document made again after its tombstone was purged starts above every
+// version the old one had, so a stale client's if_version cannot match it.
+func TestVersionsSurviveAPurge( t *testing.T ) {
+	store , _ := open( t )
+	for n := 0 ; n < 5 ; n++ {
+		if _ , err := store.Set( 1 , "notes" , "a" , envelope( 1 , 60 ) , nil , limits ); err != nil { t.Fatal( err ) }
+	}
+	gone , err := store.Delete( 1 , "notes" , "a" , nil )
+	if err != nil { t.Fatal( err ) }
+	// Purge every tombstone.
+	if _ , err = store.Sweep( time.Now().Add( 48 * time.Hour ) , 1 , 0 , func( uint64 ) bool { return true } ); err != nil { t.Fatal( err ) }
+	again , err := store.Set( 1 , "notes" , "a" , envelope( 2 , 60 ) , version( 0 ) , limits )
+	if err != nil { t.Fatal( err ) }
+	if again.Version <= gone.Version { t.Fatalf( "made again at version %d, the old one reached %d" , again.Version , gone.Version ) }
+	for stale := int64( 1 ) ; stale <= gone.Version ; stale++ {
+		if _ , err = store.Set( 1 , "notes" , "a" , envelope( 3 , 60 ) , version( stale ) , limits ); errors.Is( err , ErrConflict ) == false {
+			t.Fatalf( "a stale if_version %d matched the new document: %v" , stale , err )
+		}
+	}
+}
+
 func TestUsersAreApart( t *testing.T ) {
 	store , _ := open( t )
 	store.Set( 1 , "notes" , "a" , envelope( 1 , 60 ) , nil , limits )

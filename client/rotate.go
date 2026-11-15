@@ -141,6 +141,34 @@ func ( client *Client ) RotateKeys( ctx context.Context , collection string ) ( 
 	return
 }
 
+// AbortRotation calls off a rotation of collection that RotateKeys started
+// but nothing has been sealed with yet: the server drops the new lockboxes
+// and the collections keep their keys. Once a document is sealed with the
+// new keys the server refuses (APIError "rotate_resealed"); call RotateKeys
+// to finish it instead. Access keys revoked when it started stay revoked.
+//
+// This client forgets the rotation it saw. Any other client that saw it
+// staged cannot tell an abort from a server rolling the keys back, so it
+// refuses the old keys (ErrRolledBack) until a new rotation of collection
+// runs (README.md, "Rotating keys").
+func ( client *Client ) AbortRotation( ctx context.Context , collection string ) ( err error ) {
+	if client.key == nil { return errNoMaster }
+	var reply struct {
+		Collections []string `json:"collections"`
+	}
+	if err = client.call( ctx , http.MethodPost , collectionPath( collection ) + "/rotate/abort" , map[string]any{} , &reply ); err != nil { return }
+	client.mutex.Lock()
+	for _ , id := range reply.Collections {
+		mark := client.marks[ id ]
+		mark.Next = mark.Lock
+		client.marks[ id ] = mark
+	}
+	client.mutex.Unlock()
+	if client.statePath != "" { err = client.saveState( reply.Collections... ) }
+	client.forget()
+	return
+}
+
 // subtreeOf is root and every collection under it in tree, parents first.
 func subtreeOf( tree map[ string ]Collection , root string ) ( order []string ) {
 	children := map[ string ][]string{}

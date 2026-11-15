@@ -2,6 +2,7 @@ package client
 
 import (
 	bytes "bytes"
+	errors "errors"
 	json "encoding/json"
 	os "os"
 	testing "testing"
@@ -143,9 +144,16 @@ func FuzzUnwrapKey( f *testing.F ) {
 func FuzzSealTamper( f *testing.F ) {
 	_ , master , notes := fuzzVectors( f )
 	f.Add( []byte( `{"a":1}` ) , "notes" , "doc" , uint16( 0 ) , byte( 1 ) )
-	f.Add( []byte{} , "c" , "" , uint16( 40 ) , byte( 0x80 ) )
+	f.Add( []byte{} , "c" , "x" , uint16( 40 ) , byte( 0x80 ) )
+	f.Add( []byte{} , "c" , "a\x00b" , uint16( 0 ) , byte( 1 ) )
 	f.Fuzz( func( t *testing.T , plaintext []byte , collection string , id string , at uint16 , flip byte ) {
 		if flip == 0 { flip = 1 }
+		// An id the server would not take is refused before any crypto.
+		if checkIDs( collection , id ) != nil {
+			if _ , err := master.Seal( collection , id , plaintext ); errors.Is( err , ErrBadID ) == false { t.Fatalf( "sealed under a bad id: %v" , err ) }
+			return
+		}
+		if checkIDs( collection , id + "x" ) != nil { return }
 		check := func( kind string , envelope []byte , open func( c string , i string , e []byte ) ( []byte , error ) ) {
 			back , err := open( collection , id , envelope )
 			if err != nil || bytes.Equal( back , plaintext ) == false { t.Fatalf( "%s round trip: %v" , kind , err ) }

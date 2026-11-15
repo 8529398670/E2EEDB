@@ -105,6 +105,8 @@ docs:
   error_wrong_key: "This document was encrypted with a different key."
   error_corrupt: "This document could not be decrypted: it is damaged or not where it was written."
   error_read_only: "This key can read here but not write."
+  error_bad_id: "That folder or document id is not one the server takes."
+  error_tree_broken: "The server put this folder inside itself, so it cannot be shown."
   error_no_folder: "There is no such collection here."
   error_rotating: "This collection's keys are being rotated. Finish that first."
   error_rolled_back: "The server sent this collection's keys from before a change this device has already seen (a key rotation). They were refused: someone may be trying to undo that rotation."
