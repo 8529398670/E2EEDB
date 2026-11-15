@@ -92,3 +92,19 @@ func TestPrepareShareRefusesForeignRow( t *testing.T ) {
 		t.Fatalf( "re-sealed and sent: %v" , leaked )
 	}
 }
+
+// A server reporting a parent cycle (A in B in A) is ErrCorrupt, not a stack
+// overflow walking up for keys.
+func TestParentCycleIsCorrupt( t *testing.T ) {
+	encoded , _ := testKey( t )
+	server := fakeServer( t , func( w http.ResponseWriter , r *http.Request ) {
+		json.NewEncoder( w ).Encode( map[string]any{ "collections": []any{
+			map[string]any{ "id": "A" , "name": "A" , "parent": "B" , "version": 1 , "lock": "x" } ,
+			map[string]any{ "id": "B" , "name": "B" , "parent": "A" , "version": 1 , "lock": "x" } ,
+		} } )
+	} )
+	store , _ := New( server.URL , "k" , encoded )
+	if _ , err := store.CollectionKey( context.Background() , "A" , false ); errors.Is( err , ErrCorrupt ) == false {
+		t.Fatalf( "CollectionKey = %v, want ErrCorrupt" , err )
+	}
+}

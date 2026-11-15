@@ -156,7 +156,7 @@ A folder, empty until a document is written into it. Writing a document into an 
 
 Rename, move or reorder a collection
 
-Give any of name, parent, before and lock. Its documents are not touched: they stay filed under the same id. Moving a folder into itself or one of its own subfolders is 400 collection_cycle; deeper than max_depth is 400 too_deep.
+Give any of name, parent, before and lock. Its documents are not touched: they stay filed under the same id. Moving a folder into itself or one of its own subfolders is 400 collection_cycle; deeper than max_depth is 400 too_deep. A scoped key cannot rename or move the collection it is for (403).
 
 |  |  |
 |---|---|

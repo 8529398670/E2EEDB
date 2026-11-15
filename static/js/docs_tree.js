@@ -190,7 +190,7 @@ const DocsTree = {
     row.style.setProperty( "--docs-level" , String( level - 1 ) );
     row.addEventListener( "click" , () => this.select( folder.id ) );
     row.addEventListener( "dblclick" , ( event ) => {
-      if ( event.target.closest( ".docs-node-name" ) && Docs.canWrite() ) this.rename( folder.id );
+      if ( event.target.closest( ".docs-node-name" ) ) this.rename( folder.id );
     } );
     const item = Dom.el( "li" , {
       class: "docs-node",
@@ -248,13 +248,13 @@ const DocsTree = {
       children: [ Dom.el( "i" , { class: "bi bi-three-dots-vertical" , attrs: { "aria-hidden": "true" } } ) ],
     } );
     // Opened with an access token: only what it may do, and its own folder
-    // stays where it is. Signed in: Share... too.
+    // keeps its name and place. Signed in: Share... too.
     const scoped = Docs.scope !== null;
     const root = scoped && folder.id === Docs.scope.key.collection;
     const writable = Docs.canWrite();
     const entries = [];
     if ( writable ) entries.push( item( "bi-folder-plus" , "docs.folder_new_inside" , () => this.create( folder.id ) ) );
-    if ( writable ) entries.push( item( "bi-pencil" , "docs.folder_rename" , () => this.rename( folder.id ) ) );
+    if ( writable && !root ) entries.push( item( "bi-pencil" , "docs.folder_rename" , () => this.rename( folder.id ) ) );
     if ( writable && !root ) entries.push( item( "bi-arrow-right-square" , "docs.folder_move" , () => this.moveTo( folder.id ) ) );
     if ( !scoped ) entries.push( item( "bi-share" , "docs.folder_share" , () => Docs.share( folder.id ) ) );
     if ( writable && !root ) {
@@ -456,6 +456,8 @@ const DocsTree = {
   // Renames a folder where it sits: Enter saves, Escape cancels, and leaving
   // the field saves.
   rename( id ) {
+    // An access token's own folder keeps its name: the server refuses it.
+    if ( !Docs.canWrite() || ( Docs.scope !== null && id === Docs.scope.key.collection ) ) return;
     const folder = this.get( id );
     const item = Dom.get( "docs-tree" ).querySelector( "[role=treeitem][data-id='" + CSS.escape( id ) + "']" );
     if ( !folder || !item ) return;

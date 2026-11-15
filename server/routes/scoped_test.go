@@ -125,6 +125,12 @@ func TestScopedAccessTokens( t *testing.T ) {
 	if _ , err = writer.CreateCollection( ctx , client.NewCollection{ ID: "top" } ); err == nil { t.Fatal( "writer made a top-level folder" ) }
 	if _ , err = writer.MoveCollection( ctx , "projects" , "private" , "" ); err == nil { t.Fatal( "writer moved its own root" ) }
 	if _ , err = writer.DeleteCollection( ctx , "projects" ); err == nil { t.Fatal( "writer deleted its own root" ) }
+	// Renaming its own root would test names against the owner's other
+	// top-level folders: "private" is taken, and that must not show.
+	if status , reply := fixture.withKey( t , writer_api , fiber.MethodPost , "/api/collections/projects" , fiber.Map{ "name": "private" } ); status != 403 {
+		t.Fatalf( "writer renamed its own root: %d %v" , status , reply )
+	}
+	if _ , err = writer.RenameCollection( ctx , beta , "beta two" ); err != nil { t.Fatalf( "writer rename inside: %v" , err ) }
 	if _ , err = writer.MoveDoc( ctx , "alpha" , "a" , "private" ); err == nil { t.Fatal( "writer moved a doc out" ) }
 
 	// The owner, from scratch, reads what the writer wrote; a fresh reader

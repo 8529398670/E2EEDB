@@ -94,8 +94,11 @@ const Docs = {
   // collection's keys, from its lockbox. create: a collection without keys
   // gets them now (which needs write access to its parent), and one that
   // does not exist yet is made at the top level (master key only).
-  async keyFor( collection , create ) {
+  // depth counts the folders walked up so far: a dishonest server's parent
+  // cycle (A in B in A) would otherwise walk forever.
+  async keyFor( collection , create , depth = 0 ) {
     if ( this.folderKeys.has( collection ) ) return this.folderKeys.get( collection );
+    if ( depth > 64 ) throw DocsCrypto.fail( "corrupt" );
     let folder = DocsTree.get( collection );
     if ( !folder ) {
       await DocsTree.refresh();
@@ -105,7 +108,7 @@ const Docs = {
       if ( !create || !this.key ) throw DocsCrypto.fail( "no_folder" );
       return this.createTopLevel( collection );
     }
-    const holder = await this.holderFor( folder.parent , create );
+    const holder = await this.holderFor( folder.parent , create , depth + 1 );
     let key;
     if ( folder.lock ) {
       key = DocsCrypto.openLock( folder.lock , collection , holder );
@@ -128,8 +131,8 @@ const Docs = {
 
   // What wraps a collection under parent: the master key at the top level,
   // otherwise parent's keys.
-  async holderFor( parent , create ) {
-    if ( parent !== "" ) return this.keyFor( parent , create );
+  async holderFor( parent , create , depth = 0 ) {
+    if ( parent !== "" ) return this.keyFor( parent , create , depth );
     if ( !this.key ) throw DocsCrypto.fail( "wrong_key" );
     return this.key;
   },
@@ -878,7 +881,11 @@ const Docs = {
     }
     this.clearTextError();
     const was = this.open;
-    if ( !was.isNew && text === JSON.stringify( JSON.parse( was.text || "null" ) ) ) {
+    // was.text is the document as opened, which need not be JSON: shown as
+    // it is, and then compared as it is. A parse error here would carry its
+    // start into the error report.
+    const compact = ( raw ) => { try { return JSON.stringify( JSON.parse( raw ) ); } catch ( error ) { return raw; } };
+    if ( !was.isNew && text === compact( was.text || "null" ) ) {
       Dom.toast( I18n.get( "ui.unchanged" ) , "ok" );
       return;
     }
@@ -899,7 +906,7 @@ const Docs = {
     // One version number, carried between the undo and redo steps, so each
     // one writes only over what the one before it left.
     const state = { version: saved.version };
-    const previous = was.isNew ? null : JSON.stringify( JSON.parse( was.text ) );
+    const previous = was.isNew ? null : compact( was.text );
     const label = this.say( was.isNew ? "docs.undo_create" : "docs.undo_edit" , { id: id } );
     Undo.record( {
       label: label,

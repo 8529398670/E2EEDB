@@ -5021,7 +5021,7 @@
     },
     "/api/collections/{collection}": {
       "post": {
-        "description": "Give any of name, parent, before and lock. Its documents are not touched: they stay filed under the same id. Moving a folder into itself or one of its own subfolders is 400 collection_cycle; deeper than max_depth is 400 too_deep.",
+        "description": "Give any of name, parent, before and lock. Its documents are not touched: they stay filed under the same id. Moving a folder into itself or one of its own subfolders is 400 collection_cycle; deeper than max_depth is 400 too_deep. A scoped key cannot rename or move the collection it is for (403).",
         "operationId": "post_api_collections_collection",
         "parameters": [
           {

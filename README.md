@@ -63,7 +63,7 @@ reorder or nest it, drop documents on one to move them (press and hold first on
 a touch screen), or use each one's menu for New, Rename, Move to and Delete.
 Every change can be undone.
 
-Known limits, by design for this version:
+Known limits, by design:
 
 - **Rollback and withholding.** A malicious server cannot read or forge a
   document, or move one to another collection or id: the ciphertext is bound
@@ -77,7 +77,17 @@ Known limits, by design for this version:
 - **Sharing with write access lets someone add folders.** Whoever holds a
   read/write access key can make folders inside the shared one. They always
   get random ids, and the Go client refuses to write your own documents into
-  them unless asked to.
+  them unless asked to. Making a folder with an id that is already taken is
+  refused, so someone who already knows one of your folder ids can learn that
+  it exists, even outside what you shared. Ids are random and never shown to
+  them, so they would have to get it some other way.
+- **The web page trusts the server it came from.** The browser runs the
+  JavaScript the server sends, so a dishonest server could send a page that
+  takes the master key (or an access token) as you type it. Only the Go client,
+  built from source you hold, is safe from that.
+- **An opened access token stays in the tab.** Opening Documents with an access
+  token keeps it in that tab's `sessionStorage`, so a reload stays open, until
+  the tab is closed. Close the tab on a shared computer.
 
 ## Keys
 

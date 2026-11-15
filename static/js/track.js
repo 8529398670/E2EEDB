@@ -136,9 +136,12 @@ const Track = {
     this.event( "submit" , { target: form.id ? "#" + form.id : "form" , fields: names } );
   },
 
+  // Only the kind of error, never its message: a message can quote the data
+  // that broke (JSON.parse puts the start of its text in it), and the
+  // activity log is no place for what the page was showing.
   onError( event ) {
     this.event( "error" , { detail: {
-      message: String( event.message || "" ).slice( 0 , 200 ),
+      message: this.kind( event.error ),
       source: String( event.filename || "" ).split( "?" )[ 0 ],
       line: event.lineno || 0,
       column: event.colno || 0,
@@ -148,9 +151,13 @@ const Track = {
   onRejection( event ) {
     const reason = event.reason;
     this.event( "error" , { detail: {
-      message: String( ( reason && reason.message ) || reason || "" ).slice( 0 , 200 ),
+      message: this.kind( reason ),
       source: "promise",
     } } );
+  },
+
+  kind( error ) {
+    return error instanceof Error ? String( error.name || "Error" ).slice( 0 , 40 ) : typeof error;
   },
 
   // Straight to fetch rather than through Api.request: keepalive lets the

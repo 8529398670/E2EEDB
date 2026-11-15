@@ -435,10 +435,11 @@ func ( handlers *Handlers ) createCollection( c fiber.Ctx , in *createCollection
 // before, each optional. Its documents stay as they are.
 //
 // @route("POST /api/collections/{collection}", summary="Rename, move or reorder a collection",
-//     tag="Documents", errors=(404, 409),
+//     tag="Documents", errors=(403, 404, 409),
 //     description="Give any of name, parent, before and lock. Its documents are not touched: they stay filed "
 //         "under the same id. Moving a folder into itself or one of its own subfolders is 400 "
-//         "collection_cycle; deeper than max_depth is 400 too_deep.",
+//         "collection_cycle; deeper than max_depth is 400 too_deep. A scoped key cannot rename or move the "
+//         "collection it is for (403).",
 // )
 func ( handlers *Handlers ) updateCollection( c fiber.Ctx , in *updateCollectionRequest ) ( reply *collectionRow , err error ) {
 	change , refused := in.change( in.IfVersion )
@@ -449,18 +450,18 @@ func ( handlers *Handlers ) updateCollection( c fiber.Ctx , in *updateCollection
 		return
 	}
 	id := in.Collection
-	if scope := docScope( c ); scope != nil && ( change.Parent != nil || change.Before != nil ) {
-		// The folder a key is for stays where it is; others move only
-		// within it.
-		if id == scope.Collection {
-			err = refuse( fiber.StatusForbidden , "a scoped key cannot move the collection it is for" )
+	if scope := docScope( c ); scope != nil && id == scope.Collection && ( change.Name != nil || change.Parent != nil || change.Before != nil ) {
+		// The folder a key is for stays where and what it is. A rename
+		// would check its name against the owner's other top-level
+		// folders (409 name_taken), telling the key's holder their names.
+		err = refuse( fiber.StatusForbidden , "a scoped key cannot rename or move the collection it is for" )
+		return
+	}
+	if docScope( c ) != nil && change.Parent != nil {
+		// Others move only within it.
+		if refused = handlers.checkScope( c , *change.Parent , true ); refused != nil {
+			err = refused
 			return
-		}
-		if change.Parent != nil {
-			if refused = handlers.checkScope( c , *change.Parent , true ); refused != nil {
-				err = refused
-				return
-			}
 		}
 	}
 	entry , update_err := handlers.Docs.UpdateCollection( docOwner( c ) , id , change , handlers.docLimits() )

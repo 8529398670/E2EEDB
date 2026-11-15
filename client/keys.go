@@ -52,6 +52,22 @@ func ( client *Client ) tree( ctx context.Context ) ( tree map[ string ]Collecti
 	for _ , entry := range collections {
 		tree[ entry.ID ] = entry
 	}
+	// Keys are found by walking up the parents, so a dishonest server's
+	// cycle (A in B in A) would recurse until the stack runs out. Every
+	// walk must leave the tree (the top level, or a scoped key's root)
+	// within as many steps as there are folders.
+	for id := range tree {
+		steps := 0
+		for at := id ; ; steps++ {
+			entry , found := tree[ at ]
+			if found == false { break }
+			if steps > len( tree ) {
+				tree , err = nil , fmt.Errorf( "%w: collection %s is inside itself" , ErrCorrupt , id )
+				return
+			}
+			at = entry.Parent
+		}
+	}
 	return
 }
 
