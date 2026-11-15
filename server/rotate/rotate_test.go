@@ -93,7 +93,7 @@ func ( d *deployment ) assertWhole( t *testing.T ) ( cfg *config.Config ) {
 	if _ , err = models.GetUser( store , d.userID ); err != nil { t.Fatalf( "the key does not open the database: %v" , err ) }
 	user , err := models.GetUser( store , d.userID )
 	if err != nil { t.Fatal( err ) }
-	opened , err := encryption.ChaChaDecryptBase64String( cfg.SecretKey , user.TOTPPending )
+	opened , err := encryption.ChaChaDecryptBase64String( encryption.SubKey( cfg.SecretKey , encryption.PurposeTOTP ) , user.TOTPPending )
 	if err != nil || opened != d.secret { t.Fatalf( "two-factor secret: %q %v" , opened , err ) }
 
 	reader := logs.New( cfg.Logs , cfg.SecretKey , cfg.EncryptAtRest )

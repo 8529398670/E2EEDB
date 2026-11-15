@@ -4,6 +4,7 @@ import (
 	http "net/http"
 	strings "strings"
 	testing "testing"
+	time "time"
 
 	fiber "github.com/gofiber/fiber/v3"
 	models "github.com/8529398670/E2EEDB/server/models"
@@ -15,12 +16,18 @@ import (
 func launder( t *testing.T , fixture *authFixture ) ( key_id string , session *browser , link string , successor string ) {
 	leaked := issueKey( t , fixture , fixture.alice , models.RoleUser )
 	key_id = strings.SplitN( leaked , "." , 2 )[ 0 ]
-	status , reply := fixture.withKey( t , leaked , http.MethodPost , "/api/account/login-link" , fiber.Map{} )
-	if status != 200 { t.Fatalf( "login link from key: %d %v" , status , reply ) }
+	// No key makes a link for its own account any more (S9), but a link can
+	// still carry the key that asked for it, so make one as that key would.
+	if status , reply := fixture.withKey( t , leaked , http.MethodPost , "/api/account/login-link" , fiber.Map{} ); status != 403 {
+		t.Fatalf( "a key made its own login link: %d %v" , status , reply )
+	}
+	minted , _ , err := models.IssueLoginLink( fixture.store , fixture.alice.ID , models.LoginLinkOptions{ MaxUses: 1 , TTL: time.Hour , MintedByKey: key_id } )
+	if err != nil { t.Fatal( err ) }
 	session = fixture.browser()
-	if status , reply = session.post( t , "/api/login" , fiber.Map{ "credential": strings.TrimPrefix( reply[ "login_path" ].( string ) , "/login/" ) } ); status != 200 {
+	if status , reply := session.post( t , "/api/login" , fiber.Map{ "credential": minted } ); status != 200 {
 		t.Fatalf( "redeem: %d %v" , status , reply )
 	}
+	status , reply := 0 , fiber.Map{}
 	if status , reply = send( t , session , "/api/account/login-link" , fiber.Map{} ); status != 200 { t.Fatalf( "second link: %d %v" , status , reply ) }
 	link = strings.TrimPrefix( reply[ "login_path" ].( string ) , "/login/" )
 	if status , reply = send( t , session , "/api/keys" , fiber.Map{ "name": "successor" } ); status != 201 { t.Fatalf( "successor key: %d %v" , status , reply ) }

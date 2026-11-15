@@ -167,22 +167,17 @@ func ( handlers *Handlers ) renameAccount( c fiber.Ctx , in *renameAccountReques
 // has the same effect: any link the account could still use stops working,
 // and existing sessions stay signed in.
 //
-// An API key may ask too, but only one that carries the account's full role:
-// the link becomes a session, and a session acts with the account's role, so
-// a key scoped down to "user" on an admin's account would otherwise climb.
-// Revoking the key voids the link while it can still be used.
+// Only a browser session may ask. An API key may not: the link becomes an
+// ordinary browser session, which would open everything kept from keys (the
+// API keys card, the owner's screens, minting keys) to whoever holds one.
 //
 // @route("POST /api/account/login-link", summary="A login link for yourself",
-//     tag="Account",
-//     description="A link that signs your own account in on a browser or another device. Only a key with "
-//         "your account's full role may ask: one scoped down to user on an admin account is refused.",
+//     tag="Account", access=SESSION_ONLY,
+//     description="A link that signs your own account in on a browser or another device. Only a browser "
+//         "session may ask: an API key is refused, so that a key cannot turn itself into a session.",
 // )
 func ( handlers *Handlers ) createMyLoginLink( c fiber.Ctx , in *models.LoginLinkRequest ) ( reply *loginLinkReply , err error ) {
 	actor := security.ActorFrom( c )
-	if actor.ViaAPIKey() && actor.Role != actor.User.Role {
-		err = refuse( fiber.StatusForbidden , "this key acts with less than your account's role, so it cannot make a login link" )
-		return
-	}
 	options , refused := handlers.loginLinkOptions( c , *in )
 	if refused != nil {
 		err = refused
