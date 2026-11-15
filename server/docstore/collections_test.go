@@ -82,10 +82,14 @@ func TestCreateRenameAndNames( t *testing.T ) {
 	if _ , err = store.UpdateCollection( 1 , "work" , CollectionChange{ Name: name( "X" ) , IfVersion: version( 1 ) } , limits ); errors.Is( err , ErrConflict ) == false {
 		t.Fatalf( "a stale rename should conflict, got %v" , err )
 	}
-	for _ , bad := range []string{ "" , " lead" , "trail " , "tab\there" } {
+	// Nothing that does not show (PLAN H9): zero-width characters and the
+	// marks that turn text right to left, a joiner anywhere but in an emoji.
+	for _ , bad := range []string{ "" , " lead" , "trail " , "tab\there" , "X\u200b" , "invoices\u202efdp.exe" , "a\u2066b" ,
+		"\ufeffX" , "X\u200d" , "a\u200db" , "\u200d\U0001F600" , "a\u2060b" , "tag\U000E0041" } {
 		if ValidCollectionName( bad ) { t.Errorf( "%q should not be a valid name" , bad ) }
 	}
-	for _ , good := range []string{ "Invoices 2026" , "Ünïcødé / slashes too" } {
+	for _ , good := range []string{ "Invoices 2026" , "Ünïcødé / slashes too" , "Family \U0001F468\u200d\U0001F469\u200d\U0001F467" ,
+		"Pride \U0001F3F3\ufe0f\u200d\U0001F308" , "عربي" } {
 		if ValidCollectionName( good ) == false { t.Errorf( "%q should be a valid name" , good ) }
 	}
 }

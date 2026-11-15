@@ -5,6 +5,8 @@ import (
 	base64 "encoding/base64"
 	json "encoding/json"
 	errors "errors"
+	io "io"
+	time "time"
 )
 
 // ErrBadLock: a lockbox that is not one. The server cannot open a lockbox,
@@ -25,7 +27,43 @@ const (
 	lockOwnBytes   = 32
 	// lockMaxEpoch is what a browser's numbers hold exactly.
 	lockMaxEpoch   = 1<<53 - 1
+	// lockEpochAhead is how far past this server's clock, in seconds, an
+	// epoch may be. Clients make fresh epochs from the time and add one per
+	// rotation, so an honest lockbox never gets near it. Without it, a
+	// sharee could give a folder it made the last epoch there is, and the
+	// owner's rotation could not give that folder one more (README.md,
+	// "Rotating keys").
+	lockEpochAhead = 1 << 32
 )
+
+// lockNames is every name a lockbox may have at its top level. Each must
+// appear once, spelt exactly so: Go matches names regardless of case and a
+// browser does not, so a box with {"key_id":"A","KEY_ID":"B"} would name key
+// B here and key A there.
+var lockNames = map[ string ]bool{
+	"parent": true , "by": true , "key_id": true , "epoch": true , "nonce_r": true ,
+	"read": true , "nonce_w": true , "write": true , "sig": true , "own": true ,
+}
+
+// exactNames is whether raw is one JSON object whose names are all in
+// names, each at most once, as written, with nothing after it.
+func exactNames( raw []byte , names map[ string ]bool ) bool {
+	decoder := json.NewDecoder( bytes.NewReader( raw ) )
+	if token , err := decoder.Token(); err != nil || token != json.Delim( '{' ) { return false }
+	seen := map[ string ]bool{}
+	for decoder.More() {
+		token , err := decoder.Token()
+		if err != nil { return false }
+		name , ok := token.( string )
+		if ok == false || names[ name ] == false || seen[ name ] { return false }
+		seen[ name ] = true
+		var skip json.RawMessage
+		if decoder.Decode( &skip ) != nil { return false }
+	}
+	if token , err := decoder.Token(); err != nil || token != json.Delim( '}' ) { return false }
+	_ , err := decoder.Token()
+	return err == io.EOF
+}
 
 // lockbox is the shape of a lockbox, as far as the server reads it.
 type lockbox struct {
@@ -47,12 +85,13 @@ type lockbox struct {
 func checkLock( lock string , parent string ) ( err error ) {
 	err = ErrBadLock
 	if len( lock ) == 0 || len( lock ) > LockMaxBytes { return }
+	if exactNames( []byte( lock ) , lockNames ) == false { return }
 	decoder := json.NewDecoder( bytes.NewReader( []byte( lock ) ) )
 	decoder.DisallowUnknownFields()
 	var box lockbox
 	if decoder.Decode( &box ) != nil || decoder.More() { return }
 	if box.Parent == nil || *box.Parent != parent { return }
-	if box.Epoch < 1 || box.Epoch > lockMaxEpoch { return }
+	if box.Epoch < 1 || box.Epoch > lockMaxEpoch || box.Epoch > uint64( time.Now().Unix() ) + lockEpochAhead { return }
 	fields := []struct {
 		text string
 		size int

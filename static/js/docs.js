@@ -1472,6 +1472,7 @@ const Docs = {
     await DocsTree.refresh();
     Dom.toast( this.say( done.revoked ? "docs.rotate_done_revoked" : "docs.rotate_done" ,
       { name: folder.name , folders: done.folders , docs: done.docs , revoked: done.revoked } ) , "ok" );
+    if ( done.dropped || done.broken ) Dom.toast( this.say( "docs.rotate_dropped" , { dropped: done.dropped , broken: done.broken } ) , "error" );
     if ( Keys.me ) Keys.refresh().catch( () => {} );
     if ( this.collection ) this.refreshDocs();
   },
@@ -1479,7 +1480,13 @@ const Docs = {
   // The rotation itself, as client.RotateKeys does it: new lockboxes,
   // parents first (or the ones a rotation already under way staged), every
   // collection envelope sealed again with the new keys, then the switch.
-  // Answers { folders , docs , revoked } (how many).
+  // Answers { folders , docs , revoked , dropped , broken } (how many).
+  //
+  // Nothing an access key could plant in the subtree stops it: a folder
+  // whose lockbox does not open gets new keys as if it had none (broken),
+  // and a collection envelope no key opens is deleted (dropped). A lockbox
+  // from before a rotation this device has seen ("rolled_back") still
+  // stops it.
   async rotateKeys( id ) {
     this.forgetKeys();
     await DocsTree.refresh();
@@ -1487,9 +1494,20 @@ const Docs = {
     const olds = new Map();
     const news = new Map();
     const staged = [];
+    let broken = 0;
     for ( const at of order ) {
       const folder = DocsTree.get( at );
-      if ( folder.lock ) olds.set( at , await this.keyFor( at , false ) );
+      if ( folder.lock ) {
+        try {
+          olds.set( at , await this.keyFor( at , false ) );
+        } catch ( error ) {
+          // Its lockbox (or one above it) does not open: new keys as if it
+          // had none. What the old ones sealed opens for nobody, and the
+          // reseal pass drops it.
+          if ( error.code !== "corrupt" && error.code !== "wrong_key" ) throw error;
+          broken++;
+        }
+      }
       if ( folder.next_lock ) {
         news.set( at , await this.nextKeyFor( at ) );
         continue;
@@ -1517,15 +1535,19 @@ const Docs = {
       this.folderNextKeys.set( at , key );
       await this.noteEpoch( at , "next" , key.epoch );
     }
-    let docs = 0;
+    let docs = 0 , dropped = 0;
     for ( let pass = 0; ; pass++ ) {
-      for ( const at of order ) docs += await this.reseal( at , olds.get( at ) , news.get( at ) );
+      for ( const at of order ) {
+        const done = await this.reseal( at , olds.get( at ) , news.get( at ) );
+        docs += done.sealed;
+        dropped += done.dropped;
+      }
       try {
         const done = await Api.commitRotation( id );
         // Done: from now on only the new lockboxes are good here.
         for ( const [ at , key ] of news ) await this.noteEpoch( at , "lock" , key.epoch );
         this.forgetKeys();
-        return { folders: done.collections.length , docs: docs , revoked: revoked };
+        return { folders: done.collections.length , docs: docs , revoked: revoked , dropped: dropped , broken: broken };
       } catch ( error ) {
         // Something changed under this pass: the next one picks it up.
         if ( !( error.status === 409 && error.payload && error.payload.error === "rotate_incomplete" ) || pass >= 3 ) throw error;
@@ -1535,11 +1557,13 @@ const Docs = {
 
   // Seals every collection envelope in collection that next did not seal
   // again with next, each only if it has not changed since it was read.
-  // Answers how many it wrote. One sealed with neither old nor next cannot
-  // be opened, so it cannot move to the new keys: that stops it.
+  // One no key opens (sealed with neither old nor next, or failing its
+  // signature) is deleted instead, if unchanged: no reader accepts it, and
+  // the commit waits for every envelope to name next. Answers
+  // { sealed , dropped } (how many).
   async reseal( collection , old , next ) {
     const next_id = DocsCrypto.b64( next.id );
-    let count = 0;
+    let count = 0 , dropped = 0;
     let offset = 0;
     while ( offset !== null && offset !== undefined ) {
       const page = await Api.docs( collection , offset , 200 , true );
@@ -1548,11 +1572,22 @@ const Docs = {
         if ( DocsCrypto.envelopeKind( row.body ) !== DocsCrypto.ENVELOPE_COLLECTION ) continue;
         const named = DocsCrypto.envelopeKeyId( row.body );
         if ( named === next_id ) continue;
-        if ( !old || named !== DocsCrypto.b64( old.id ) ) throw new Error( this.say( "docs.rotate_unreadable" , { id: row.id } ) );
-        const text = DocsCrypto.openCollection( old , row.id , row.body );
+        let text = null;
+        if ( old && named === DocsCrypto.b64( old.id ) ) {
+          try {
+            text = DocsCrypto.openCollection( old , row.id , row.body );
+          } catch ( error ) {
+            if ( error.code !== "corrupt" ) throw error;
+          }
+        }
         try {
-          await Api.setDoc( collection , row.id , DocsCrypto.sealCollection( next , row.id , text ) , row.version );
-          count++;
+          if ( text === null ) {
+            await Api.deleteDoc( collection , row.id , row.version );
+            dropped++;
+          } else {
+            await Api.setDoc( collection , row.id , DocsCrypto.sealCollection( next , row.id , text ) , row.version );
+            count++;
+          }
         } catch ( error ) {
           // Changed or deleted meanwhile: the next pass looks again.
           if ( error.status !== 409 && error.status !== 404 ) throw error;
@@ -1560,7 +1595,7 @@ const Docs = {
       }
       offset = page.next;
     }
-    return count;
+    return { sealed: count , dropped: dropped };
   },
 
   showShared( name , made ) {

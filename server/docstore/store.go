@@ -157,14 +157,18 @@ var migrations = []string{
 	// graves: the folders deleted lately, each with the folders it was in
 	// then (above: " id:born " for itself and each one over it), so a
 	// scoped key may make one again under its old id (undo) only when it
-	// was inside that key's folder. Swept with the tombstones.
+	// was inside that key's folder. Swept with the tombstones, and capped
+	// with them (max_tombstones per account, oldest first). Making the id
+	// again removes its grave.
 	//
 	// usage: running totals of each account's documents, per collection and
 	// (collection "") for the whole account, kept by the triggers below so
 	// every statement that touches docs keeps them right. bytes and docs
 	// count the live documents, tombs the tombstones not yet purged,
 	// updated_at is the last time a document there changed, deletes
-	// included. A quota check reads one row instead of summing the account.
+	// included. graves (the account's row only) counts its graves, which
+	// the quota charges like tombstones. A quota check reads one row instead
+	// of summing the account.
 	`CREATE TABLE docs (
 		user_id    INTEGER NOT NULL,
 		collection TEXT    NOT NULL,
@@ -222,6 +226,7 @@ var migrations = []string{
 		bytes      INTEGER NOT NULL DEFAULT 0,
 		docs       INTEGER NOT NULL DEFAULT 0,
 		tombs      INTEGER NOT NULL DEFAULT 0,
+		graves     INTEGER NOT NULL DEFAULT 0,
 		updated_at INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY ( user_id , collection )
 	) WITHOUT ROWID;
@@ -244,6 +249,13 @@ var migrations = []string{
 				( NEW.deleted = 0 ) - ( OLD.deleted = 0 ) , ( NEW.deleted != 0 ) - ( OLD.deleted != 0 ) , NEW.updated_at )
 		ON CONFLICT ( user_id , collection ) DO UPDATE SET bytes = bytes + excluded.bytes , docs = docs + excluded.docs ,
 			tombs = tombs + excluded.tombs , updated_at = MAX( updated_at , excluded.updated_at );
+	END;
+	CREATE TRIGGER graves_usage_insert AFTER INSERT ON graves BEGIN
+		INSERT INTO usage ( user_id , collection , graves ) VALUES ( NEW.user_id , '' , 1 )
+		ON CONFLICT ( user_id , collection ) DO UPDATE SET graves = graves + 1;
+	END;
+	CREATE TRIGGER graves_usage_delete AFTER DELETE ON graves BEGIN
+		UPDATE usage SET graves = graves - 1 WHERE user_id = OLD.user_id AND collection = '';
 	END;
 	CREATE TRIGGER docs_usage_delete AFTER DELETE ON docs BEGIN
 		UPDATE usage SET bytes = bytes - OLD.size * ( OLD.deleted = 0 ) , docs = docs - ( OLD.deleted = 0 ) , tombs = tombs - ( OLD.deleted != 0 )

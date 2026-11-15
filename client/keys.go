@@ -426,8 +426,7 @@ func ( client *Client ) hasPrivate( ctx context.Context , collection string ) ( 
 			if decode_err != nil || row.Collection != collection { return false , ErrCorrupt }
 			if EnvelopeKind( envelope ) == EnvelopeMaster { return true , nil }
 		}
-		offset = -1
-		if reply.Next != nil { offset = *reply.Next }
+		if offset , err = nextOffset( offset , reply.Next ); err != nil { return }
 	}
 	return
 }
@@ -469,8 +468,7 @@ func ( client *Client ) sealForSharing( ctx context.Context , key *CollectionKey
 				return
 			}
 		}
-		offset = -1
-		if reply.Next != nil { offset = *reply.Next }
+		if offset , err = nextOffset( offset , reply.Next ); err != nil { return }
 	}
 	return
 }

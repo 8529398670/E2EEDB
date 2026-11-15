@@ -288,7 +288,7 @@ func ( handlers *Handlers ) mountDeclared( app *fiber.App ) {
 	} , handlers.createCollection , handlers.Guard.RequireLogin )
 	apidoc.Mount( app , "POST" , "/api/collections/{collection}" , apidoc.Op{
 		Summary: "Rename, move or reorder a collection",
-		Description: "Give any of name, parent, before and lock. Its documents are not touched: they stay filed under the same id. Moving a folder into itself or one of its own subfolders is 400 collection_cycle; deeper than max_depth is 400 too_deep. A scoped key cannot rename or move the collection it is for (403).",
+		Description: "Give any of name, parent, before and lock. Its documents are not touched: they stay filed under the same id. Moving a folder into itself or one of its own subfolders is 400 collection_cycle; deeper than max_depth is 400 too_deep. A scoped key cannot rename, move or give a lockbox to the collection it is for (403).",
 		Tag: "Documents",
 		Errors: []int{ 400 , 401 , 403 , 404 , 409 },
 	} , handlers.updateCollection , handlers.Guard.RequireLogin )

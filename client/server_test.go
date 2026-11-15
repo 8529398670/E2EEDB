@@ -286,3 +286,20 @@ func TestOwnedAllTheWayDown( t *testing.T ) {
 	if _ , err := owner.CreateCollection( ctx , NewCollection{ ID: "Z" , Parent: "X" } ); err != nil { t.Fatal( err ) }
 	if len( locks ) != 1 || lockOwn( locks[ 0 ] ) != "" { t.Fatalf( "a folder inside the sharee's got the owner tag: %v" , locks ) }
 }
+
+// A server whose next page never moves forward cannot keep a client paging
+// for ever (PLAN H8): every paged read stops with ErrCorrupt.
+func TestNextPageMustMoveForward( t *testing.T ) {
+	encoded , _ := testKey( t )
+	calls := 0
+	server := fakeServer( t , func( w http.ResponseWriter , r *http.Request ) {
+		calls++
+		json.NewEncoder( w ).Encode( map[string]any{ "collections": []any{} , "docs": []any{} , "next": 0 } )
+	} )
+	store , _ := New( server.URL , "k" , encoded )
+	ctx := context.Background()
+	if _ , err := store.Collections( ctx ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "Collections = %v" , err ) }
+	if err := store.Each( ctx , "a" , func( Meta , json.RawMessage ) error { return nil } ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "Each = %v" , err ) }
+	if _ , err := store.CollectionKey( ctx , "a" , false ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "CollectionKey = %v" , err ) }
+	if calls > 3 { t.Fatalf( "%d calls" , calls ) }
+}

@@ -125,7 +125,7 @@ func TestTombstonesCountTowardTheQuota( t *testing.T ) {
 			if errors.Is( err , ErrQuota ) == false { t.Fatal( err ) }
 			break
 		}
-		if _ , err := store.Delete( 1 , "notes" , id , nil ); err != nil { t.Fatal( err ) }
+		if _ , err := store.Delete( 1 , "notes" , id , nil , nil ); err != nil { t.Fatal( err ) }
 	}
 	// Eight tombstones are 1024 bytes: the ninth write does not fit.
 	if cycles != 8 { t.Fatalf( "%d write+delete cycles fit in a 1 KiB quota" , cycles ) }
@@ -140,7 +140,7 @@ func TestTombstonesCountTowardTheQuota( t *testing.T ) {
 	for index := 0 ; index < 3 ; index++ {
 		id := fmt.Sprintf( "s%d" , index )
 		if _ , err := store.Set( 1 , "shared" , id , envelope( 1 , 60 ) , nil , share ); err != nil { t.Fatal( err ) }
-		store.Delete( 1 , "shared" , id , nil )
+		store.Delete( 1 , "shared" , id , nil , nil )
 	}
 	if _ , err := store.Set( 1 , "shared" , "s9" , envelope( 1 , 60 ) , nil , share ); errors.Is( err , ErrShareQuota ) == false {
 		t.Fatalf( "share full of tombstones: %v" , err )
@@ -163,7 +163,7 @@ func TestTotalsStayExact( t *testing.T ) {
 		case 0, 1, 2, 3:
 			store.Set( user_id , folder , id , envelope( 1 , 60 + random.Intn( 400 ) ) , nil , limits )
 		case 4, 5:
-			store.Delete( user_id , folder , id , nil )
+			store.Delete( user_id , folder , id , nil , nil )
 		case 6:
 			store.MoveDoc( user_id , folder , id , folders[ random.Intn( len( folders ) ) ] , id , envelope( 2 , 80 ) , nil , limits )
 		case 7:
@@ -211,7 +211,7 @@ func TestSweepCapsTombstones( t *testing.T ) {
 	for index := 0 ; index < 12 ; index++ {
 		id := fmt.Sprintf( "d%02d" , index )
 		store.Set( 1 , "notes" , id , envelope( 1 , 60 ) , nil , limits )
-		store.Delete( 1 , "notes" , id , nil )
+		store.Delete( 1 , "notes" , id , nil , nil )
 	}
 	store.Set( 1 , "notes" , "live" , envelope( 1 , 60 ) , nil , limits )
 	all , _ , _ := store.Changes( 1 , 0 , 100 )
@@ -224,4 +224,27 @@ func TestSweepCapsTombstones( t *testing.T ) {
 	if _ , _ , err = store.Changes( 1 , all[ 0 ].Seq , 100 ); errors.Is( err , ErrSyncExpired ) == false { t.Fatalf( "old sync: %v" , err ) }
 	if _ , _ , err = store.Changes( 1 , all[ 6 ].Seq , 100 ); err != nil { t.Fatalf( "sync past the purge: %v" , err ) }
 	checkTotals( t , store )
+}
+
+// Each deleted folder leaves a grave (for undo). The quota charges graves
+// like tombstones, the sweep keeps at most max_tombstones of them, and
+// making an id again removes its grave (PLAN H6).
+func TestGravesAreChargedAndCapped( t *testing.T ) {
+	store , _ := open( t )
+	for _ , id := range []string{ "a" , "b" , "c" , "d" , "e" } {
+		if _ , err := store.CreateCollection( 1 , id , CollectionChange{} , limits ); err != nil { t.Fatal( err ) }
+		if _ , err := store.DeleteCollection( 1 , id , DeleteOptions{} ); err != nil { t.Fatal( err ) }
+		time.Sleep( 2 * time.Millisecond )
+	}
+	usage , _ := store.Usage( 1 )
+	if usage.Graves != 5 || usage.Charged() != 5 * TombstoneBytes { t.Fatalf( "after 5 deletes: %+v charged %d" , usage , usage.Charged() ) }
+	if _ , err := store.CreateCollection( 1 , "e" , CollectionChange{} , limits ); err != nil { t.Fatal( err ) }
+	if usage , _ = store.Usage( 1 ); usage.Graves != 4 { t.Fatalf( "made again, its grave stays: %+v" , usage ) }
+	if _ , err := store.Sweep( time.Now() , 30 , 2 , func( uint64 ) bool { return true } ); err != nil { t.Fatal( err ) }
+	if usage , _ = store.Usage( 1 ); usage.Graves != 2 { t.Fatalf( "past the cap: %+v" , usage ) }
+	var kept []string
+	rows , _ := store.read.Query( `SELECT id FROM graves WHERE user_id = 1 ORDER BY id` )
+	for rows.Next() { var id string; rows.Scan( &id ); kept = append( kept , id ) }
+	rows.Close()
+	if len( kept ) != 2 || kept[ 0 ] != "c" || kept[ 1 ] != "d" { t.Fatalf( "kept %v, want the newest: c d" , kept ) }
 }

@@ -235,6 +235,8 @@ const DocsCrypto = {
   // remembers the highest it has seen can refuse an older lockbox the server
   // serves again. above is the highest this client has seen for the id.
   MAX_EPOCH: Number.MAX_SAFE_INTEGER ,
+  // Every name a lockbox may have (README.md, "Lockboxes").
+  LOCK_NAMES: [ "parent" , "by" , "key_id" , "epoch" , "nonce_r" , "read" , "nonce_w" , "write" , "sig" , "own" ] ,
   freshEpoch( above ) {
     return Math.max( Math.floor( Date.now() / 1000 ) , ( above || 0 ) + 1 );
   },
@@ -412,8 +414,12 @@ const DocsCrypto = {
     } catch ( error ) {
       throw this.fail( "corrupt" );
     }
+    // Only the format's names, spelt exactly so: Go reads a name in any
+    // case, so a box with "KEY_ID" beside "key_id" would name other keys
+    // there than here (the server and the Go client refuse it too).
+    if ( !box || typeof box !== "object" || Array.isArray( box ) || Object.keys( box ).some( ( name ) => !this.LOCK_NAMES.includes( name ) ) ) throw this.fail( "corrupt" );
     const parent = this.holderParent( holder );
-    if ( !box || box.parent !== parent ) throw this.fail( "corrupt" );
+    if ( box.parent !== parent ) throw this.fail( "corrupt" );
     if ( box.by !== this.b64( holder.id ) ) throw this.fail( "wrong_key" );
     if ( !this.validEpoch( box.epoch ) ) throw this.fail( "corrupt" );
     let opened , seed = null;

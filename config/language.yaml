@@ -179,7 +179,7 @@ docs:
   rotate_done: "{name} has new keys: {folders} collections, {docs} documents sealed again."
   rotate_done_revoked: "{name} has new keys: {folders} collections, {docs} documents sealed again. {revoked} access keys were revoked: share again to give access back."
   rotate_failed: "Rotating the keys of {name} stopped ({reason}). Use Finish rotating keys in its menu to carry on."
-  rotate_unreadable: "Document {id} is sealed with keys this collection does not have, so it cannot be moved to the new ones. Delete it, then carry on."
+  rotate_dropped: "{dropped} documents that no key opens were deleted, and {broken} collections whose keys did not open got new ones. An access key may have planted them to hold the rotation up."
   folder_top: "Top level"
   folder_top_drop: "Drop here to move to the top level"
   folder_delete_question: "Delete {name} and the {docs} documents in it?"

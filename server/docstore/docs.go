@@ -2,6 +2,7 @@ package docstore
 
 import (
 	sql "database/sql"
+	slices "slices"
 	errors "errors"
 	regexp "regexp"
 	time "time"
@@ -78,7 +79,8 @@ type Limits struct {
 	// and a folder deleted in between must not come back outside it.
 	NoAutoCreate bool
 	// Share is a scoped key's folder: its writes may not take that folder's
-	// subtree past ShareQuotaBytes of live documents (0: no limit) or
+	// subtree past ShareQuotaBytes of live documents and tombstones, with
+	// what the folders deleted from it still hold (0: no limit), or
 	// ShareMaxCollections folders (0: no limit), so someone it was shared
 	// with cannot use up the account's quota or folder limit. A scoped
 	// write that the account's own limits refuse is answered with the share
@@ -86,6 +88,27 @@ type Limits struct {
 	Share               string
 	ShareQuotaBytes     int64
 	ShareMaxCollections int
+	// Scope is a scoped key's folder, checked again inside the write's
+	// transaction (inScopeTx): the route's check runs before it, and the
+	// owner may move the folder out, or a rotation cut the key off, in
+	// between.
+	Scope *ScopeRoot
+}
+
+// inScopeTx is ErrNoCollection unless scope's root is still the folder the
+// key was made for (its Born) and every one of ids is it or under it. A nil
+// scope (a full key) reaches everything.
+func inScopeTx( tx *sql.Tx , user_id uint64 , scope *ScopeRoot , ids ...string ) ( err error ) {
+	if scope == nil { return }
+	root , found , err := readCollection( tx , user_id , scope.Root )
+	if err != nil { return }
+	if found == false || root.Born != scope.Born { return ErrNoCollection }
+	for _ , id := range ids {
+		above , walk_err := ancestors( tx , user_id , id )
+		if walk_err != nil { return walk_err }
+		if slices.Contains( above , scope.Root ) == false { return ErrNoCollection }
+	}
+	return
 }
 
 // shareSub is a WITH clause naming sub: the share's folder and every folder
@@ -157,6 +180,7 @@ func readExisting( tx *sql.Tx , user_id uint64 , collection string , id string )
 func ( store *Store ) Set( user_id uint64 , collection string , id string , body []byte , if_version *int64 , limits Limits ) ( doc Doc , err error ) {
 	now := time.Now()
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
+		if tx_err = inScopeTx( tx , user_id , limits.Scope , collection ); tx_err != nil { return }
 		created , tx_err := ensureCollection( tx , user_id , collection , limits , now )
 		if tx_err != nil { return }
 		if tx_err = checkEnvelopeKey( tx , user_id , collection , body ); tx_err != nil { return }
@@ -164,6 +188,23 @@ func ( store *Store ) Set( user_id uint64 , collection string , id string , body
 		if created { tx_err = markTree( tx , user_id , collection , doc.Seq ) }
 		return
 	} )
+	return
+}
+
+// shareUsed is what a scoped key's folder holds against the account: the
+// live documents and tombstones in its subtree, and what the folders
+// deleted from it still hold until it is purged (their tombstones and
+// graves). Otherwise writing up to the cap and deleting the folder, over and
+// over, would charge the account many times the cap.
+func shareUsed( tx *sql.Tx , user_id uint64 , limits Limits ) ( used int64 , err error ) {
+	err = tx.QueryRow( shareSub + `SELECT COALESCE( SUM( bytes + tombs * ? ) , 0 ) FROM usage WHERE user_id = ? AND collection IN ( SELECT id FROM sub )` ,
+		user_id , limits.Share , user_id , TombstoneBytes , user_id ).Scan( &used )
+	if err != nil || limits.Scope == nil { return }
+	var gone int64
+	err = tx.QueryRow( `WITH dead ( id ) AS ( SELECT id FROM graves WHERE user_id = ? AND instr( above , ? ) > 0 )
+		SELECT ( SELECT COUNT(*) FROM dead ) * ? + COALESCE( ( SELECT SUM( tombs ) FROM usage WHERE user_id = ? AND collection IN ( SELECT id FROM dead ) ) , 0 ) * ?` ,
+		user_id , graveMark( limits.Scope.Root , limits.Scope.Born ) , TombstoneBytes , user_id , TombstoneBytes ).Scan( &gone )
+	used += gone
 	return
 }
 
@@ -195,9 +236,7 @@ func setTx( tx *sql.Tx , user_id uint64 , collection string , id string , body [
 	}
 	if limits.Share != "" && limits.ShareQuotaBytes > 0 {
 		var used int64
-		err = tx.QueryRow( shareSub + `SELECT COALESCE( SUM( bytes + tombs * ? ) , 0 ) FROM usage WHERE user_id = ? AND collection IN ( SELECT id FROM sub )` ,
-			user_id , limits.Share , user_id , TombstoneBytes , user_id ).Scan( &used )
-		if err != nil { return }
+		if used , err = shareUsed( tx , user_id , limits ); err != nil { return }
 		if used - freed + int64( len( body ) ) > limits.ShareQuotaBytes {
 			err = ErrShareQuota
 			return
@@ -222,10 +261,12 @@ func setTx( tx *sql.Tx , user_id uint64 , collection string , id string , body [
 
 // Delete leaves a tombstone: no body, the next version, a new change number,
 // so a syncing client hears about it. It is purged after tombstone_days (see
-// Sweep). Deleting a document that is not live is ErrNotFound.
-func ( store *Store ) Delete( user_id uint64 , collection string , id string , if_version *int64 ) ( doc Doc , err error ) {
+// Sweep). Deleting a document that is not live is ErrNotFound. scope is a
+// scoped key's folder (Limits.Scope), nil for a full key.
+func ( store *Store ) Delete( user_id uint64 , collection string , id string , if_version *int64 , scope *ScopeRoot ) ( doc Doc , err error ) {
 	now := time.Now()
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
+		if tx_err = inScopeTx( tx , user_id , scope , collection ); tx_err != nil { return }
 		doc , tx_err = deleteTx( tx , user_id , collection , id , if_version , now )
 		return
 	} )
@@ -310,11 +351,15 @@ type Usage struct {
 	Docs  int
 	// Tombstones are the deletes not yet purged.
 	Tombstones int
+	// Graves are the deleted folders remembered for undo (the account's
+	// usage only).
+	Graves int
 }
 
-// Charged is what counts against a quota: the live documents and
-// TombstoneBytes for each tombstone.
-func ( usage Usage ) Charged() int64 { return usage.Bytes + int64( usage.Tombstones ) * TombstoneBytes }
+// Charged is what counts against a quota: the live documents, and
+// TombstoneBytes for each tombstone and each grave, so deleting over and
+// over cannot grow an account without limit.
+func ( usage Usage ) Charged() int64 { return usage.Bytes + int64( usage.Tombstones + usage.Graves ) * TombstoneBytes }
 
 // Usage is what the account's documents add up to, from the running totals
 // (one row, however many documents there are).
@@ -323,7 +368,7 @@ func ( store *Store ) Usage( user_id uint64 ) ( usage Usage , err error ) {
 	return
 }
 
-const usageQuery = `SELECT bytes , docs , tombs FROM usage WHERE user_id = ? AND collection = ''`
+const usageQuery = `SELECT bytes , docs , tombs , graves FROM usage WHERE user_id = ? AND collection = ''`
 
 func readUsage( tx *sql.Tx , user_id uint64 ) ( usage Usage , err error ) {
 	usage , err = scanUsage( tx.QueryRow( usageQuery , user_id ) )
@@ -331,7 +376,7 @@ func readUsage( tx *sql.Tx , user_id uint64 ) ( usage Usage , err error ) {
 }
 
 func scanUsage( row *sql.Row ) ( usage Usage , err error ) {
-	err = row.Scan( &usage.Bytes , &usage.Docs , &usage.Tombstones )
+	err = row.Scan( &usage.Bytes , &usage.Docs , &usage.Tombstones , &usage.Graves )
 	if errors.Is( err , sql.ErrNoRows ) { err = nil }
 	return
 }

@@ -7,6 +7,7 @@ import (
 	errors "errors"
 	flag "flag"
 	os "os"
+	strings "strings"
 	testing "testing"
 )
 
@@ -247,6 +248,16 @@ func TestCollectionKeys( t *testing.T ) {
 	if plain , err := opened_child.Open( "a" , envelope ); err != nil || string( plain ) != `{"x":1}` { t.Fatalf( "open: %v" , err ) }
 
 	// A lockbox read for another collection, or with the wrong holder, fails.
+	// Only the format's names, as written: encoding/json would read
+	// "KEY_ID" as key_id, and a browser would not (H4).
+	for label , text := range map[ string ]string{
+		"other case": strings.Replace( child_lock , `"key_id":` , `"KEY_ID":` , 1 ),
+		"repeated":   strings.Replace( child_lock , `"by":` , `"by":"x","by":` , 1 ),
+		"extra":      strings.Replace( child_lock , `{` , `{"x":1,` , 1 ),
+		"trailing":   child_lock + "{}",
+	} {
+		if _ , err = openLock( text , "child" , opened_parent ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "%s: %v" , label , err ) }
+	}
 	if _ , err = openLock( child_lock , "other" , opened_parent ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "wrong collection: %v" , err ) }
 	if _ , err = openLock( child_lock , "child" , master ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "wrong parent: %v" , err ) }
 	stranger , _ := generateCollectionKey( "parent" , 1 )

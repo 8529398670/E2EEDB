@@ -18,6 +18,7 @@ package client
 // crypto_sign_seed_keypair / crypto_sign_detached.
 
 import (
+	bytes "bytes"
 	ed25519 "crypto/ed25519"
 	hmac "crypto/hmac"
 	rand "crypto/rand"
@@ -26,6 +27,7 @@ import (
 	json "encoding/json"
 	errors "errors"
 	fmt "fmt"
+	io "io"
 	strings "strings"
 	time "time"
 
@@ -271,6 +273,35 @@ type lockbox struct {
 	Own string `json:"own,omitempty"`
 }
 
+// lockNames is every name a lockbox may have at its top level. Each must
+// appear once, spelt exactly so: encoding/json matches names regardless of
+// case and a browser does not, so a box with {"key_id":"A","KEY_ID":"B"}
+// would name key B here and key A there.
+var lockNames = map[ string ]bool{
+	"parent": true , "by": true , "key_id": true , "epoch": true , "nonce_r": true ,
+	"read": true , "nonce_w": true , "write": true , "sig": true , "own": true ,
+}
+
+// exactNames is whether raw is one JSON object whose names are all in
+// names, each at most once, as written, with nothing after it.
+func exactNames( raw []byte , names map[ string ]bool ) bool {
+	decoder := json.NewDecoder( bytes.NewReader( raw ) )
+	if token , err := decoder.Token(); err != nil || token != json.Delim( '{' ) { return false }
+	seen := map[ string ]bool{}
+	for decoder.More() {
+		token , err := decoder.Token()
+		if err != nil { return false }
+		name , ok := token.( string )
+		if ok == false || names[ name ] == false || seen[ name ] { return false }
+		seen[ name ] = true
+		var skip json.RawMessage
+		if decoder.Decode( &skip ) != nil { return false }
+	}
+	if token , err := decoder.Token(); err != nil || token != json.Delim( '}' ) { return false }
+	_ , err := decoder.Token()
+	return err == io.EOF
+}
+
 // ownTag is what says the master key made collection's keys (key_id): a MAC
 // only the master key can make or check.
 //
@@ -368,7 +399,7 @@ func sealLockWith( key *CollectionKey , holder lockHolder , nonce_r []byte , non
 // ErrWrongKey; one made for another place, or changed, is ErrCorrupt.
 func openLock( text string , collection string , holder lockHolder ) ( key *CollectionKey , err error ) {
 	var box lockbox
-	if err = json.Unmarshal( []byte( text ) , &box ); err != nil {
+	if exactNames( []byte( text ) , lockNames ) == false || json.Unmarshal( []byte( text ) , &box ) != nil {
 		err = ErrCorrupt
 		return
 	}

@@ -24,6 +24,16 @@ type Rotation struct {
 	// revoked: they reached a collection whose keys changed, and what their
 	// tokens carry no longer opens it. Share again to give access back.
 	Revoked []string
+	// Dropped is the documents deleted because no key opens them, as
+	// "collection/id": a collection envelope whose signature or ciphertext
+	// does not check out, or that names neither the old keys nor the new.
+	// No reader accepts one, so it cannot be sealed again, and left there
+	// it would hold the rotation up for good. Broken is the collections
+	// whose lockbox did not open: they got new keys as if they had none.
+	// Both are what a read/write access key could plant to stop the
+	// rotation meant to cut it off.
+	Dropped []string
+	Broken  []string
 }
 
 // rotateBatch is how many lockboxes go in one rotate call.
@@ -38,6 +48,12 @@ const rotateBatch = 200
 // starts: their tokens hold the old keys. Access keys for a collection above
 // it keep working, since they open the new keys the same way they opened the
 // old.
+//
+// Nothing an access key could have planted in the subtree stops it: a
+// collection whose lockbox does not open gets new keys as if it had none
+// (Rotation.Broken), and a collection envelope no key opens is deleted
+// (Rotation.Dropped). A lockbox from before a rotation this client has seen
+// (ErrRolledBack) still stops it.
 //
 // It is safe to stop half way: the server keeps both lockboxes until it is
 // done, documents open with either meanwhile, and calling RotateKeys on the
@@ -59,7 +75,15 @@ func ( client *Client ) RotateKeys( ctx context.Context , collection string ) ( 
 	for _ , id := range order {
 		entry := tree[ id ]
 		if entry.Lock != "" {
-			if olds[ id ] , err = client.resolve( ctx , tree , id , mintNever ); err != nil { return }
+			olds[ id ] , err = client.resolve( ctx , tree , id , mintNever )
+			if errors.Is( err , ErrCorrupt ) || errors.Is( err , ErrWrongKey ) {
+				// Its lockbox does not open (or one above it does not): give
+				// it keys as if it had none. What was sealed with the old ones
+				// opens for nobody, so the reseal pass drops it.
+				olds[ id ] , err = nil , nil
+				rotation.Broken = append( rotation.Broken , id )
+			}
+			if err != nil { return }
 		}
 		if entry.NextLock != "" {
 			if news[ id ] , err = client.resolveNext( ctx , tree , id ); err != nil { return }
@@ -119,8 +143,9 @@ func ( client *Client ) RotateKeys( ctx context.Context , collection string ) ( 
 	// under this pass is picked up by the next.
 	for pass := 0 ; ; pass++ {
 		for _ , id := range order {
-			count , reseal_err := client.reseal( ctx , id , olds[ id ] , news[ id ] )
+			count , dropped , reseal_err := client.reseal( ctx , id , olds[ id ] , news[ id ] )
 			rotation.Docs += count
+			rotation.Dropped = append( rotation.Dropped , dropped... )
 			if reseal_err != nil { return rotation , reseal_err }
 		}
 		var reply struct {
@@ -186,9 +211,11 @@ func subtreeOf( tree map[ string ]Collection , root string ) ( order []string ) 
 
 // reseal seals every collection envelope in collection that next did not
 // seal again with next, each only if it has not changed since it was read,
-// and answers how many it wrote. One sealed with neither old nor next is
-// ErrWrongKey: it cannot be opened, so it cannot be moved to the new keys.
-func ( client *Client ) reseal( ctx context.Context , collection string , old *CollectionKey , next *CollectionKey ) ( count int , err error ) {
+// and answers how many it wrote. One that no key opens (sealed with neither
+// old nor next, or failing its signature) is deleted instead, if it has not
+// changed since it was read, and named in dropped: no reader accepts it,
+// and the commit waits for every envelope to name next.
+func ( client *Client ) reseal( ctx context.Context , collection string , old *CollectionKey , next *CollectionKey ) ( count int , dropped []string , err error ) {
 	offset := 0
 	for offset >= 0 {
 		var reply struct {
@@ -202,19 +229,24 @@ func ( client *Client ) reseal( ctx context.Context , collection string , old *C
 		if err = client.call( ctx , http.MethodGet , path , nil , &reply ); err != nil { return }
 		for _ , row := range reply.Docs {
 			envelope , decode_err := b64.DecodeString( row.Body )
-			if decode_err != nil || row.Collection != collection { return count , ErrCorrupt }
+			if decode_err != nil || row.Collection != collection { return count , dropped , ErrCorrupt }
 			if EnvelopeKind( envelope ) != EnvelopeCollection || len( envelope ) < headerSize { continue }
 			named := string( envelope[ 1:headerSize ] )
 			if named == string( next.id[ : ] ) { continue }
-			if old == nil || named != string( old.id[ : ] ) {
-				return count , fmt.Errorf( "%w: %s/%s is sealed with keys %s does not have" , ErrWrongKey , collection , row.ID , collection )
+			var plaintext []byte
+			open_err := ErrWrongKey
+			if old != nil && named == string( old.id[ : ] ) { plaintext , open_err = old.Open( row.ID , envelope ) }
+			var request map[string]any
+			path := docPath( collection , row.ID )
+			if open_err != nil {
+				request = map[string]any{ "if_version": row.Version }
+				path += "/delete"
+			} else {
+				sealed , seal_err := next.Seal( row.ID , plaintext )
+				if seal_err != nil { return count , dropped , seal_err }
+				request = map[string]any{ "body": b64.EncodeToString( sealed ) , "if_version": row.Version }
 			}
-			plaintext , open_err := old.Open( row.ID , envelope )
-			if open_err != nil { return count , open_err }
-			sealed , seal_err := next.Seal( row.ID , plaintext )
-			if seal_err != nil { return count , seal_err }
-			request := map[string]any{ "body": b64.EncodeToString( sealed ) , "if_version": row.Version }
-			if err = client.call( ctx , http.MethodPost , docPath( collection , row.ID ) , request , nil ); err != nil {
+			if err = client.call( ctx , http.MethodPost , path , request , nil ); err != nil {
 				if errors.Is( err , ErrConflict ) || errors.Is( err , ErrNotFound ) {
 					// Changed or deleted meanwhile: the next pass looks again.
 					err = nil
@@ -222,10 +254,13 @@ func ( client *Client ) reseal( ctx context.Context , collection string , old *C
 				}
 				return
 			}
+			if open_err != nil {
+				dropped = append( dropped , collection + "/" + row.ID )
+				continue
+			}
 			count++
 		}
-		offset = -1
-		if reply.Next != nil { offset = *reply.Next }
+		if offset , err = nextOffset( offset , reply.Next ); err != nil { return }
 	}
 	return
 }

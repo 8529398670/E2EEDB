@@ -169,6 +169,7 @@ func ( handlers *Handlers ) docLimitsFor( c fiber.Ctx ) ( limits docstore.Limits
 		limits.ShareQuotaBytes = docs.ShareQuotaBytes
 		limits.ShareMaxCollections = docs.ShareMaxCollections
 		limits.NoAutoCreate = true
+		limits.Scope = &docstore.ScopeRoot{ Root: scope.Collection , Born: scope.Born }
 	}
 	return
 }
@@ -421,7 +422,7 @@ type updateCollectionRequest struct {
 // change is the request checked and turned into what the store takes.
 func ( fields collectionFields ) change( if_version *int64 ) ( change docstore.CollectionChange , refused *refusal ) {
 	if fields.Name != nil && docstore.ValidCollectionName( *fields.Name ) == false {
-		refused = refuse( fiber.StatusBadRequest , "name must be 1-" + strconv.Itoa( docstore.CollectionNameMax ) + " characters, with no control characters and no space at either end" )
+		refused = refuse( fiber.StatusBadRequest , "name must be 1-" + strconv.Itoa( docstore.CollectionNameMax ) + " characters, with no control or invisible characters and no space at either end" )
 		return
 	}
 	for _ , other := range []*string{ fields.Parent , fields.Before } {
@@ -514,8 +515,8 @@ func ( handlers *Handlers ) createCollection( c fiber.Ctx , in *createCollection
 //     tag="Documents", errors=(403, 404, 409),
 //     description="Give any of name, parent, before and lock. Its documents are not touched: they stay filed "
 //         "under the same id. Moving a folder into itself or one of its own subfolders is 400 "
-//         "collection_cycle; deeper than max_depth is 400 too_deep. A scoped key cannot rename or move the "
-//         "collection it is for (403).",
+//         "collection_cycle; deeper than max_depth is 400 too_deep. A scoped key cannot rename, move or give "
+//         "a lockbox to the collection it is for (403).",
 // )
 func ( handlers *Handlers ) updateCollection( c fiber.Ctx , in *updateCollectionRequest ) ( reply *collectionRow , err error ) {
 	change , refused := in.change( in.IfVersion )
@@ -526,11 +527,14 @@ func ( handlers *Handlers ) updateCollection( c fiber.Ctx , in *updateCollection
 		return
 	}
 	id := in.Collection
-	if scope := docScope( c ); scope != nil && id == scope.Collection && ( change.Name != nil || change.Parent != nil || change.Before != nil ) {
+	if scope := docScope( c ); scope != nil && id == scope.Collection && ( change.Name != nil || change.Parent != nil || change.Before != nil || change.Lock != nil ) {
 		// The folder a key is for stays where and what it is. A rename
 		// would check its name against the owner's other top-level
 		// folders (409 name_taken), telling the key's holder their names.
-		err = refuse( fiber.StatusForbidden , "a scoped key cannot rename or move the collection it is for" )
+		// Its lockbox is the owner's to give: one set from the key would
+		// stay (409 lock_exists), and bad_lock against 200 would confirm a
+		// guess at its parent.
+		err = refuse( fiber.StatusForbidden , "a scoped key cannot rename, move or give a lockbox to the collection it is for" )
 		return
 	}
 	if docScope( c ) != nil && change.Parent != nil {
@@ -584,7 +588,7 @@ func ( handlers *Handlers ) deleteCollection( c fiber.Ctx , in *deleteCollection
 		err = refuse( fiber.StatusForbidden , "a scoped key cannot delete the collection it is for" )
 		return
 	}
-	options := docstore.DeleteOptions{ IfVersion: in.IfVersion , MaxDocs: handlers.cfg().Docs.Limits().MaxDeleteDocs , Partial: in.Partial }
+	options := docstore.DeleteOptions{ IfVersion: in.IfVersion , MaxDocs: handlers.cfg().Docs.Limits().MaxDeleteDocs , Partial: in.Partial , Scope: handlers.docLimitsFor( c ).Scope }
 	deleted , delete_err := handlers.Docs.DeleteCollection( docOwner( c ) , id , options )
 	if delete_err != nil {
 		err = handlers.docRefusal( delete_err )
@@ -886,7 +890,7 @@ func ( handlers *Handlers ) deleteDoc( c fiber.Ctx , in *deleteDocRequest ) ( re
 		err = refused
 		return
 	}
-	doc , delete_err := handlers.Docs.Delete( docOwner( c ) , in.Collection , in.DocID , in.IfVersion )
+	doc , delete_err := handlers.Docs.Delete( docOwner( c ) , in.Collection , in.DocID , in.IfVersion , handlers.docLimitsFor( c ).Scope )
 	if delete_err != nil {
 		err = handlers.docRefusal( delete_err )
 		return

@@ -51,16 +51,32 @@ const LockMaxBytes = 2048
 const CollectionNameMax = 128
 
 // ValidCollectionName is whether name may name a folder: 1-128 characters,
-// no control characters, no space at either end.
+// no space at either end, and nothing that does not show: no control
+// characters, and no format characters (zero-width ones, the marks that turn
+// text right to left), which would let a sharee make a folder that looks
+// like one of the owner's (X beside X+U+200B, or "invoices"+U+202E+"fdp.exe").
+// The one format character kept is the zero-width joiner between two
+// symbols, which emoji such as a family or a rainbow flag are made of.
 func ValidCollectionName( name string ) bool {
 	if utf8.ValidString( name ) == false || name != strings.TrimSpace( name ) { return false }
-	count := utf8.RuneCountInString( name )
-	if count < 1 || count > CollectionNameMax { return false }
-	for _ , r := range name {
+	runes := []rune( name )
+	if len( runes ) < 1 || len( runes ) > CollectionNameMax { return false }
+	for at , r := range runes {
 		if unicode.IsControl( r ) { return false }
+		if unicode.Is( unicode.Cf , r ) && ( r != zeroWidthJoiner || at == 0 || at == len( runes ) - 1 ||
+			emojiPart( runes[ at - 1 ] ) == false || unicode.IsSymbol( runes[ at + 1 ] ) == false ) {
+			return false
+		}
 	}
 	return true
 }
+
+// zeroWidthJoiner joins emoji into one (U+200D).
+const zeroWidthJoiner = '\u200d'
+
+// emojiPart is whether r may come before a zero-width joiner in an emoji: a
+// symbol, or the variation selector that asks for the emoji form (U+FE0F).
+func emojiPart( r rune ) bool { return unicode.IsSymbol( r ) || r == '\ufe0f' }
 
 // Collection is one folder, with its own live documents summed (not its
 // subfolders'). UpdatedAt is the later of its own last change and its
@@ -140,6 +156,9 @@ type DeleteOptions struct {
 	// documents is tombstoned and the folders stay.
 	MaxDocs int
 	Partial bool
+	// Scope is a scoped key's folder, checked inside the transaction (see
+	// Limits.Scope).
+	Scope *ScopeRoot
 }
 
 // DeletedTree is what DeleteCollection removed.
@@ -234,6 +253,12 @@ func ( store *Store ) CreateCollection( user_id uint64 , id string , change Coll
 			}
 			if tx_err != nil { return }
 		}
+		if limits.Scope != nil {
+			// A scoped key makes folders only inside its own.
+			parent := ""
+			if change.Parent != nil { parent = *change.Parent }
+			if tx_err = inScopeTx( tx , user_id , limits.Scope , parent ); tx_err != nil { return }
+		}
 		if _ , found , read_err := readCollection( tx , user_id , id ); read_err != nil || found {
 			tx_err = read_err
 			if found { tx_err = &ConflictError{ Current: 1 , Live: true } }
@@ -276,6 +301,8 @@ func ( store *Store ) CreateCollection( user_id uint64 , id string , change Coll
 		_ , tx_err = tx.Exec( `INSERT INTO collections ( user_id , id , name , parent , position , version , seq , updated_at , lock , by_key , born )
 			VALUES ( ? , ? , ? , ? , 0 , 1 , ? , ? , ? , ? , ? )` , user_id , id , name , parent , seq , millis( now ) , lock , change.ByKey , newBorn() )
 		if tx_err != nil { return }
+		// Made again: the grave that allowed it (undo) is done with.
+		if _ , tx_err = tx.Exec( `DELETE FROM graves WHERE user_id = ? AND id = ?` , user_id , id ); tx_err != nil { return }
 		if tx_err = place( tx , user_id , id , parent , before ); tx_err != nil { return }
 		entry , _ , tx_err = readCollection( tx , user_id , id )
 		return
@@ -288,6 +315,9 @@ func ( store *Store ) CreateCollection( user_id uint64 , id string , change Coll
 func ( store *Store ) UpdateCollection( user_id uint64 , id string , change CollectionChange , limits Limits ) ( entry Collection , err error ) {
 	now := time.Now()
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
+		in_scope := []string{ id }
+		if change.Parent != nil { in_scope = append( in_scope , *change.Parent ) }
+		if tx_err = inScopeTx( tx , user_id , limits.Scope , in_scope... ); tx_err != nil { return }
 		current , found , tx_err := readCollection( tx , user_id , id )
 		if tx_err != nil { return }
 		if found == false {
@@ -365,6 +395,7 @@ func ( store *Store ) UpdateCollection( user_id uint64 , id string , change Coll
 func ( store *Store ) DeleteCollection( user_id uint64 , id string , options DeleteOptions ) ( deleted DeletedTree , err error ) {
 	now := time.Now()
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
+		if tx_err = inScopeTx( tx , user_id , options.Scope , id ); tx_err != nil { return }
 		current , found , tx_err := readCollection( tx , user_id , id )
 		if tx_err != nil { return }
 		if found == false {
@@ -494,6 +525,7 @@ func ( store *Store ) MoveDoc( user_id uint64 , from string , id string , to str
 	}
 	now := time.Now()
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
+		if tx_err = inScopeTx( tx , user_id , limits.Scope , from , to ); tx_err != nil { return }
 		if _ , found , read_err := readCollection( tx , user_id , to ); read_err != nil || found == false {
 			tx_err = read_err
 			if found == false { tx_err = ErrNoCollection }
@@ -556,6 +588,7 @@ func ensureCollection( tx *sql.Tx , user_id uint64 , id string , limits Limits ,
 	if err != nil { return }
 	_ , err = tx.Exec( `INSERT INTO collections ( user_id , id , name , parent , position , version , seq , updated_at , born )
 		VALUES ( ? , ? , ? , '' , ? , 1 , 0 , ? , ? )` , user_id , id , name , position , millis( now ) , newBorn() )
+	if err == nil { _ , err = tx.Exec( `DELETE FROM graves WHERE user_id = ? AND id = ?` , user_id , id ) }
 	created = err == nil
 	return
 }
@@ -592,6 +625,24 @@ func checkCount( tx *sql.Tx , user_id uint64 , limits Limits ) ( err error ) {
 	if limits.Share != "" && limits.ShareMaxCollections > 0 {
 		err = tx.QueryRow( shareSub + `SELECT COUNT(*) FROM sub` , user_id , limits.Share , user_id ).Scan( &count )
 		if err == nil && count >= limits.ShareMaxCollections { err = ErrShareTooMany }
+		if err != nil { return }
+	}
+	// A folder will leave a grave when it is deleted, which the quota
+	// charges like a tombstone: past the quota, no new folders, or making
+	// and deleting empty ones would grow the account for ever.
+	if limits.QuotaBytes > 0 {
+		var usage Usage
+		if usage , err = readUsage( tx , user_id ); err != nil { return }
+		if usage.Charged() + TombstoneBytes > limits.QuotaBytes {
+			err = ErrQuota
+			if limits.Share != "" { err = ErrShareQuota }
+			return
+		}
+	}
+	if limits.Share != "" && limits.ShareQuotaBytes > 0 {
+		var used int64
+		if used , err = shareUsed( tx , user_id , limits ); err != nil { return }
+		if used + TombstoneBytes > limits.ShareQuotaBytes { err = ErrShareQuota }
 	}
 	return
 }

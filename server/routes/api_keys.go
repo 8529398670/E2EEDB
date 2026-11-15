@@ -329,6 +329,13 @@ func ( handlers *Handlers ) checkKeyScope( user_id uint64 , request keyScope , r
 		refused = handlers.docRefusal( err )
 		return
 	}
+	// The token carries the collection's keys, so it has some by now (the
+	// share flow gives them first). Without, the key's holder could set the
+	// lockbox itself, and the owner could not set the real one.
+	if entry.Lock == "" {
+		refused = refuse( fiber.StatusConflict , "lock_required" )
+		return
+	}
 	// Mid-rotation, the keys a token would carry are about to go.
 	rotating , err := handlers.Docs.InRotation( user_id , request.Collection )
 	if err == nil && rotating { err = docstore.ErrRotating }

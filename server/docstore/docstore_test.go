@@ -53,13 +53,13 @@ func TestSetGetVersions( t *testing.T ) {
 func TestDeleteTombstoneAndRecreate( t *testing.T ) {
 	store , _ := open( t )
 	store.Set( 1 , "notes" , "a" , envelope( 1 , 60 ) , nil , limits )
-	if _ , err := store.Delete( 1 , "notes" , "a" , version( 9 ) ); errors.Is( err , ErrConflict ) == false {
+	if _ , err := store.Delete( 1 , "notes" , "a" , version( 9 ) , nil ); errors.Is( err , ErrConflict ) == false {
 		t.Fatalf( "delete at the wrong version should conflict, got %v" , err )
 	}
-	gone , err := store.Delete( 1 , "notes" , "a" , version( 1 ) )
+	gone , err := store.Delete( 1 , "notes" , "a" , version( 1 ) , nil )
 	if err != nil || gone.Version != 2 || gone.Deleted == false { t.Fatalf( "delete: %+v %v" , gone , err ) }
 	if _ , err = store.Get( 1 , "notes" , "a" ); errors.Is( err , ErrNotFound ) == false { t.Fatalf( "get after delete: %v" , err ) }
-	if _ , err = store.Delete( 1 , "notes" , "a" , nil ); errors.Is( err , ErrNotFound ) == false { t.Fatalf( "second delete: %v" , err ) }
+	if _ , err = store.Delete( 1 , "notes" , "a" , nil , nil ); errors.Is( err , ErrNotFound ) == false { t.Fatalf( "second delete: %v" , err ) }
 	// Undoing a delete is writing it again with if_version 0.
 	back , err := store.Set( 1 , "notes" , "a" , envelope( 1 , 60 ) , version( 0 ) , limits )
 	if err != nil || back.Version != 3 { t.Fatalf( "recreate: %+v %v" , back , err ) }
@@ -72,7 +72,7 @@ func TestVersionsSurviveAPurge( t *testing.T ) {
 	for n := 0 ; n < 5 ; n++ {
 		if _ , err := store.Set( 1 , "notes" , "a" , envelope( 1 , 60 ) , nil , limits ); err != nil { t.Fatal( err ) }
 	}
-	gone , err := store.Delete( 1 , "notes" , "a" , nil )
+	gone , err := store.Delete( 1 , "notes" , "a" , nil , nil )
 	if err != nil { t.Fatal( err ) }
 	// Purge every tombstone.
 	if _ , err = store.Sweep( time.Now().Add( 48 * time.Hour ) , 1 , 0 , func( uint64 ) bool { return true } ); err != nil { t.Fatal( err ) }
@@ -90,7 +90,7 @@ func TestUsersAreApart( t *testing.T ) {
 	store , _ := open( t )
 	store.Set( 1 , "notes" , "a" , envelope( 1 , 60 ) , nil , limits )
 	if _ , err := store.Get( 2 , "notes" , "a" ); errors.Is( err , ErrNotFound ) == false { t.Fatalf( "user 2 read user 1's doc: %v" , err ) }
-	if _ , err := store.Delete( 2 , "notes" , "a" , nil ); errors.Is( err , ErrNotFound ) == false { t.Fatalf( "user 2 deleted user 1's doc: %v" , err ) }
+	if _ , err := store.Delete( 2 , "notes" , "a" , nil , nil ); errors.Is( err , ErrNotFound ) == false { t.Fatalf( "user 2 deleted user 1's doc: %v" , err ) }
 	collections , total , _ := store.Collections( 2 , 0 , 10 )
 	if total != 0 || len( collections ) != 0 { t.Fatalf( "user 2 sees collections: %+v" , collections ) }
 	changes , _ , _ := store.Changes( 2 , 0 , 10 )
@@ -103,7 +103,7 @@ func TestListCollectionsAndChanges( t *testing.T ) {
 		store.Set( 1 , "notes" , id , envelope( 1 , 60 ) , nil , limits )
 	}
 	store.Set( 1 , "tasks" , "x" , envelope( 1 , 100 ) , nil , limits )
-	store.Delete( 1 , "notes" , "b" , nil )
+	store.Delete( 1 , "notes" , "b" , nil , nil )
 
 	docs , total , err := store.List( 1 , "notes" , 0 , 1 , false , 0 )
 	if err != nil || total != 2 || len( docs ) != 1 || docs[ 0 ].ID != "a" || docs[ 0 ].Body != nil {
@@ -155,7 +155,7 @@ func TestSweep( t *testing.T ) {
 	store , _ := open( t )
 	store.Set( 1 , "n" , "a" , envelope( 1 , 60 ) , nil , limits )
 	store.Set( 1 , "n" , "b" , envelope( 1 , 60 ) , nil , limits )
-	gone , _ := store.Delete( 1 , "n" , "a" , nil )
+	gone , _ := store.Delete( 1 , "n" , "a" , nil , nil )
 	store.Set( 7 , "n" , "x" , envelope( 1 , 60 ) , nil , limits )
 	store.SetKeyring( 7 , "k" , nil )
 
@@ -230,7 +230,7 @@ func TestChangeNumbersPerAccount( t *testing.T ) {
 	if err != nil || first.Seq != 1 || second.Seq != 2 { t.Fatalf( "account 1 numbers: %d %d %v" , first.Seq , second.Seq , err ) }
 	if mine , _ := store.Set( 2 , "n" , "y" , envelope( 1 , 60 ) , nil , limits ); mine.Seq != 6 { t.Fatalf( "account 2 number %d, want 6" , mine.Seq ) }
 
-	store.Delete( 2 , "n" , "y" , nil )
+	store.Delete( 2 , "n" , "y" , nil , nil )
 	if _ , err = store.Sweep( time.Now().Add( 31 * 24 * time.Hour ) , 30 , 0 , func( uint64 ) bool { return true } ); err != nil { t.Fatal( err ) }
 	if _ , _ , err = store.Changes( 2 , 1 , 10 ); errors.Is( err , ErrSyncExpired ) == false { t.Fatalf( "account 2 after its purge: %v" , err ) }
 	if _ , _ , err = store.Changes( 1 , 1 , 10 ); err != nil { t.Fatalf( "account 1 expired by account 2's purge: %v" , err ) }
@@ -251,8 +251,13 @@ func TestShareLimits( t *testing.T ) {
 	if _ , err := store.Set( 1 , "shared" , "b" , envelope( 1 , 60 ) , nil , share ); errors.Is( err , ErrShareQuota ) == false { t.Fatalf( "past the share's bytes: %v" , err ) }
 	// Rewriting a document counts it once.
 	if _ , err := store.Set( 1 , "inner" , "a" , envelope( 2 , 140 ) , nil , share ); err != nil { t.Fatalf( "rewrite within the share: %v" , err ) }
-	if _ , err := store.CreateCollection( 1 , "third" , CollectionChange{ Parent: &inner } , share ); err != nil { t.Fatalf( "third folder: %v" , err ) }
-	if _ , err := store.CreateCollection( 1 , "fourth" , CollectionChange{ Parent: &inner } , share ); errors.Is( err , ErrShareTooMany ) == false { t.Fatalf( "past the share's folders: %v" , err ) }
+	// A folder leaves a grave when deleted, charged like a tombstone, so a
+	// share with less room than that makes no more.
+	if _ , err := store.CreateCollection( 1 , "third" , CollectionChange{ Parent: &inner } , share ); errors.Is( err , ErrShareQuota ) == false { t.Fatalf( "folder in a full share: %v" , err ) }
+	folders := share
+	folders.ShareQuotaBytes = 0
+	if _ , err := store.CreateCollection( 1 , "third" , CollectionChange{ Parent: &inner } , folders ); err != nil { t.Fatalf( "third folder: %v" , err ) }
+	if _ , err := store.CreateCollection( 1 , "fourth" , CollectionChange{ Parent: &inner } , folders ); errors.Is( err , ErrShareTooMany ) == false { t.Fatalf( "past the share's folders: %v" , err ) }
 	// The owner is held only to the account's limits.
 	if _ , err := store.CreateCollection( 1 , "fourth" , CollectionChange{ Parent: &inner } , plenty ); err != nil { t.Fatalf( "owner folder: %v" , err ) }
 	// The account full: a scoped write hears the share's error.

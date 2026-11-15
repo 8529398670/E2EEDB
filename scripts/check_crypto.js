@@ -94,6 +94,14 @@ page.sodium.ready.then( () => {
     try { C.openLock( JSON.stringify( stripped ) , vectors.child , holder ); } catch ( error ) { unsigned = error.code; }
     check( "unsigned lockbox refused" , unsigned === "corrupt" );
   }
+  // A name the format does not have, such as another case of one it has
+  // (Go would read "KEY_ID" as key_id), opens for nobody.
+  const cased = JSON.parse( vectors.child_lockbox );
+  cased.KEY_ID = cased.key_id;
+  let other_case = "";
+  try { C.openLock( JSON.stringify( cased ) , vectors.child , opened ); } catch ( error ) { other_case = error.code; }
+  check( "lockbox with another name refused" , other_case === "corrupt" );
+  check( "lockbox as is opens" , !!C.openLock( vectors.child_lockbox , vectors.child , opened ) );
   // A reader planting a child lockbox: it can wrap the read half, but its
   // signature is not the parent's.
   const planted = fixed( "planted" , 0x10 , 1 );

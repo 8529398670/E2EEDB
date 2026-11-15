@@ -48,6 +48,7 @@ func ( store *Store ) Sweep( now time.Time , tombstone_days int , max_tombstones
 		var purged int64
 		if purged , err = store.capTombstones( max_tombstones ); err != nil { return }
 		swept.Tombstones += purged
+		if err = store.capGraves( max_tombstones ); err != nil { return }
 	}
 	// A folder's totals go once nothing of it is left.
 	if _ , err = store.db.Exec( `DELETE FROM usage WHERE collection != '' AND docs = 0 AND tombs = 0` ); err != nil { return }
@@ -102,6 +103,18 @@ func ( store *Store ) capTombstones( limit int ) ( purged int64 , err error ) {
 		} )
 		if err != nil { return }
 	}
+	return
+}
+
+// capGraves drops the oldest graves of each account holding more than
+// limit: each deleted folder leaves one, and only age would clear them
+// otherwise. A folder whose grave goes can no longer be made again by an
+// access key (undo), as after tombstone_days.
+func ( store *Store ) capGraves( limit int ) ( err error ) {
+	_ , err = store.db.Exec( `DELETE FROM graves WHERE ( user_id , id ) IN (
+			SELECT user_id , id FROM ( SELECT user_id , id , ROW_NUMBER() OVER ( PARTITION BY user_id ORDER BY deleted_at DESC , id ) AS rank
+				FROM graves WHERE user_id IN ( SELECT user_id FROM usage WHERE collection = '' AND graves > ? ) )
+			WHERE rank > ? )` , limit , limit )
 	return
 }
 

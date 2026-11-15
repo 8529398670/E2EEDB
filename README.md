@@ -44,7 +44,9 @@ Collections nest, like folders. Each one has an **id** and a **name**:
 - The **name**, its **parent** and its place among its siblings can change at any
   time. Renaming, moving or reordering a collection touches none of its
   documents, so it needs no key, and a service that writes by id keeps working.
-  Names are unique among siblings, ignoring case.
+  Names are unique among siblings, ignoring case, and may not hold
+  characters that do not show (zero-width ones, or the marks that turn
+  text right to left), so nobody can make a folder that looks like another.
 
 Writing a document into an id that has no collection yet makes one at the top
 level, named after the id, so code that never thinks about folders keeps
@@ -112,6 +114,13 @@ Known limits, by design:
   such as Cloudflare, the proxy can change the page too, so it is trusted
   the same way (see "Deploying behind Cloudflare"). Only the Go client, built
   from source you hold, is safe from that.
+- **An admin can sign in as you.** Admins hand out sign-in links, so an
+  admin can reset your two-factor and make a link for your account (the
+  owner can do it to an admin). That session sees what you see without a
+  key: the folder tree and names, and the keyring, so it can try
+  passphrases offline. It cannot open a document without the master key or
+  passphrase. Give admin rights only to people you would trust with that,
+  and use a long passphrase or none.
 - **An opened access token stays in the tab.** Opening Documents with an access
   token keeps it in that tab's `sessionStorage`, so a reload stays open, until
   the tab is closed. Close the tab on a shared computer.
@@ -162,14 +171,17 @@ and write, name it, and set when it expires. It shows an **access key**
 
 Whoever gets it pastes it under **Have an access key?** on the signed-out page
 (no account needed), or, in Go, uses `client.NewScoped( baseURL , token )`. A
-scoped key cannot move, delete or leave its own collection, or make one at the
-top level. It can make, move and delete collections inside its own. The
+scoped key cannot move, delete or leave its own collection, give it a
+lockbox, or make one at the top level. No access key is made for a
+collection with no lockbox yet (`409 lock_required`): sharing gives it keys
+first. It can make, move and delete collections inside its own. The
 server picks the id of each one it makes, so it cannot take an id your own
 code writes to by name, and the client sends the new collection's lockbox in
 a second call, once it knows the id. The one id it may send itself is that of
 a collection deleted from inside its own, to undo the delete
 (`400 id_not_reusable` otherwise); the server remembers those for as long as
-it keeps tombstones. A collection made that way has no
+it keeps tombstones (or until the account holds more than
+`docs.max_tombstones` of them, the oldest going first). A collection made that way has no
 owner tag in its lockbox (see "Lockboxes"), and the Go client will not write
 your documents into one, or into anything under one, unless you pass
 `client.AllowShared()` (`ErrSharedCollection` otherwise). The Documents
@@ -257,8 +269,10 @@ A deleted document shows up once with `deleted: true` and is purged after
 `docs.tombstone_days`, or sooner once the account holds more than
 `docs.max_tombstones` of them (default 100,000; the oldest go first). A client
 that last synced before a purged one gets `410 sync_expired` and starts again
-from 0. Until it is purged, a tombstone counts 128 bytes against the quota, so
-writing and deleting over and over cannot grow an account without limit.
+from 0. Until it is purged, a tombstone counts 128 bytes against the quota, and
+so does each deleted folder the server remembers for undo, so writing and
+deleting over and over cannot grow an account without limit. For the same
+reason a new folder needs 128 bytes of room left.
 Change numbers are counted per account.
 
 ### Conditional writes
@@ -459,10 +473,26 @@ A rotation stopped half way stays as it is: documents open with either
 keys, and starting it again on `R` finishes it (the new keys already staged
 are kept). Private envelopes are not touched: only the master key opens them.
 
+**Nothing planted stops it.** Whoever holds a read/write access key to the
+subtree, and expects to be cut off, could plant something in it beforehand.
+So a collection in the subtree whose `lock` does not open (a bad signature,
+or a lockbox copied from another folder) gets new keys as if it had none,
+and a collection envelope that no key opens (its signature or ciphertext
+does not check out, or it names neither the old keys nor the new) is
+deleted, if it has not changed since it was read: no reader accepts one,
+and the commit waits for every envelope to name the new keys. Go lists them
+in `Rotation.Broken` and `Rotation.Dropped`; the Documents screen says how
+many. A lockbox from before a rotation the client has seen (`ErrRolledBack`)
+still stops it.
+
 The server checks the shape of every lockbox it is given, as `lock` or
-`next_lock`: one JSON object with every field above at its right size, and
-`parent` naming the collection's real parent (`400 bad_lock` otherwise). It
-still cannot open one. Sending a `next_lock` again for a collection already
+`next_lock`: one JSON object with every field above at its right size, each
+name once and spelt exactly so (Go reads `KEY_ID` as `key_id`, a browser does
+not), `parent` naming the collection's real parent, and an `epoch` at most
+2^32 seconds past the server's clock, so no folder can be given the last
+epoch there is and never be rotated (`400 bad_lock` otherwise). Both clients
+refuse to open a lockbox with any other name. The server still cannot open
+one. Sending a `next_lock` again for a collection already
 staged replaces it.
 
 **Calling it off.** `POST /api/collections/{R}/rotate/abort` (or
@@ -533,11 +563,13 @@ Data lives in `~/.config/e2eedb/`: `app.db` (bbolt: accounts, sessions,
 keys) and `docs.db` (SQLite: documents). `manage backup` and the scheduled
 backup include both. `docs:` in `config/config.yaml` sets the largest document
 (`max_doc_kb`), the per-account quota (`quota_mb`, with 128 bytes for each
-tombstone), how long deletes stay visible to syncing clients
+tombstone and each deleted folder), how long deletes stay visible to syncing clients
 (`tombstone_days`, `max_tombstones`), how many documents one folder delete
 takes (`max_delete_docs`), and how much writes through one
 access key may grow its shared folder (`share_quota_mb`,
-`share_max_collections`; 0 leaves only the account's limits). An access key
+`share_max_collections`; 0 leaves only the account's limits). The share's
+bytes count its live documents and tombstones, and what folders deleted from
+it still hold until purged. An access key
 that reaches either cap, or the account's own, gets `413
 share_quota_exceeded` or `413 share_too_many_collections`. The hourly `docs` job purges old
 tombstones and the documents of deleted accounts.

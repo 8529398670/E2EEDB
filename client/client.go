@@ -384,8 +384,7 @@ func ( client *Client ) Each( ctx context.Context , collection string , fn func(
 			if err = client.open( ctx , collection , row.ID , row.Meta , row.Body , &data ); err != nil { return }
 			if err = fn( row.Meta , data ); err != nil { return }
 		}
-		offset = -1
-		if reply.Next != nil { offset = *reply.Next }
+		if offset , err = nextOffset( offset , reply.Next ); err != nil { return }
 	}
 	return
 }
@@ -401,8 +400,7 @@ func ( client *Client ) Collections( ctx context.Context ) ( collections []Colle
 		}
 		if err = client.call( ctx , http.MethodGet , "/api/collections?" + pageQuery( offset , 1000 ) , nil , &reply ); err != nil { return }
 		collections = append( collections , reply.Collections... )
-		offset = -1
-		if reply.Next != nil { offset = *reply.Next }
+		if offset , err = nextOffset( offset , reply.Next ); err != nil { return }
 	}
 	return
 }
@@ -552,6 +550,15 @@ func ( client *Client ) Changes( ctx context.Context , since int64 , limit int )
 	path := "/api/changes?since=" + strconv.FormatInt( since , 10 ) + "&limit=" + strconv.Itoa( limit )
 	err = client.call( ctx , http.MethodGet , path , nil , &changes )
 	return
+}
+
+// nextOffset is the offset of the page after the one at offset, from the
+// server's next: -1 after the last. A next that does not move forward is
+// ErrCorrupt, so a server cannot keep a client paging for ever.
+func nextOffset( offset int , next *int ) ( int , error ) {
+	if next == nil { return -1 , nil }
+	if *next <= offset { return -1 , fmt.Errorf( "%w: the server's next page is at %d, after %d" , ErrCorrupt , *next , offset ) }
+	return *next , nil
 }
 
 func pageQuery( offset int , limit int ) string {

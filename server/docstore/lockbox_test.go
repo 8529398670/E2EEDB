@@ -5,7 +5,9 @@ import (
 	base64 "encoding/base64"
 	json "encoding/json"
 	errors "errors"
+	strings "strings"
 	testing "testing"
+	time "time"
 )
 
 // shapedLock is lockbox text the server takes: every field the right size,
@@ -52,9 +54,16 @@ func TestCheckLock( t *testing.T ) {
 		"extra field":   with( "extra" , "x" ),
 		"bad own":       with( "own" , short ),
 		"not base64":    with( "read" , "!!" ),
+		// A sharee's folder at the last epoch could never be rotated.
+		"epoch far ahead": with( "epoch" , float64( time.Now().Unix() + 1 << 33 ) ),
+		// Go reads a name in any case, a browser only as written (H4).
+		"repeated name":  strings.Replace( good , `"key_id":` , `"key_id":"` + short + `","key_id":` , 1 ),
+		"other case":     strings.Replace( good , `"key_id":` , `"KEY_ID":` , 1 ),
+		"both cases":     strings.Replace( good , `"key_id":` , `"key_id":"` + short + `","Key_Id":` , 1 ),
 	} {
 		if err := checkLock( lock , "p" ); errors.Is( err , ErrBadLock ) == false { t.Errorf( "%s: %v" , label , err ) }
 	}
+	if err := checkLock( with( "epoch" , float64( time.Now().Unix() + 1000 ) ) , "p" ); err != nil { t.Errorf( "epoch a little ahead: %v" , err ) }
 	if err := checkLock( with( "own" , base64.StdEncoding.EncodeToString( make( []byte , 32 ) ) ) , "p" ); err != nil { t.Errorf( "with own: %v" , err ) }
 }
 
