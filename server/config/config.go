@@ -182,6 +182,8 @@ type DocsSection struct {
 	MaxDepth       int `yaml:"max_depth"`
 	ShareQuotaMB        int `yaml:"share_quota_mb"`
 	ShareMaxCollections int `yaml:"share_max_collections"`
+	MaxDeleteDocs       int `yaml:"max_delete_docs"`
+	MaxTombstones       int `yaml:"max_tombstones"`
 }
 
 
@@ -433,12 +435,20 @@ type DocsConfig struct {
 	// access key can grow its shared folder to (0: no cap of its own).
 	ShareQuotaBytes     int64
 	ShareMaxCollections int
+	// MaxDeleteDocs is the most live documents one folder delete tombstones;
+	// a client deletes a bigger folder in pages.
+	MaxDeleteDocs int
+	// MaxTombstones is how many tombstones an account keeps before the
+	// sweep purges its oldest early.
+	MaxTombstones int
 }
 
 // Defaults for a DocsConfig left at zero.
 const (
 	DefaultMaxDocBytes   = 512 * 1024
 	DefaultTombstoneDays = 30
+	DefaultMaxDeleteDocs = 50000
+	DefaultMaxTombstones = 100000
 )
 
 // Limits is the config with the defaults filled in.
@@ -446,6 +456,8 @@ func ( docs DocsConfig ) Limits() ( result DocsConfig ) {
 	result = docs
 	if result.MaxDocBytes <= 0 { result.MaxDocBytes = DefaultMaxDocBytes }
 	if result.TombstoneDays <= 0 { result.TombstoneDays = DefaultTombstoneDays }
+	if result.MaxDeleteDocs <= 0 { result.MaxDeleteDocs = DefaultMaxDeleteDocs }
+	if result.MaxTombstones <= 0 { result.MaxTombstones = DefaultMaxTombstones }
 	return
 }
 
@@ -712,6 +724,8 @@ func ( file *File ) Validate() ( err error ) {
 	check( docs.MaxDepth >= 1 && docs.MaxDepth <= 64 , "docs.max_depth must be 1-64, got %d" , docs.MaxDepth )
 	check( docs.ShareQuotaMB >= 0 , "docs.share_quota_mb must be 0 (no cap of its own) or more" )
 	check( docs.ShareMaxCollections >= 0 && docs.ShareMaxCollections <= 100000 , "docs.share_max_collections must be 0-100000, got %d" , docs.ShareMaxCollections )
+	check( docs.MaxDeleteDocs >= 1 && docs.MaxDeleteDocs <= 1000000 , "docs.max_delete_docs must be 1-1000000, got %d" , docs.MaxDeleteDocs )
+	check( docs.MaxTombstones >= 1000 && docs.MaxTombstones <= 10000000 , "docs.max_tombstones must be 1000-10000000, got %d" , docs.MaxTombstones )
 
 	docker := file.Docker
 	check( imagePattern.MatchString( docker.Image ) , "docker.image %q is not a valid lowercase image name" , docker.Image )
@@ -1233,6 +1247,8 @@ func docsConfig( section DocsSection ) ( docs DocsConfig ) {
 		MaxDepth:       section.MaxDepth,
 		ShareQuotaBytes:     int64( section.ShareQuotaMB ) * 1024 * 1024,
 		ShareMaxCollections: section.ShareMaxCollections,
+		MaxDeleteDocs:       section.MaxDeleteDocs,
+		MaxTombstones:       section.MaxTombstones,
 	}
 	return
 }

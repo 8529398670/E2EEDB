@@ -23,7 +23,7 @@ func Docs( registry *Registry , docs *docstore.Store , store *db.Store , setting
 			// failed for another reason keeps the documents for next time.
 			return errors.Is( get_err , db.ErrNotFound ) == false
 		}
-		swept , err := docs.Sweep( time.Now() , limits.TombstoneDays , exists )
+		swept , err := docs.Sweep( time.Now() , limits.TombstoneDays , limits.MaxTombstones , exists )
 		note = fmt.Sprintf( "purged %d tombstones, cleared %d deleted accounts" , swept.Tombstones , swept.Accounts )
 		return
 	} )

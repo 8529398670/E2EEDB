@@ -127,7 +127,7 @@ Every collection (folder) in your account, each parent's children together in th
 | `quota_bytes` | integer | yes |  | 0: no quota. For an access key, what its shared folder may hold. |
 | `total` | integer | yes |  |  |
 | `tree_seq` | integer or null | no |  | Change number of the last change to your folders; 0 if none. Left out for an access key: it would show changes outside its folder. |
-| `used_bytes` | integer | yes |  | All your live documents. |
+| `used_bytes` | integer | yes |  | What counts against quota_bytes: your live documents, and 128 bytes for each delete not yet purged. |
 
 ### POST /api/collections
 
@@ -191,7 +191,7 @@ Give any of name, parent, before and lock. Its documents are not touched: they s
 
 Delete a collection and everything in it
 
-Removes the folder, every folder under it, and every document in them. Each document leaves a tombstone GET /api/changes reports. To undo: make the folders again with the same ids, then write the documents back with if_version 0.
+Removes the folder, every folder under it, and every document in them. Each document leaves a tombstone GET /api/changes reports. More than docs.max_delete_docs live documents is 413 delete_too_large (with docs and max_docs): send partial to delete them a page per call. To undo: make the folders again with the same ids, then write the documents back with if_version 0.
 
 |  |  |
 |---|---|
@@ -210,13 +210,15 @@ Removes the folder, every folder under it, and every document in them. Each docu
 |---|---|---|---|---|
 | `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
 | `if_version` | integer or null | no | at least 1 | Delete only if the collection is at this version. |
+| `partial` | boolean | no |  | When the folders hold more than docs.max_delete_docs live documents, delete that many of them and leave the folders (done false) instead of 413 delete_too_large. Call again until done. |
 
 **Reply 200**: Success
 
 | Field | Type | Required | Limits | Description |
 |---|---|---|---|---|
-| `collections` | array of string | yes |  | Every folder removed, the one asked for first, parents before children. |
-| `docs` | array of [`DocChange`](#docchange) | yes |  | The tombstones left. |
+| `collections` | array of string | yes |  | Every folder removed, the one asked for first, parents before children; empty until done. |
+| `docs` | integer | yes |  | How many documents this call deleted. GET /api/changes lists their tombstones. |
+| `done` | boolean | yes |  | Everything is gone. False after a partial call that only deleted a page of the documents. |
 
 ### GET /api/collections/{collection}/docs
 

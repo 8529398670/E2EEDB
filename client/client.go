@@ -469,14 +469,28 @@ func ( client *Client ) MoveCollection( ctx context.Context , id string , parent
 }
 
 // DeleteCollection deletes a folder, every folder under it and every
-// document in them, and answers the ids of the folders removed.
+// document in them, and answers the ids of the folders removed. A folder
+// with more documents than the server deletes in one call
+// (docs.max_delete_docs) goes in several, its documents a page at a time
+// and the folders with the last; if it fails part way, what was deleted
+// stays deleted and calling it again finishes the job.
 func ( client *Client ) DeleteCollection( ctx context.Context , id string ) ( removed []string , err error ) {
-	var reply struct {
-		Collections []string `json:"collections"`
+	for {
+		var reply struct {
+			Done        bool     `json:"done"`
+			Collections []string `json:"collections"`
+			Docs        int      `json:"docs"`
+		}
+		if err = client.call( ctx , http.MethodPost , collectionPath( id ) + "/delete" , map[string]any{ "partial": true } , &reply ); err != nil { return }
+		if reply.Done {
+			removed = reply.Collections
+			return
+		}
+		if reply.Docs == 0 {
+			err = &APIError{ Status: http.StatusConflict , Message: "delete made no progress" }
+			return
+		}
 	}
-	err = client.call( ctx , http.MethodPost , collectionPath( id ) + "/delete" , map[string]any{} , &reply )
-	removed = reply.Collections
-	return
 }
 
 // MoveDoc moves collection/id into the folder to, keeping its id. The

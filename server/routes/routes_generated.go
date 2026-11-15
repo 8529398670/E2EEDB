@@ -294,7 +294,7 @@ func ( handlers *Handlers ) mountDeclared( app *fiber.App ) {
 	} , handlers.updateCollection , handlers.Guard.RequireLogin )
 	apidoc.Mount( app , "POST" , "/api/collections/{collection}/delete" , apidoc.Op{
 		Summary: "Delete a collection and everything in it",
-		Description: "Removes the folder, every folder under it, and every document in them. Each document leaves a tombstone GET /api/changes reports. To undo: make the folders again with the same ids, then write the documents back with if_version 0.",
+		Description: "Removes the folder, every folder under it, and every document in them. Each document leaves a tombstone GET /api/changes reports. More than docs.max_delete_docs live documents is 413 delete_too_large (with docs and max_docs): send partial to delete them a page per call. To undo: make the folders again with the same ids, then write the documents back with if_version 0.",
 		Tag: "Documents",
 		Errors: []int{ 400 , 401 , 403 , 404 , 409 },
 	} , handlers.deleteCollection , handlers.Guard.RequireLogin )

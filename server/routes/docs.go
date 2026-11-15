@@ -177,6 +177,7 @@ func ( handlers *Handlers ) docLimitsFor( c fiber.Ctx ) ( limits docstore.Limits
 func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 	var conflict *docstore.ConflictError
 	var incomplete *docstore.RotateIncomplete
+	var large *docstore.DeleteTooLarge
 	limits := handlers.docLimits()
 	switch {
 	case errors.As( cause , &conflict ):
@@ -219,6 +220,8 @@ func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 		refused = refuse( fiber.StatusRequestEntityTooLarge , "quota_exceeded" , fiber.Map{ "quota_bytes": limits.QuotaBytes } )
 	case errors.Is( cause , docstore.ErrSyncExpired ):
 		refused = refuse( fiber.StatusGone , "sync_expired" )
+	case errors.As( cause , &large ):
+		refused = refuse( fiber.StatusRequestEntityTooLarge , "delete_too_large" , fiber.Map{ "docs": large.Docs , "max_docs": handlers.cfg().Docs.Limits().MaxDeleteDocs } )
 	default:
 		refused = internalFailure( cause )
 	}
@@ -259,7 +262,7 @@ type listCollectionsReply struct {
 	Collections []collectionCountedRow `json:"collections"`
 	Paged
 	TreeSeq        *int64 `json:"tree_seq,omitempty" jsonschema_description:"Change number of the last change to your folders; 0 if none. Left out for an access key: it would show changes outside its folder."`
-	UsedBytes      int64 `json:"used_bytes" jsonschema_description:"All your live documents."`
+	UsedBytes      int64 `json:"used_bytes" jsonschema_description:"What counts against quota_bytes: your live documents, and 128 bytes for each delete not yet purged."`
 	DocCount       int   `json:"doc_count"`
 	QuotaBytes     int64 `json:"quota_bytes" jsonschema_description:"0: no quota. For an access key, what its shared folder may hold."`
 	MaxDocBytes    int   `json:"max_doc_bytes" jsonschema_description:"Largest one document may be, in ciphertext bytes."`
@@ -306,7 +309,9 @@ func ( handlers *Handlers ) listCollections( c fiber.Ctx , in *Page ) ( reply *l
 		if err != nil { return }
 	} else {
 		if collections , total , err = handlers.Docs.Collections( owner , in.Offset , limit ); err != nil { return }
-		if used , count , err = handlers.Docs.Usage( owner ); err != nil { return }
+		usage , usage_err := handlers.Docs.Usage( owner )
+		if usage_err != nil { return nil , usage_err }
+		used , count = usage.Charged() , usage.Docs
 	}
 	var tree_seq *int64
 	if docScope( c ) == nil {
@@ -340,27 +345,17 @@ func ( handlers *Handlers ) listCollections( c fiber.Ctx , in *Page ) ( reply *l
 
 // scopedCollections is listCollections for a scoped key: root and the
 // folders under it, root shown at the top level, one page of them, and what
-// their documents use.
+// their documents use against the share's quota.
 func ( handlers *Handlers ) scopedCollections( owner uint64 , root string , offset int , limit int ) ( page []docstore.Collection , total int , used int64 , count int , err error ) {
-	ids , err := handlers.Docs.Subtree( owner , root )
+	kept , err := handlers.Docs.CollectionsIn( owner , root )
 	if err != nil { return }
-	inside := map[ string ]bool{}
-	for _ , id := range ids { inside[ id ] = true }
-	kept := []docstore.Collection{}
-	var all []docstore.Collection
-	for start , account_total := 0 , 1 ; start < account_total ; start += 1000 {
-		var batch []docstore.Collection
-		if batch , account_total , err = handlers.Docs.Collections( owner , start , 1000 ); err != nil { return }
-		all = append( all , batch... )
-	}
-	for _ , entry := range all {
-		if inside[ entry.ID ] == false { continue }
+	for index := range kept {
+		entry := &kept[ index ]
 		// The root shows at the top level, alone: where it sits among the
 		// account's own top-level folders is not the key's business.
 		if entry.ID == root { entry.Parent , entry.Position = "" , 0 }
-		used += entry.Bytes
+		used += docstore.Usage{ Bytes: entry.Bytes , Tombstones: entry.Tombstones }.Charged()
 		count += entry.Count
-		kept = append( kept , entry )
 	}
 	total = len( kept )
 	if offset > total { offset = total }
@@ -518,11 +513,13 @@ func ( handlers *Handlers ) updateCollection( c fiber.Ctx , in *updateCollection
 type deleteCollectionRequest struct {
 	collectionPath
 	IfVersion *int64 `json:"if_version,omitempty" jsonschema:"minimum=1" jsonschema_description:"Delete only if the collection is at this version." error:"if_version must be 1 or more"`
+	Partial   bool   `json:"partial,omitempty" jsonschema_description:"When the folders hold more than docs.max_delete_docs live documents, delete that many of them and leave the folders (done false) instead of 413 delete_too_large. Call again until done."`
 }
 
 type deleteCollectionReply struct {
-	Collections []string    `json:"collections" jsonschema_description:"Every folder removed, the one asked for first, parents before children."`
-	Docs        []docChange `json:"docs" jsonschema_description:"The tombstones left."`
+	Done        bool     `json:"done" jsonschema_description:"Everything is gone. False after a partial call that only deleted a page of the documents."`
+	Collections []string `json:"collections" jsonschema_description:"Every folder removed, the one asked for first, parents before children; empty until done."`
+	Docs        int      `json:"docs" jsonschema_description:"How many documents this call deleted. GET /api/changes lists their tombstones."`
 }
 
 // deleteCollection removes a folder, the folders under it and every document
@@ -531,8 +528,9 @@ type deleteCollectionReply struct {
 // @route("POST /api/collections/{collection}/delete", summary="Delete a collection and everything in it",
 //     tag="Documents", errors=(404, 409),
 //     description="Removes the folder, every folder under it, and every document in them. Each document leaves "
-//         "a tombstone GET /api/changes reports. To undo: make the folders again with the same ids, then write "
-//         "the documents back with if_version 0.",
+//         "a tombstone GET /api/changes reports. More than docs.max_delete_docs live documents is 413 "
+//         "delete_too_large (with docs and max_docs): send partial to delete them a page per call. To undo: make "
+//         "the folders again with the same ids, then write the documents back with if_version 0.",
 // )
 func ( handlers *Handlers ) deleteCollection( c fiber.Ctx , in *deleteCollectionRequest ) ( reply *deleteCollectionReply , err error ) {
 	refused := in.check()
@@ -546,9 +544,15 @@ func ( handlers *Handlers ) deleteCollection( c fiber.Ctx , in *deleteCollection
 		err = refuse( fiber.StatusForbidden , "a scoped key cannot delete the collection it is for" )
 		return
 	}
-	deleted , delete_err := handlers.Docs.DeleteCollection( docOwner( c ) , id , in.IfVersion )
+	options := docstore.DeleteOptions{ IfVersion: in.IfVersion , MaxDocs: handlers.cfg().Docs.Limits().MaxDeleteDocs , Partial: in.Partial }
+	deleted , delete_err := handlers.Docs.DeleteCollection( docOwner( c ) , id , options )
 	if delete_err != nil {
 		err = handlers.docRefusal( delete_err )
+		return
+	}
+	reply = &deleteCollectionReply{ Done: deleted.Done , Collections: deleted.Collections , Docs: deleted.Docs }
+	if deleted.Done == false {
+		reply.Collections = []string{}
 		return
 	}
 	// The access keys for a folder that is gone go with it, so one can never
@@ -557,12 +561,7 @@ func ( handlers *Handlers ) deleteCollection( c fiber.Ctx , in *deleteCollection
 	for _ , key_id := range revoked {
 		handlers.audit( c , logs.KindAdmin , "api key revoked: its collection was deleted" , fiber.Map{ "key_id": key_id , "collection": id } )
 	}
-	if err != nil { return }
-	rows := make( []docChange , 0 , len( deleted.Docs ) )
-	for _ , doc := range deleted.Docs {
-		rows = append( rows , newDocChange( doc , true ) )
-	}
-	reply = &deleteCollectionReply{ Collections: deleted.Collections , Docs: rows }
+	if err != nil { reply = nil }
 	return
 }
 

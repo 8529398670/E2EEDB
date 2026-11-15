@@ -133,14 +133,14 @@ func TestDeleteSubtree( t *testing.T ) {
 	store.Set( 1 , "keep" , "d" , envelope( 1 , 60 ) , nil , limits )
 	before , _ := store.TreeSeq( 1 )
 
-	deleted , err := store.DeleteCollection( 1 , "top" , version( 1 ) )
+	deleted , err := store.DeleteCollection( 1 , "top" , DeleteOptions{ IfVersion: version( 1 ) } )
 	if err != nil { t.Fatal( err ) }
-	if same( deleted.Collections , "top" , "mid" , "leaf" ) == false || len( deleted.Docs ) != 3 { t.Fatalf( "deleted: %+v" , deleted ) }
+	if same( deleted.Collections , "top" , "mid" , "leaf" ) == false || deleted.Docs != 3 || deleted.Done == false { t.Fatalf( "deleted: %+v" , deleted ) }
 	if ids := children( t , store , 1 , "" ); same( ids , "keep" ) == false { t.Fatalf( "left: %v" , ids ) }
 	if got := tree( t , store , 1 )[ "keep" ].Position; got != 0 { t.Fatalf( "keep's position %d" , got ) }
 	if after , _ := store.TreeSeq( 1 ); after <= before { t.Fatalf( "tree seq did not move: %d -> %d" , before , after ) }
 	// Every document became a tombstone the feed reports, each with its own number.
-	changes , _ , _ := store.Changes( 1 , deleted.Docs[ 0 ].Seq - 1 , 100 )
+	changes , _ , _ := store.Changes( 1 , 0 , 100 )
 	gone := 0
 	for _ , change := range changes {
 		if change.Deleted { gone++ }
@@ -152,7 +152,7 @@ func TestDeleteSubtree( t *testing.T ) {
 	store.CreateCollection( 1 , "mid" , CollectionChange{ Parent: name( "top" ) } , limits )
 	store.CreateCollection( 1 , "leaf" , CollectionChange{ Parent: name( "mid" ) } , limits )
 	if _ , err = store.Set( 1 , "leaf" , "b" , envelope( 1 , 60 ) , version( 0 ) , limits ); err != nil { t.Fatalf( "restore: %v" , err ) }
-	if _ , err = store.DeleteCollection( 1 , "nope" , nil ); errors.Is( err , ErrNoCollection ) == false { t.Fatalf( "missing: %v" , err ) }
+	if _ , err = store.DeleteCollection( 1 , "nope" , DeleteOptions{} ); errors.Is( err , ErrNoCollection ) == false { t.Fatalf( "missing: %v" , err ) }
 }
 
 func TestMoveDoc( t *testing.T ) {
@@ -182,7 +182,7 @@ func TestFoldersAreApartAndCapped( t *testing.T ) {
 	store.CreateCollection( 1 , "mine" , CollectionChange{} , limits )
 	if len( tree( t , store , 2 ) ) != 0 { t.Fatal( "user 2 sees user 1's folders" ) }
 	if _ , err := store.UpdateCollection( 2 , "mine" , CollectionChange{ Name: name( "x" ) } , limits ); errors.Is( err , ErrNoCollection ) == false { t.Fatalf( "rename another's: %v" , err ) }
-	if _ , err := store.DeleteCollection( 2 , "mine" , nil ); errors.Is( err , ErrNoCollection ) == false { t.Fatalf( "delete another's: %v" , err ) }
+	if _ , err := store.DeleteCollection( 2 , "mine" , DeleteOptions{} ); errors.Is( err , ErrNoCollection ) == false { t.Fatalf( "delete another's: %v" , err ) }
 	few := limits
 	few.MaxCollections = 2
 	store.CreateCollection( 1 , "two" , CollectionChange{} , few )

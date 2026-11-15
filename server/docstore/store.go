@@ -132,6 +132,13 @@ var migrations = []string{
 	// minted for one never reaches the other. next_lock is the lockbox of
 	// the keys a rotation (StageRotation) is moving the folder to, "" when
 	// none is under way.
+	//
+	// usage: running totals of each account's documents, per collection and
+	// (collection "") for the whole account, kept by the triggers below so
+	// every statement that touches docs keeps them right. bytes and docs
+	// count the live documents, tombs the tombstones not yet purged,
+	// updated_at is the last time a document there changed, deletes
+	// included. A quota check reads one row instead of summing the account.
 	`CREATE TABLE docs (
 		user_id    INTEGER NOT NULL,
 		collection TEXT    NOT NULL,
@@ -175,7 +182,40 @@ var migrations = []string{
 	CREATE TABLE trees (
 		user_id INTEGER PRIMARY KEY,
 		seq     INTEGER NOT NULL
-	);`,
+	);
+	CREATE TABLE usage (
+		user_id    INTEGER NOT NULL,
+		collection TEXT    NOT NULL,
+		bytes      INTEGER NOT NULL DEFAULT 0,
+		docs       INTEGER NOT NULL DEFAULT 0,
+		tombs      INTEGER NOT NULL DEFAULT 0,
+		updated_at INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY ( user_id , collection )
+	) WITHOUT ROWID;
+	CREATE TRIGGER docs_stay_put BEFORE UPDATE OF user_id , collection , doc_id ON docs
+	WHEN OLD.user_id != NEW.user_id OR OLD.collection != NEW.collection OR OLD.doc_id != NEW.doc_id BEGIN
+		SELECT RAISE( ABORT , 'a document row never moves: write the new place and delete the old' );
+	END;
+	CREATE TRIGGER docs_usage_insert AFTER INSERT ON docs BEGIN
+		INSERT INTO usage ( user_id , collection , bytes , docs , tombs , updated_at ) VALUES
+			( NEW.user_id , NEW.collection , NEW.size * ( NEW.deleted = 0 ) , NEW.deleted = 0 , NEW.deleted != 0 , NEW.updated_at ),
+			( NEW.user_id , '' , NEW.size * ( NEW.deleted = 0 ) , NEW.deleted = 0 , NEW.deleted != 0 , NEW.updated_at )
+		ON CONFLICT ( user_id , collection ) DO UPDATE SET bytes = bytes + excluded.bytes , docs = docs + excluded.docs ,
+			tombs = tombs + excluded.tombs , updated_at = MAX( updated_at , excluded.updated_at );
+	END;
+	CREATE TRIGGER docs_usage_update AFTER UPDATE ON docs BEGIN
+		INSERT INTO usage ( user_id , collection , bytes , docs , tombs , updated_at ) VALUES
+			( NEW.user_id , NEW.collection , NEW.size * ( NEW.deleted = 0 ) - OLD.size * ( OLD.deleted = 0 ) ,
+				( NEW.deleted = 0 ) - ( OLD.deleted = 0 ) , ( NEW.deleted != 0 ) - ( OLD.deleted != 0 ) , NEW.updated_at ),
+			( NEW.user_id , '' , NEW.size * ( NEW.deleted = 0 ) - OLD.size * ( OLD.deleted = 0 ) ,
+				( NEW.deleted = 0 ) - ( OLD.deleted = 0 ) , ( NEW.deleted != 0 ) - ( OLD.deleted != 0 ) , NEW.updated_at )
+		ON CONFLICT ( user_id , collection ) DO UPDATE SET bytes = bytes + excluded.bytes , docs = docs + excluded.docs ,
+			tombs = tombs + excluded.tombs , updated_at = MAX( updated_at , excluded.updated_at );
+	END;
+	CREATE TRIGGER docs_usage_delete AFTER DELETE ON docs BEGIN
+		UPDATE usage SET bytes = bytes - OLD.size * ( OLD.deleted = 0 ) , docs = docs - ( OLD.deleted = 0 ) , tombs = tombs - ( OLD.deleted != 0 )
+			WHERE user_id = OLD.user_id AND collection IN ( OLD.collection , '' );
+	END;`,
 }
 
 func ( store *Store ) migrate() ( err error ) {

@@ -188,12 +188,17 @@ func setTx( tx *sql.Tx , user_id uint64 , collection string , id string , body [
 	if err != nil { return }
 	live := row.found && row.deleted == false
 	if err = checkVersion( if_version , live , row.version ); err != nil { return }
+	// What the write frees: the live document it replaces, or the
+	// tombstone it overwrites.
+	var freed int64
+	switch {
+	case live: freed = int64( row.size )
+	case row.found: freed = TombstoneBytes
+	}
 	if limits.QuotaBytes > 0 {
-		var used int64
-		err = tx.QueryRow( `SELECT COALESCE( SUM( size ) , 0 ) FROM docs WHERE user_id = ? AND deleted = 0` , user_id ).Scan( &used )
-		if err != nil { return }
-		if live { used -= int64( row.size ) }
-		if used + int64( len( body ) ) > limits.QuotaBytes {
+		var usage Usage
+		if usage , err = readUsage( tx , user_id ); err != nil { return }
+		if usage.Charged() - freed + int64( len( body ) ) > limits.QuotaBytes {
 			err = ErrQuota
 			if limits.Share != "" { err = ErrShareQuota }
 			return
@@ -201,11 +206,10 @@ func setTx( tx *sql.Tx , user_id uint64 , collection string , id string , body [
 	}
 	if limits.Share != "" && limits.ShareQuotaBytes > 0 {
 		var used int64
-		err = tx.QueryRow( shareSub + `SELECT COALESCE( SUM( size ) , 0 ) FROM docs WHERE user_id = ? AND deleted = 0 AND collection IN ( SELECT id FROM sub )` ,
-			user_id , limits.Share , user_id , user_id ).Scan( &used )
+		err = tx.QueryRow( shareSub + `SELECT COALESCE( SUM( bytes + tombs * ? ) , 0 ) FROM usage WHERE user_id = ? AND collection IN ( SELECT id FROM sub )` ,
+			user_id , limits.Share , user_id , TombstoneBytes , user_id ).Scan( &used )
 		if err != nil { return }
-		if live { used -= int64( row.size ) }
-		if used + int64( len( body ) ) > limits.ShareQuotaBytes {
+		if used - freed + int64( len( body ) ) > limits.ShareQuotaBytes {
 			err = ErrShareQuota
 			return
 		}
@@ -300,10 +304,41 @@ func ( store *Store ) List( user_id uint64 , collection string , offset int , li
 	return
 }
 
-// Usage is the bytes and number of an account's live documents.
-func ( store *Store ) Usage( user_id uint64 ) ( bytes int64 , count int , err error ) {
-	err = store.db.QueryRow( `SELECT COALESCE( SUM( size ) , 0 ) , COUNT(*) FROM docs WHERE user_id = ? AND deleted = 0` ,
-		user_id ).Scan( &bytes , &count )
+// TombstoneBytes is what a tombstone counts against the quota until it is
+// purged, so writing and deleting over and over cannot grow an account
+// without limit.
+const TombstoneBytes = 128
+
+// Usage is what an account's (or a folder's) documents add up to.
+type Usage struct {
+	// Bytes and Docs are the live documents.
+	Bytes int64
+	Docs  int
+	// Tombstones are the deletes not yet purged.
+	Tombstones int
+}
+
+// Charged is what counts against a quota: the live documents and
+// TombstoneBytes for each tombstone.
+func ( usage Usage ) Charged() int64 { return usage.Bytes + int64( usage.Tombstones ) * TombstoneBytes }
+
+// Usage is what the account's documents add up to, from the running totals
+// (one row, however many documents there are).
+func ( store *Store ) Usage( user_id uint64 ) ( usage Usage , err error ) {
+	usage , err = scanUsage( store.db.QueryRow( usageQuery , user_id ) )
+	return
+}
+
+const usageQuery = `SELECT bytes , docs , tombs FROM usage WHERE user_id = ? AND collection = ''`
+
+func readUsage( tx *sql.Tx , user_id uint64 ) ( usage Usage , err error ) {
+	usage , err = scanUsage( tx.QueryRow( usageQuery , user_id ) )
+	return
+}
+
+func scanUsage( row *sql.Row ) ( usage Usage , err error ) {
+	err = row.Scan( &usage.Bytes , &usage.Docs , &usage.Tombstones )
+	if errors.Is( err , sql.ErrNoRows ) { err = nil }
 	return
 }
 

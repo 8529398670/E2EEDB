@@ -95,8 +95,8 @@ func TestListCollectionsAndChanges( t *testing.T ) {
 	if total != 2 || collections[ 0 ].Name != "notes" || collections[ 0 ].Count != 2 || collections[ 1 ].Bytes != 100 {
 		t.Fatalf( "collections: %+v" , collections )
 	}
-	bytes_used , count , _ := store.Usage( 1 )
-	if bytes_used != 220 || count != 3 { t.Fatalf( "usage: %d bytes %d docs" , bytes_used , count ) }
+	usage , _ := store.Usage( 1 )
+	if usage.Bytes != 220 || usage.Docs != 3 { t.Fatalf( "usage: %+v" , usage ) }
 
 	changes , more , _ := store.Changes( 1 , 0 , 3 )
 	if len( changes ) != 3 || more == false || changes[ 0 ].ID != "c" { t.Fatalf( "changes page 1: %+v more %v" , changes , more ) }
@@ -139,13 +139,13 @@ func TestSweep( t *testing.T ) {
 	store.SetKeyring( 7 , "k" , nil )
 
 	// Nothing is old enough yet: the tombstone stays and a sync from 1 works.
-	swept , err := store.Sweep( time.Now() , 30 , func( id uint64 ) bool { return true } )
+	swept , err := store.Sweep( time.Now() , 30 , 0 , func( id uint64 ) bool { return true } )
 	if err != nil || swept.Tombstones != 0 { t.Fatalf( "early sweep: %+v %v" , swept , err ) }
 	if _ , _ , err = store.Changes( 1 , 1 , 10 ); err != nil { t.Fatalf( "sync before purge: %v" , err ) }
 
 	// 31 days on, the tombstone goes, a client that never saw it must start
 	// again, one that did may carry on, and account 7 (deleted) is cleared.
-	swept , err = store.Sweep( time.Now().Add( 31 * 24 * time.Hour ) , 30 , func( id uint64 ) bool { return id == 1 } )
+	swept , err = store.Sweep( time.Now().Add( 31 * 24 * time.Hour ) , 30 , 0 , func( id uint64 ) bool { return id == 1 } )
 	if err != nil || swept.Tombstones != 1 || swept.Accounts != 1 { t.Fatalf( "sweep: %+v %v" , swept , err ) }
 	if _ , _ , err = store.Changes( 1 , 1 , 10 ); errors.Is( err , ErrSyncExpired ) == false { t.Fatalf( "sync from before the purge: %v" , err ) }
 	if _ , _ , err = store.Changes( 1 , gone.Seq , 10 ); err != nil { t.Fatalf( "sync from the purged tombstone itself: %v" , err ) }
@@ -210,7 +210,7 @@ func TestChangeNumbersPerAccount( t *testing.T ) {
 	if mine , _ := store.Set( 2 , "n" , "y" , envelope( 1 , 60 ) , nil , limits ); mine.Seq != 6 { t.Fatalf( "account 2 number %d, want 6" , mine.Seq ) }
 
 	store.Delete( 2 , "n" , "y" , nil )
-	if _ , err = store.Sweep( time.Now().Add( 31 * 24 * time.Hour ) , 30 , func( uint64 ) bool { return true } ); err != nil { t.Fatal( err ) }
+	if _ , err = store.Sweep( time.Now().Add( 31 * 24 * time.Hour ) , 30 , 0 , func( uint64 ) bool { return true } ); err != nil { t.Fatal( err ) }
 	if _ , _ , err = store.Changes( 2 , 1 , 10 ); errors.Is( err , ErrSyncExpired ) == false { t.Fatalf( "account 2 after its purge: %v" , err ) }
 	if _ , _ , err = store.Changes( 1 , 1 , 10 ); err != nil { t.Fatalf( "account 1 expired by account 2's purge: %v" , err ) }
 }

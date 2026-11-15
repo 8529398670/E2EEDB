@@ -61,7 +61,7 @@ func ValidCollectionName( name string ) bool {
 
 // Collection is one folder, with its own live documents summed (not its
 // subfolders'). UpdatedAt is the later of its own last change and its
-// documents'.
+// documents' (deletes included).
 type Collection struct {
 	ID        string
 	Name      string
@@ -82,6 +82,8 @@ type Collection struct {
 	Born      int64
 	Count     int
 	Bytes     int64
+	// Tombstones are its documents' deletes not yet purged.
+	Tombstones int
 	UpdatedAt time.Time
 }
 
@@ -101,12 +103,37 @@ type CollectionChange struct {
 	ByKey     string
 }
 
+// ErrDeleteTooLarge: the folders hold more live documents than one delete
+// may tombstone (DeleteOptions.MaxDocs). Errors carry a *DeleteTooLarge.
+var ErrDeleteTooLarge = errors.New( "delete_too_large" )
+
+// DeleteTooLarge is ErrDeleteTooLarge with how many live documents there are.
+type DeleteTooLarge struct{ Docs int }
+
+func ( large *DeleteTooLarge ) Error() string { return ErrDeleteTooLarge.Error() }
+func ( large *DeleteTooLarge ) Unwrap() error { return ErrDeleteTooLarge }
+
+// DeleteOptions shape a DeleteCollection.
+type DeleteOptions struct {
+	// IfVersion, when set, is the version the folder must be at.
+	IfVersion *int64
+	// MaxDocs caps the live documents one call tombstones (0: no cap). Past
+	// it the call is ErrDeleteTooLarge, or with Partial a page of the
+	// documents is tombstoned and the folders stay.
+	MaxDocs int
+	Partial bool
+}
+
 // DeletedTree is what DeleteCollection removed.
 type DeletedTree struct {
-	// Collections is every folder removed, the one asked for first.
+	// Collections is every folder removed, the one asked for first; none
+	// when Done is false.
 	Collections []string
-	// Docs is the tombstones left, one per live document that was in them.
-	Docs []Doc
+	// Docs is how many tombstones it left. The change feed lists them.
+	Docs int
+	// Done is false when a Partial call only tombstoned a page of the
+	// documents: call again.
+	Done bool
 }
 
 // Collections is one page of an account's folders, each parent's children
@@ -114,20 +141,37 @@ type DeletedTree struct {
 func ( store *Store ) Collections( user_id uint64 , offset int , limit int ) ( result []Collection , total int , err error ) {
 	err = store.db.QueryRow( `SELECT COUNT(*) FROM collections WHERE user_id = ?` , user_id ).Scan( &total )
 	if err != nil { return }
-	rows , err := store.db.Query( `SELECT c.id , c.name , c.parent , c.position , c.version , c.lock , c.next_lock , c.by_key , c.born ,
-			COALESCE( d.n , 0 ) , COALESCE( d.bytes , 0 ) , MAX( c.updated_at , COALESCE( d.updated , 0 ) )
-		FROM collections c
-		LEFT JOIN ( SELECT collection , COUNT(*) AS n , SUM( size ) AS bytes , MAX( updated_at ) AS updated
-			FROM docs WHERE user_id = ? AND deleted = 0 GROUP BY collection ) d ON d.collection = c.id
+	result , err = scanCounted( store.db.Query( `SELECT `+ countedColumns +` FROM collections c
+		LEFT JOIN usage u ON u.user_id = c.user_id AND u.collection = c.id
 		WHERE c.user_id = ? ORDER BY c.parent , c.position , c.id LIMIT ? OFFSET ?` ,
-		user_id , user_id , limit , offset )
-	if err != nil { return }
+		user_id , limit , offset ) )
+	return
+}
+
+// CollectionsIn is root and every folder under it, with their counts, in
+// the order Collections gives; empty when root does not exist.
+func ( store *Store ) CollectionsIn( user_id uint64 , root string ) ( result []Collection , err error ) {
+	result , err = scanCounted( store.db.Query( shareSub + `SELECT `+ countedColumns +` FROM collections c
+		LEFT JOIN usage u ON u.user_id = c.user_id AND u.collection = c.id
+		WHERE c.user_id = ? AND c.id IN ( SELECT id FROM sub ) ORDER BY c.parent , c.position , c.id` ,
+		user_id , root , user_id , user_id ) )
+	return
+}
+
+// countedColumns are what scanCounted reads: a folder (c) and its running
+// totals (u, absent for a folder no document was ever written to).
+const countedColumns = `c.id , c.name , c.parent , c.position , c.version , c.lock , c.next_lock , c.by_key , c.born ,
+	COALESCE( u.docs , 0 ) , COALESCE( u.bytes , 0 ) , COALESCE( u.tombs , 0 ) , MAX( c.updated_at , COALESCE( u.updated_at , 0 ) )`
+
+func scanCounted( rows *sql.Rows , query_err error ) ( result []Collection , err error ) {
+	if err = query_err; err != nil { return }
 	defer rows.Close()
 	result = []Collection{}
 	for rows.Next() {
 		var entry Collection
 		var updated int64
-		if err = rows.Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.NextLock , &entry.ByKey , &entry.Born , &entry.Count , &entry.Bytes , &updated ); err != nil { return }
+		if err = rows.Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.NextLock , &entry.ByKey , &entry.Born ,
+			&entry.Count , &entry.Bytes , &entry.Tombstones , &updated ); err != nil { return }
 		entry.UpdatedAt = fromMillis( updated )
 		result = append( result , entry )
 	}
@@ -276,7 +320,10 @@ func ( store *Store ) UpdateCollection( user_id uint64 , id string , change Coll
 
 // DeleteCollection removes a folder, every folder under it, and every live
 // document in them (each one a tombstone, so syncing clients hear of it).
-func ( store *Store ) DeleteCollection( user_id uint64 , id string , if_version *int64 ) ( deleted DeletedTree , err error ) {
+// The documents go in one statement, so even a big folder holds the write
+// lock briefly; options.MaxDocs caps how many one call may take (see
+// DeleteOptions).
+func ( store *Store ) DeleteCollection( user_id uint64 , id string , options DeleteOptions ) ( deleted DeletedTree , err error ) {
 	now := time.Now()
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
 		current , found , tx_err := readCollection( tx , user_id , id )
@@ -285,33 +332,60 @@ func ( store *Store ) DeleteCollection( user_id uint64 , id string , if_version 
 			tx_err = ErrNoCollection
 			return
 		}
-		if if_version != nil && *if_version != current.Version {
+		if options.IfVersion != nil && *options.IfVersion != current.Version {
 			tx_err = &ConflictError{ Current: current.Version , Live: true }
 			return
 		}
-		ids , tx_err := subtree( tx , user_id , id )
+		var live int
+		tx_err = tx.QueryRow( shareSub + `SELECT COALESCE( SUM( docs ) , 0 ) FROM usage WHERE user_id = ? AND collection IN ( SELECT id FROM sub )` ,
+			user_id , id , user_id , user_id ).Scan( &live )
 		if tx_err != nil { return }
-		deleted = DeletedTree{ Collections: ids , Docs: []Doc{} }
-		for _ , collection := range ids {
-			doc_ids , list_err := liveDocIDs( tx , user_id , collection )
-			if list_err != nil {
-				tx_err = list_err
+		page := live
+		if options.MaxDocs > 0 && live > options.MaxDocs {
+			if options.Partial == false {
+				tx_err = &DeleteTooLarge{ Docs: live }
 				return
 			}
-			for _ , doc_id := range doc_ids {
-				gone , delete_err := deleteTx( tx , user_id , collection , doc_id , nil , now )
-				if delete_err != nil {
-					tx_err = delete_err
-					return
-				}
-				deleted.Docs = append( deleted.Docs , gone )
-			}
-			if _ , tx_err = tx.Exec( `DELETE FROM collections WHERE user_id = ? AND id = ?` , user_id , collection ); tx_err != nil { return }
+			page = options.MaxDocs
 		}
+		if deleted.Docs , tx_err = tombstoneIn( tx , user_id , id , page , now ); tx_err != nil { return }
+		// Fewer than a page means none are left, whatever the totals said.
+		if page < live && deleted.Docs == page {
+			return
+		}
+		deleted.Done = true
+		if deleted.Collections , tx_err = subtree( tx , user_id , id ); tx_err != nil { return }
+		_ , tx_err = tx.Exec( shareSub + `DELETE FROM collections WHERE user_id = ? AND id IN ( SELECT id FROM sub )` ,
+			user_id , id , user_id , user_id )
+		if tx_err != nil { return }
 		if _ , tx_err = touchTree( tx , user_id ); tx_err != nil { return }
 		tx_err = place( tx , user_id , "" , current.Parent , "" )
 		return
 	} )
+	return
+}
+
+// tombstoneIn turns up to limit live documents in root and the folders
+// under it into tombstones, in one statement, each with its own change
+// number, and answers how many it did.
+func tombstoneIn( tx *sql.Tx , user_id uint64 , root string , limit int , now time.Time ) ( count int , err error ) {
+	if limit <= 0 { return }
+	var base int64
+	err = tx.QueryRow( `SELECT seq FROM counters WHERE user_id = ?` , user_id ).Scan( &base )
+	if errors.Is( err , sql.ErrNoRows ) { err = nil }
+	if err != nil { return }
+	result , err := tx.Exec( shareSub + `, pick ( collection , doc_id , n ) AS (
+			SELECT collection , doc_id , ROW_NUMBER() OVER ( ORDER BY collection , doc_id ) FROM docs
+			WHERE user_id = ? AND deleted = 0 AND collection IN ( SELECT id FROM sub ) ORDER BY collection , doc_id LIMIT ?
+		) UPDATE docs SET version = docs.version + 1 , seq = ? + pick.n , updated_at = ? , deleted = 1 , size = 0 , body = NULL
+		FROM pick WHERE docs.user_id = ? AND docs.collection = pick.collection AND docs.doc_id = pick.doc_id` ,
+		user_id , root , user_id , user_id , limit , base , millis( now ) , user_id )
+	if err != nil { return }
+	affected , err := result.RowsAffected()
+	if err != nil || affected == 0 { return }
+	count = int( affected )
+	_ , err = tx.Exec( `INSERT INTO counters ( user_id , seq ) VALUES ( ? , ? )
+		ON CONFLICT ( user_id ) DO UPDATE SET seq = excluded.seq` , user_id , base + affected )
 	return
 }
 
@@ -535,19 +609,6 @@ func ( store *Store ) Subtree( user_id uint64 , root string ) ( ids []string , e
 	if err != nil { return }
 	defer tx.Rollback()
 	ids , err = subtree( tx , user_id , root )
-	return
-}
-
-func liveDocIDs( tx *sql.Tx , user_id uint64 , collection string ) ( ids []string , err error ) {
-	rows , err := tx.Query( `SELECT doc_id FROM docs WHERE user_id = ? AND collection = ? AND deleted = 0 ORDER BY doc_id` , user_id , collection )
-	if err != nil { return }
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		if err = rows.Scan( &id ); err != nil { return }
-		ids = append( ids , id )
-	}
-	err = rows.Err()
 	return
 }
 

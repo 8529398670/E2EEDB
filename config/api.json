@@ -4874,7 +4874,7 @@
                       ]
                     },
                     "used_bytes": {
-                      "description": "All your live documents.",
+                      "description": "What counts against quota_bytes: your live documents, and 128 bytes for each delete not yet purged.",
                       "type": "integer"
                     }
                   },
@@ -5147,7 +5147,7 @@
     },
     "/api/collections/{collection}/delete": {
       "post": {
-        "description": "Removes the folder, every folder under it, and every document in them. Each document leaves a tombstone GET /api/changes reports. To undo: make the folders again with the same ids, then write the documents back with if_version 0.",
+        "description": "Removes the folder, every folder under it, and every document in them. Each document leaves a tombstone GET /api/changes reports. More than docs.max_delete_docs live documents is 413 delete_too_large (with docs and max_docs): send partial to delete them a page per call. To undo: make the folders again with the same ids, then write the documents back with if_version 0.",
         "operationId": "post_api_collections_collection_delete",
         "parameters": [
           {
@@ -5179,6 +5179,10 @@
                       "integer",
                       "null"
                     ]
+                  },
+                  "partial": {
+                    "description": "When the folders hold more than docs.max_delete_docs live documents, delete that many of them and leave the folders (done false) instead of 413 delete_too_large. Call again until done.",
+                    "type": "boolean"
                   }
                 },
                 "type": "object"
@@ -5194,23 +5198,25 @@
                 "schema": {
                   "properties": {
                     "collections": {
-                      "description": "Every folder removed, the one asked for first, parents before children.",
+                      "description": "Every folder removed, the one asked for first, parents before children; empty until done.",
                       "items": {
                         "type": "string"
                       },
                       "type": "array"
                     },
                     "docs": {
-                      "description": "The tombstones left.",
-                      "items": {
-                        "$ref": "#/components/schemas/DocChange"
-                      },
-                      "type": "array"
+                      "description": "How many documents this call deleted. GET /api/changes lists their tombstones.",
+                      "type": "integer"
+                    },
+                    "done": {
+                      "description": "Everything is gone. False after a partial call that only deleted a page of the documents.",
+                      "type": "boolean"
                     }
                   },
                   "required": [
                     "collections",
-                    "docs"
+                    "docs",
+                    "done"
                   ],
                   "type": "object"
                 }

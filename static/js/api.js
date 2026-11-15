@@ -150,10 +150,17 @@ const Api = {
   allCollections( offset , limit ) { return this.request( "/api/collections?offset=" + offset + "&limit=" + limit ); },
   createCollection( change )   { return this.post( "/api/collections" , change ); },
   updateCollection( id , change ) { return this.post( "/api/collections/" + encodeURIComponent( id ) , change ); },
-  deleteCollection( id , ifVersion ) {
-    const request = {};
+  // Deletes a folder and everything under it. One call deletes at most
+  // docs.max_delete_docs documents, so a bigger folder goes in several: its
+  // documents a page at a time, then the folders with the last page.
+  async deleteCollection( id , ifVersion ) {
+    const request = { partial: true };
     if ( ifVersion !== undefined && ifVersion !== null ) request.if_version = ifVersion;
-    return this.post( "/api/collections/" + encodeURIComponent( id ) + "/delete" , request );
+    for ( ;; ) {
+      const reply = await this.post( "/api/collections/" + encodeURIComponent( id ) + "/delete" , request );
+      if ( reply.done ) return reply;
+      if ( !reply.docs ) throw new Error( "delete made no progress" );
+    }
   },
   // Rotating a collection's keys: locks maps collection ids to the
   // lockboxes of their new keys, parents first; then commit.

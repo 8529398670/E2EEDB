@@ -55,7 +55,11 @@ bound to where it is, so the client opens it and seals it again for the new
 place, and the server swaps the two in one step
 (`POST .../docs/{id}/move`, or `client.MoveDoc`). Deleting a collection deletes
 every collection under it and every document in them, each leaving a tombstone
-in the change feed. `docs.max_collections` and `docs.max_depth` cap how many
+in the change feed. One call deletes at most `docs.max_delete_docs` documents
+(default 50,000); past that it is `413 delete_too_large`, and a call with
+`partial: true` deletes a page of the documents and answers `done: false`
+until the last call takes the folders too. The Go client and the browser do
+that for you. `docs.max_collections` and `docs.max_depth` cap how many
 there are and how deep they nest.
 
 In the browser, the Documents screen shows the tree: drag a collection to
@@ -240,9 +244,12 @@ package depends only on the standard library and `golang.org/x/crypto`.
 change number N, oldest first and without bodies. Start from 0. Keep calling
 with `next_since` while `more` is true, and store `next_since` for next time.
 A deleted document shows up once with `deleted: true` and is purged after
-`docs.tombstone_days`. A client that last synced before that gets
-`410 sync_expired` and starts again from 0. Change numbers are counted per
-account.
+`docs.tombstone_days`, or sooner once the account holds more than
+`docs.max_tombstones` of them (default 100,000; the oldest go first). A client
+that last synced before a purged one gets `410 sync_expired` and starts again
+from 0. Until it is purged, a tombstone counts 128 bytes against the quota, so
+writing and deleting over and over cannot grow an account without limit.
+Change numbers are counted per account.
 
 ### Conditional writes
 
@@ -490,8 +497,10 @@ for an admin's key, since admin rights here only decide who gets in.
 Data lives in `~/.config/e2eedb/`: `app.db` (bbolt: accounts, sessions,
 keys) and `docs.db` (SQLite: documents). `manage backup` and the scheduled
 backup include both. `docs:` in `config/config.yaml` sets the largest document
-(`max_doc_kb`), the per-account quota (`quota_mb`), how long deletes stay
-visible to syncing clients (`tombstone_days`), and how much writes through one
+(`max_doc_kb`), the per-account quota (`quota_mb`, with 128 bytes for each
+tombstone), how long deletes stay visible to syncing clients
+(`tombstone_days`, `max_tombstones`), how many documents one folder delete
+takes (`max_delete_docs`), and how much writes through one
 access key may grow its shared folder (`share_quota_mb`,
 `share_max_collections`; 0 leaves only the account's limits). An access key
 that reaches either cap, or the account's own, gets `413

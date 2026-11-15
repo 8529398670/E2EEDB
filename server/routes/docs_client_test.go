@@ -131,3 +131,35 @@ func TestGoClientFolders( t *testing.T ) {
 	if _ , err = store.Get( ctx , "invoices" , "b" , &back ); errors.Is( err , client.ErrNotFound ) == false { t.Fatalf( "doc survived: %v" , err ) }
 	if collections , _ = store.Collections( ctx ); len( collections ) != 0 { t.Fatalf( "folders left: %+v" , collections ) }
 }
+
+func TestBigFolderDeletesInPages( t *testing.T ) {
+	fixture := newAuthFixture( t )
+	fixture.cfg.Docs.MaxDeleteDocs = 3
+	base := serve( t , fixture )
+	api_key := issueKey( t , fixture , fixture.alice , models.RoleUser )
+	master , _ := client.GenerateKey()
+	store , err := client.New( base , api_key , master )
+	if err != nil { t.Fatal( err ) }
+	ctx := context.Background()
+	work , err := store.CreateCollection( ctx , client.NewCollection{ Name: "Work" } )
+	if err != nil { t.Fatal( err ) }
+	for index := 0 ; index < 8 ; index++ {
+		if _ , err = store.Set( ctx , work.ID , client.NewID() , invoice{ Total: float64( index ) } ); err != nil { t.Fatal( err ) }
+	}
+
+	// All at once is refused, and nothing goes.
+	status , reply := fixture.withKey( t , api_key , "POST" , "/api/collections/" + work.ID + "/delete" , fiber.Map{} )
+	if status != fiber.StatusRequestEntityTooLarge || reply[ "error" ] != "delete_too_large" || reply[ "docs" ] != float64( 8 ) || reply[ "max_docs" ] != float64( 3 ) {
+		t.Fatalf( "too large: %d %v" , status , reply )
+	}
+	// One partial call deletes a page and leaves the folder.
+	status , reply = fixture.withKey( t , api_key , "POST" , "/api/collections/" + work.ID + "/delete" , fiber.Map{ "partial": true } )
+	if status != fiber.StatusOK || reply[ "done" ] != false || reply[ "docs" ] != float64( 3 ) { t.Fatalf( "partial: %d %v" , status , reply ) }
+	if _ , err = fixture.handlers.Docs.GetCollection( fixture.alice.ID , work.ID ); err != nil { t.Fatalf( "folder went with a partial delete: %v" , err ) }
+
+	// The client pages through the rest.
+	removed , err := store.DeleteCollection( ctx , work.ID )
+	if err != nil || len( removed ) != 1 || removed[ 0 ] != work.ID { t.Fatalf( "delete: %v %v" , removed , err ) }
+	usage , _ := fixture.handlers.Docs.Usage( fixture.alice.ID )
+	if usage.Docs != 0 || usage.Tombstones != 8 { t.Fatalf( "usage after: %+v" , usage ) }
+}

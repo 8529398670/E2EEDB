@@ -116,6 +116,10 @@ Fix:
 
 ## G3 (medium): deleting a big folder blocks every account's writes
 
+**Done** (card 667). One `UPDATE … FROM` tombstones the subtree, with
+`docs.max_delete_docs` and `partial` paging; the reply is counts only. 20k
+documents delete in about 0.25 s, and another account's write goes through.
+
 **Confirmed.** Deleting 100k documents held SQLite's only write lock for
 9 seconds and returned a 12.4 MB reply. Another account's write failed with
 `SQLITE_BUSY` (500). A read-write access key can do this to its own
@@ -137,6 +141,11 @@ Fix:
    concurrent write from another account succeeds.
 
 ## G4 (medium): tombstones let an account grow without limit, and writes slow with it
+
+**Done** (card 668). A `usage` table, kept by triggers on `docs`, holds the
+running totals per account and per folder. Tombstones count 128 bytes, and the
+sweep caps them at `docs.max_tombstones`. Writes at 100k documents take as long
+as at 1k.
 
 **Confirmed.**
 
