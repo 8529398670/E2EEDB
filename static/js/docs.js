@@ -39,6 +39,8 @@ const Docs = {
   sharedAllowed: new Set(),
   // The account's keyring reply (GET /api/keyring), or null when none is set.
   keyring: null,
+  // The server keeps the keyring from this browser (key_made_session).
+  keyringBlocked: false,
   collection: null,
   // Ids of the documents ticked in the list, for Move to.
   picked: new Set(),
@@ -618,6 +620,7 @@ const Docs = {
     Dom.show( Dom.get( "docs-locked" ) , !unlocked );
     Dom.show( Dom.get( "docs-unlocked" ) , unlocked );
     Dom.show( Dom.get( "docs-passphrase-card" ) , this.key !== null );
+    Dom.show( Dom.get( "docs-passphrase-form" ) , !this.keyringBlocked );
     Dom.show( Dom.get( "docs-passphrase-unlock-form" ) , !unlocked && this.keyring !== null );
     Dom.show( Dom.get( "docs-new-button" ) , this.canWrite() );
     Dom.show( Dom.get( "docs-folder-new" ) , this.scope === null );
@@ -632,7 +635,7 @@ const Docs = {
   },
 
   renderPassphraseStatus() {
-    let text = I18n.get( "docs.passphrase_none" );
+    let text = I18n.get( this.keyringBlocked ? "docs.passphrase_key_made" : "docs.passphrase_none" );
     if ( this.keyring ) {
       text = this.say( "docs.passphrase_set" , { when: new Date( this.keyring.updated_at ).toLocaleString() } );
       let ring = null;
@@ -643,11 +646,16 @@ const Docs = {
   },
 
   async refreshKeyring() {
+    this.keyringBlocked = false;
     try {
       this.keyring = await Api.keyring();
     } catch ( error ) {
-      if ( error.status !== 404 ) throw error;
+      // A browser whose way in started with an API key (a link a key made)
+      // is kept from the keyring: it unlocks with the master key only.
+      const blocked = error.status === 403 && error.payload && error.payload.error === "key_made_session";
+      if ( error.status !== 404 && !blocked ) throw error;
       this.keyring = null;
+      this.keyringBlocked = blocked;
     }
     this.renderLock();
   },

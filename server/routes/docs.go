@@ -1014,18 +1014,45 @@ type keyringReply struct {
 // must not be able to take the keyring away and guess the passphrase offline,
 // and services hold the raw key instead.
 //
-// @route("GET /api/keyring", summary="Your wrapped master key", tag="Documents", errors=(404,), access=SESSION_ONLY,
+// @route("GET /api/keyring", summary="Your wrapped master key", tag="Documents", errors=(403,404,), access=SESSION_ONLY,
 //     description="The master key sealed under a key derived from your passphrase (Argon2id), stored as the "
-//         "client wrote it. Useless without the passphrase. 404 when no passphrase has been set.",
+//         "client wrote it. Useless without the passphrase. 404 when no passphrase has been set. 403 "
+//         "key_made_session for a browser that signed in through a link an API key made, directly or not.",
 // )
 func ( handlers *Handlers ) getKeyring( c fiber.Ctx , in *apidoc.None ) ( reply *keyringReply , err error ) {
+	if refused := keyringSession( c ); refused != nil {
+		err = refused
+		return
+	}
 	keyring , err := handlers.Docs.GetKeyring( docOwner( c ) )
 	if errors.Is( err , docstore.ErrNotFound ) {
 		err = refuse( fiber.StatusNotFound , "no keyring" )
 		return
 	}
 	if err != nil { return }
+	// Every read is on the account's log, with who issued the link this
+	// browser signed in through when that was someone else (an admin can
+	// sign in as anyone below them): the keyring is what a passphrase is
+	// guessed against.
+	detail := fiber.Map{}
+	if session := security.ActorFrom( c ).Session; session != nil && session.IssuedBy != 0 { detail[ "issued_by" ] = session.IssuedBy }
+	handlers.audit( c , logs.KindAuth , "keyring read" , detail )
 	reply = &keyringReply{ Keyring: keyring.Body , Version: keyring.Version , UpdatedAt: keyring.UpdatedAt }
+	return
+}
+
+// keyringSession refuses a browser whose way in started with an API key: it
+// signed in through a login link a key made, or one a session made that
+// did (models.Session.MintedByKey). A key may make accounts and, through
+// them, links; the keyring is kept from all of it, as from the key itself,
+// so a key that was never given the master key cannot take the keyring away
+// to guess the passphrase, or replace it. Such a browser still opens
+// documents with the raw master key. A link from a person (or a shell) gives
+// a browser that reaches it.
+func keyringSession( c fiber.Ctx ) ( refused *refusal ) {
+	if session := security.ActorFrom( c ).Session; session != nil && session.MintedByKey != "" {
+		refused = refuse( fiber.StatusForbidden , "key_made_session" )
+	}
 	return
 }
 
@@ -1043,11 +1070,15 @@ type setKeyringReply struct {
 // Browser sessions only, like getKeyring, so an API key cannot replace it
 // and lock the owner's passphrase out.
 //
-// @route("POST /api/keyring", summary="Set or change your passphrase", tag="Documents", errors=(409,), access=SESSION_ONLY,
+// @route("POST /api/keyring", summary="Set or change your passphrase", tag="Documents", errors=(403,409,), access=SESSION_ONLY,
 //     description="Stores a new wrapped master key. Documents are not re-encrypted: they stay under the same "
 //         "master key.",
 // )
 func ( handlers *Handlers ) setKeyring( c fiber.Ctx , in *setKeyringRequest ) ( reply *setKeyringReply , err error ) {
+	if refused := keyringSession( c ); refused != nil {
+		err = refused
+		return
+	}
 	keyring , set_err := handlers.Docs.SetKeyring( docOwner( c ) , in.Keyring , in.IfVersion )
 	if errors.Is( set_err , docstore.ErrTooLarge ) {
 		err = refuse( fiber.StatusBadRequest , "keyring must be 1-" + strconv.Itoa( docstore.KeyringMaxBytes ) + " bytes" )

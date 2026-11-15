@@ -191,7 +191,8 @@ func TestAnAdminKeyCannotReissueTheOwnersLink( t *testing.T ) {
 			}
 		}
 	}
-	if status , reply := fixture.withKey( t , key , http.MethodPost , userPath( fixture.alice , "reissue-login" ) , fiber.Map{} ); status != fiber.StatusOK { t.Fatalf( "%d %v" , status , reply ) }
+	// E2EEDB: no key reissues anyone's link (H0), so not even a user's.
+	if status , reply := fixture.withKey( t , key , http.MethodPost , userPath( fixture.alice , "reissue-login" ) , fiber.Map{} ); status != fiber.StatusForbidden || reply[ "login_path" ] != nil { t.Fatalf( "%d %v" , status , reply ) }
 }
 
 func TestAnAdminKeyManagesAccounts( t *testing.T ) {
@@ -203,8 +204,8 @@ func TestAnAdminKeyManagesAccounts( t *testing.T ) {
 	if status != fiber.StatusCreated { t.Fatalf( "create: %d %v" , status , reply ) }
 	if fixture.loginWith( t , reply[ "login_path" ].( string ) ) == false { t.Fatal( "the new account's link did not sign in" ) }
 
-	if status , reply = fixture.withKey( t , key , http.MethodPost , userPath( fixture.alice , "reissue-login" ) , fiber.Map{} ); status != fiber.StatusOK { t.Fatalf( "reissue: %d %v" , status , reply ) }
-	if fixture.loginWith( t , reply[ "login_path" ].( string ) ) == false { t.Fatal( "the reissued link did not sign in" ) }
+	// E2EEDB: reissuing is a person's, from a browser (H0).
+	if status , reply = fixture.withKey( t , key , http.MethodPost , userPath( fixture.alice , "reissue-login" ) , fiber.Map{} ); status != fiber.StatusForbidden { t.Fatalf( "reissue: %d %v" , status , reply ) }
 
 	if status , reply = fixture.withKey( t , key , http.MethodPost , userPath( fixture.alice , "rename" ) , fiber.Map{ "display_name": "Alicia" } ); status != fiber.StatusOK { t.Fatalf( "rename: %d %v" , status , reply ) }
 	if status , reply = fixture.withKey( t , key , http.MethodPost , userPath( fixture.alice , "role" ) , fiber.Map{ "role": "admin" } ); status != fiber.StatusOK { t.Fatalf( "role: %d %v" , status , reply ) }
@@ -267,7 +268,8 @@ func TestRevokingAKeyEndsTheSessionsItsLinksMade( t *testing.T ) {
 		fixture := newAuthFixture( t )
 		key , record , err := models.IssueAPIKey( fixture.store , fixture.owner.ID , "ops" , models.RoleAdmin , time.Hour )
 		if err != nil { t.Fatal( err ) }
-		_ , by_key := fixture.withKey( t , key , http.MethodPost , userPath( fixture.alice , "reissue-login" ) , fiber.Map{ "max_uses": 2 } )
+		// E2EEDB: a key makes a link only with a new account (H0).
+		_ , by_key := fixture.withKey( t , key , http.MethodPost , "/api/admin/users" , fiber.Map{ "display_name": "Carol" , "role": "user" , "max_uses": 2 } )
 		through_key := fixture.browser()
 		if status , _ := through_key.post( t , "/api/login" , fiber.Map{ "credential": strings.TrimPrefix( by_key[ "login_path" ].( string ) , "/login/" ) } ); status != fiber.StatusOK { t.Fatalf( "%s: sign-in: %d" , how , status ) }
 		by_person := fixture.signIn( t , fixture.alice.ID )

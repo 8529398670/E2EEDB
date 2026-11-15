@@ -211,11 +211,12 @@ func ( handlers *Handlers ) mountDeclared( app *fiber.App ) {
 	} , handlers.setUserDisabled , handlers.Guard.RequireAdmin )
 	apidoc.Mount( app , "POST" , "/api/admin/users/{user_id}/reissue-login" , apidoc.Op{
 		Summary: "A new login link for an account",
-		Description: "For someone who lost their device or their link: a fresh login link for their account.",
+		Description: "For someone who lost their device or their link: a fresh login link for their account. From a browser session only: an API key gets 403.",
 		Tag: "Admin",
+		Access: apidoc.SessionOnly,
 		Role: apidoc.Admin,
 		Errors: []int{ 400 , 401 , 403 , 404 },
-	} , handlers.reissueLogin , handlers.Guard.RequireAdmin )
+	} , handlers.reissueLogin , handlers.Guard.RequireAdmin , handlers.Guard.RequireSession )
 	apidoc.Mount( app , "POST" , "/api/admin/users/{user_id}/rename" , apidoc.Op{
 		Summary: "Rename someone",
 		Description: "Change another account's display name (1-80 characters). Only the owner renames an admin. expect, when given, is the name you think it has now; if it changed meanwhile the rename is refused with the current name.",
@@ -352,7 +353,7 @@ func ( handlers *Handlers ) mountDeclared( app *fiber.App ) {
 	} , handlers.getHealth )
 	apidoc.Mount( app , "GET" , "/api/keyring" , apidoc.Op{
 		Summary: "Your wrapped master key",
-		Description: "The master key sealed under a key derived from your passphrase (Argon2id), stored as the client wrote it. Useless without the passphrase. 404 when no passphrase has been set.",
+		Description: "The master key sealed under a key derived from your passphrase (Argon2id), stored as the client wrote it. Useless without the passphrase. 404 when no passphrase has been set. 403 key_made_session for a browser that signed in through a link an API key made, directly or not.",
 		Tag: "Documents",
 		Access: apidoc.SessionOnly,
 		Errors: []int{ 401 , 403 , 404 },

@@ -63,6 +63,7 @@ docs:
   passphrase_heading: "Passphrase"
   passphrase_none: "No passphrase yet. Set one to unlock this screen without pasting the key. Your documents stay encrypted with the same key."
   passphrase_set: "A passphrase is set (changed {when}). Setting a new one replaces it."
+  passphrase_key_made: "This browser signed in through a link an API key made, so it cannot use or set a passphrase: that would let the key reach it. Paste the master key here, or sign in with a link from a person."
   passphrase_other_key: "It opens a different key from the one unlocked now; saving replaces it with this key."
   passphrase_new_label: "New passphrase (12 characters or more)"
   passphrase_again_label: "The same again"

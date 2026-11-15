@@ -304,12 +304,14 @@ func ( guard *Guard ) RequireAdmin( c fiber.Ctx ) ( err error ) {
 // two-factor, other people's files, and the owner's screens.
 //
 // Accounts and ways in are not on that list. An admin key may create and
-// delete accounts, change roles and hand out login links and invite links,
-// and any key may make its own account a login link -- so long as it carries
-// the account's full role, since the session the link becomes does. What keeps
+// delete accounts, change roles and hand out login links and invite links.
+// No key makes its own account a login link here (E2EEDB leaves out the
+// template's may_sign_in switch: a session reads the keyring), and no key
+// reissues one (reissueLogin is session-only). What keeps
 // revoking a leaked key meaningful is that every link records the key that
 // made it, and revoking or deleting the key voids those still usable and ends
 // every session one of its login links signed in (models.VoidLinksMintedByKeyTx).
+// Disabling or demoting the key's account does the same for all its keys.
 // What it does not undo is anything such a session did meanwhile, or the
 // accounts made through an invite link it handed out: those show in the
 // activity log and the user list.

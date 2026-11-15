@@ -19,6 +19,15 @@ document is still sealed under keys they hold.
 
 ## H0: no API key makes a login link in E2EEDB; take S19-S21
 
+**Done** (card 680). Took S19-S21 through `webserver-upgrade` (2ad0dbf ->
+bbf7241), leaving out the `may_sign_in` route, button and strings, and keeping
+`POST /api/account/login-link` session-only. `reissue-login` is session-only
+here. The keyring refuses a browser whose sign-in traces back to a key
+(`Session.MintedByKey`, `403 key_made_session`), which closes the long way
+round (key makes an admin account, that browser reissues someone's link).
+Keyring reads are logged. Test: `TestNoKeyFindsAWayToTheKeyring`; the
+template tests that reissue through a key were adapted. Checked in the browser.
+
 Card 680. Keys making login links is a template option on purpose, and it
 stays in the skills. E2EEDB turns it off for itself: a session here reads
 `/api/keyring`, so a key that can sign in can take the keyring away to guess

@@ -118,7 +118,8 @@ Known limits, by design:
   admin can reset your two-factor and make a link for your account (the
   owner can do it to an admin). That session sees what you see without a
   key: the folder tree and names, and the keyring, so it can try
-  passphrases offline. It cannot open a document without the master key or
+  passphrases offline. The account's log then shows "signed in with a link
+  issued by" that admin, and each keyring read. It cannot open a document without the master key or
   passphrase. Give admin rights only to people you would trust with that,
   and use a long passphrase or none.
 - **An opened access token stays in the tab.** Opening Documents with an access
@@ -139,6 +140,15 @@ the keyring and never re-encrypts documents. Only a signed-in browser reaches
 the keyring (`/api/keyring`). An API key gets 403, even the account's own full
 key, so a script that was never given the master key cannot take the keyring
 away to guess the passphrase, or replace it. Services hold the raw key.
+
+No key gets there the long way round either. A key makes no login link for
+an account that already exists: not its own (the template's `may_sign_in`
+switch is left out here) and not anyone else's (`reissue-login` is
+browser-only). An admin key may still make a new account, with its link, but
+a browser whose way in started with a key's link, and every browser that one
+signs in through links of its own, gets `403 key_made_session` from the
+keyring: it unlocks with the master key only. Every keyring read is on the
+account's log, saying who issued the link when that was someone else.
 
 ### Collection keys and access keys
 

@@ -169,7 +169,9 @@ func ( handlers *Handlers ) renameAccount( c fiber.Ctx , in *renameAccountReques
 //
 // Only a browser session may ask. An API key may not: the link becomes an
 // ordinary browser session, which would open everything kept from keys (the
-// API keys card, the owner's screens, minting keys) to whoever holds one.
+// API keys card, the owner's screens, minting keys, and here the keyring) to
+// whoever holds one. E2EEDB leaves out the template's may_sign_in switch on
+// purpose: no key here makes a login link (PLAN-security-fixes.md, H0).
 //
 // @route("POST /api/account/login-link", summary="A login link for yourself",
 //     tag="Account", access=SESSION_ONLY,

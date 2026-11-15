@@ -464,7 +464,7 @@ Once every collection in the subtree has its new lockbox and every collection en
 
 Your wrapped master key
 
-The master key sealed under a key derived from your passphrase (Argon2id), stored as the client wrote it. Useless without the passphrase. 404 when no passphrase has been set.
+The master key sealed under a key derived from your passphrase (Argon2id), stored as the client wrote it. Useless without the passphrase. 404 when no passphrase has been set. 403 key_made_session for a browser that signed in through a link an API key made, directly or not.
 
 |  |  |
 |---|---|
@@ -1409,7 +1409,7 @@ Revoke one of your keys
 | POST | [`/api/admin/users/{user_id}/cancel-login-link`](#post-apiadminusersuser_idcancel-login-link) | Stop an account's login link working | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/delete`](#post-apiadminusersuser_iddelete) | Delete an account | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/disabled`](#post-apiadminusersuser_iddisabled) | Disable or enable a user | browser session or API key, admins |
-| POST | [`/api/admin/users/{user_id}/reissue-login`](#post-apiadminusersuser_idreissue-login) | A new login link for an account | browser session or API key, admins |
+| POST | [`/api/admin/users/{user_id}/reissue-login`](#post-apiadminusersuser_idreissue-login) | A new login link for an account | browser session only, admins |
 | POST | [`/api/admin/users/{user_id}/rename`](#post-apiadminusersuser_idrename) | Rename someone | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/reset-two-factor`](#post-apiadminusersuser_idreset-two-factor) | Turn off an account's two-factor | browser session or API key, admins |
 | POST | [`/api/admin/users/{user_id}/revoke-access`](#post-apiadminusersuser_idrevoke-access) | Revoke a user's access | browser session or API key, admins |
@@ -1614,11 +1614,11 @@ Switch an account off (disabled: true) or back on (false). Disabling signs it ou
 
 A new login link for an account
 
-For someone who lost their device or their link: a fresh login link for their account.
+For someone who lost their device or their link: a fresh login link for their account. From a browser session only: an API key gets 403.
 
 |  |  |
 |---|---|
-| Who may call | browser session or API key, admins |
+| Who may call | browser session only, admins |
 | Errors | 400, 401, 403, 404, 429, 503 |
 
 **Parameters**

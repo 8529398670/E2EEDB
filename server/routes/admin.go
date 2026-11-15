@@ -186,9 +186,15 @@ func ( handlers *Handlers ) createUser( c fiber.Ctx , in *createUserRequest ) ( 
 // the worry is that someone else holds the account's credentials, use
 // RevokeAccess first, then reissue.
 //
+// E2EEDB only: a browser session asks, never an API key (the template lets a
+// key). The link signs in as the account, and a session here reaches the
+// keyring, so a key could take it away to guess the passphrase
+// (PLAN-security-fixes.md, H0).
+//
 // @route("POST /api/admin/users/{user_id}/reissue-login", summary="A new login link for an account",
-//     tag="Admin", role=ADMIN, errors=(404,),
-//     description="For someone who lost their device or their link: a fresh login link for their account.",
+//     tag="Admin", role=ADMIN, errors=(404,), access=SESSION_ONLY,
+//     description="For someone who lost their device or their link: a fresh login link for their account. "
+//         "From a browser session only: an API key gets 403.",
 // )
 func ( handlers *Handlers ) reissueLogin( c fiber.Ctx , in *loginLinkRequest ) ( reply *loginLinkReply , err error ) {
 	if _ , get_err := models.GetUser( handlers.Store , in.UserID ); get_err != nil {

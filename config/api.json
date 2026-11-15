@@ -3900,7 +3900,7 @@
     },
     "/api/admin/users/{user_id}/reissue-login": {
       "post": {
-        "description": "For someone who lost their device or their link: a fresh login link for their account.",
+        "description": "For someone who lost their device or their link: a fresh login link for their account. From a browser session only: an API key gets 403.",
         "operationId": "post_api_admin_users_user_id_reissue_login",
         "parameters": [
           {
@@ -4014,9 +4014,6 @@
         "security": [
           {
             "sessionCookie": []
-          },
-          {
-            "apiKey": []
           }
         ],
         "summary": "A new login link for an account",
@@ -6154,7 +6151,7 @@
     },
     "/api/keyring": {
       "get": {
-        "description": "The master key sealed under a key derived from your passphrase (Argon2id), stored as the client wrote it. Useless without the passphrase. 404 when no passphrase has been set.",
+        "description": "The master key sealed under a key derived from your passphrase (Argon2id), stored as the client wrote it. Useless without the passphrase. 404 when no passphrase has been set. 403 key_made_session for a browser that signed in through a link an API key made, directly or not.",
         "operationId": "get_api_keyring",
         "responses": {
           "200": {
