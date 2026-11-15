@@ -159,6 +159,20 @@ func ( handlers *Handlers ) docLimits() ( limits docstore.Limits ) {
 	return
 }
 
+// docLimitsFor is docLimits for the caller: a scoped key's writes are also
+// held to what its share may grow to.
+func ( handlers *Handlers ) docLimitsFor( c fiber.Ctx ) ( limits docstore.Limits ) {
+	limits = handlers.docLimits()
+	if scope := docScope( c ); scope != nil {
+		docs := handlers.cfg().Docs
+		limits.Share = scope.Collection
+		limits.ShareQuotaBytes = docs.ShareQuotaBytes
+		limits.ShareMaxCollections = docs.ShareMaxCollections
+		limits.NoAutoCreate = true
+	}
+	return
+}
+
 // docRefusal turns what the store said no with into an answer.
 func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 	var conflict *docstore.ConflictError
@@ -186,6 +200,10 @@ func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 		refused = refuse( fiber.StatusBadRequest , "same_place" )
 	case errors.Is( cause , docstore.ErrTooLarge ):
 		refused = refuse( fiber.StatusRequestEntityTooLarge , "doc_too_large" , fiber.Map{ "max_bytes": limits.MaxDocBytes } )
+	case errors.Is( cause , docstore.ErrShareTooMany ):
+		refused = refuse( fiber.StatusRequestEntityTooLarge , "share_too_many_collections" , fiber.Map{ "max_collections": handlers.cfg().Docs.ShareMaxCollections } )
+	case errors.Is( cause , docstore.ErrShareQuota ):
+		refused = refuse( fiber.StatusRequestEntityTooLarge , "share_quota_exceeded" , fiber.Map{ "quota_bytes": handlers.cfg().Docs.ShareQuotaBytes } )
 	case errors.Is( cause , docstore.ErrQuota ):
 		refused = refuse( fiber.StatusRequestEntityTooLarge , "quota_exceeded" , fiber.Map{ "quota_bytes": limits.QuotaBytes } )
 	case errors.Is( cause , docstore.ErrSyncExpired ):
@@ -228,12 +246,12 @@ type collectionCountedRow struct {
 type listCollectionsReply struct {
 	Collections []collectionCountedRow `json:"collections"`
 	Paged
-	TreeSeq        int64 `json:"tree_seq" jsonschema_description:"Change number of the last change to your folders; 0 if none."`
+	TreeSeq        *int64 `json:"tree_seq,omitempty" jsonschema_description:"Change number of the last change to your folders; 0 if none. Left out for an access key: it would show changes outside its folder."`
 	UsedBytes      int64 `json:"used_bytes" jsonschema_description:"All your live documents."`
 	DocCount       int   `json:"doc_count"`
-	QuotaBytes     int64 `json:"quota_bytes" jsonschema_description:"0: no quota."`
+	QuotaBytes     int64 `json:"quota_bytes" jsonschema_description:"0: no quota. For an access key, what its shared folder may hold."`
 	MaxDocBytes    int   `json:"max_doc_bytes" jsonschema_description:"Largest one document may be, in ciphertext bytes."`
-	MaxCollections int   `json:"max_collections" jsonschema_description:"Most folders an account may have."`
+	MaxCollections int   `json:"max_collections" jsonschema_description:"Most folders an account may have; for an access key, its shared folder (0: only the account's limit)."`
 	MaxDepth       int   `json:"max_depth" jsonschema_description:"How deep folders may nest; a top-level folder is depth 1."`
 }
 
@@ -278,8 +296,12 @@ func ( handlers *Handlers ) listCollections( c fiber.Ctx , in *Page ) ( reply *l
 		if collections , total , err = handlers.Docs.Collections( owner , in.Offset , limit ); err != nil { return }
 		if used , count , err = handlers.Docs.Usage( owner ); err != nil { return }
 	}
-	tree_seq , err := handlers.Docs.TreeSeq( owner )
-	if err != nil { return }
+	var tree_seq *int64
+	if docScope( c ) == nil {
+		seq , seq_err := handlers.Docs.TreeSeq( owner )
+		if seq_err != nil { return nil , seq_err }
+		tree_seq = &seq
+	}
 	rows := make( []collectionCountedRow , 0 , len( collections ) )
 	for _ , entry := range collections {
 		rows = append( rows , collectionCountedRow{ collectionRow: newCollectionRow( entry ) , Count: entry.Count , Bytes: entry.Bytes } )
@@ -295,6 +317,11 @@ func ( handlers *Handlers ) listCollections( c fiber.Ctx , in *Page ) ( reply *l
 		MaxDocBytes:    limits.MaxDocBytes,
 		MaxCollections: limits.MaxCollections,
 		MaxDepth:       limits.MaxDepth,
+	}
+	if docScope( c ) != nil {
+		// An access key sees its share's limits, not the account's.
+		docs := handlers.cfg().Docs
+		reply.QuotaBytes , reply.MaxCollections = docs.ShareQuotaBytes , docs.ShareMaxCollections
 	}
 	return
 }
@@ -316,7 +343,9 @@ func ( handlers *Handlers ) scopedCollections( owner uint64 , root string , offs
 	}
 	for _ , entry := range all {
 		if inside[ entry.ID ] == false { continue }
-		if entry.ID == root { entry.Parent = "" }
+		// The root shows at the top level, alone: where it sits among the
+		// account's own top-level folders is not the key's business.
+		if entry.ID == root { entry.Parent , entry.Position = "" , 0 }
 		used += entry.Bytes
 		count += entry.Count
 		kept = append( kept , entry )
@@ -421,7 +450,7 @@ func ( handlers *Handlers ) createCollection( c fiber.Ctx , in *createCollection
 		}
 		change.ByKey = security.APIKeyFrom( c ).ID
 	}
-	entry , create_err := handlers.Docs.CreateCollection( docOwner( c ) , id , change , handlers.docLimits() )
+	entry , create_err := handlers.Docs.CreateCollection( docOwner( c ) , id , change , handlers.docLimitsFor( c ) )
 	if create_err != nil {
 		err = handlers.docRefusal( create_err )
 		return
@@ -464,7 +493,7 @@ func ( handlers *Handlers ) updateCollection( c fiber.Ctx , in *updateCollection
 			return
 		}
 	}
-	entry , update_err := handlers.Docs.UpdateCollection( docOwner( c ) , id , change , handlers.docLimits() )
+	entry , update_err := handlers.Docs.UpdateCollection( docOwner( c ) , id , change , handlers.docLimitsFor( c ) )
 	if update_err != nil {
 		err = handlers.docRefusal( update_err )
 		return
@@ -626,8 +655,7 @@ func ( handlers *Handlers ) setDoc( c fiber.Ctx , in *setDocRequest ) ( reply *d
 		err = refused
 		return
 	}
-	limits := handlers.docLimits()
-	limits.NoAutoCreate = docScope( c ) != nil
+	limits := handlers.docLimitsFor( c )
 	doc , set_err := handlers.Docs.Set( docOwner( c ) , in.Collection , in.DocID , body , in.IfVersion , limits )
 	if set_err != nil {
 		err = handlers.docRefusal( set_err )
@@ -715,7 +743,7 @@ func ( handlers *Handlers ) moveDoc( c fiber.Ctx , in *moveDocRequest ) ( reply 
 		err = refused
 		return
 	}
-	moved , gone , move_err := handlers.Docs.MoveDoc( docOwner( c ) , in.Collection , in.DocID , in.ToCollection , to_id , body , in.IfVersion , handlers.docLimits() )
+	moved , gone , move_err := handlers.Docs.MoveDoc( docOwner( c ) , in.Collection , in.DocID , in.ToCollection , to_id , body , in.IfVersion , handlers.docLimitsFor( c ) )
 	if move_err != nil {
 		err = handlers.docRefusal( move_err )
 		return

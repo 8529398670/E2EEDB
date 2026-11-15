@@ -179,6 +179,8 @@ type DocsSection struct {
 	TombstoneDays  int `yaml:"tombstone_days"`
 	MaxCollections int `yaml:"max_collections"`
 	MaxDepth       int `yaml:"max_depth"`
+	ShareQuotaMB        int `yaml:"share_quota_mb"`
+	ShareMaxCollections int `yaml:"share_max_collections"`
 }
 
 
@@ -415,6 +417,10 @@ type DocsConfig struct {
 	TombstoneDays  int
 	MaxCollections int
 	MaxDepth       int
+	// ShareQuotaBytes and ShareMaxCollections cap what writes through one
+	// access key can grow its shared folder to (0: no cap of its own).
+	ShareQuotaBytes     int64
+	ShareMaxCollections int
 }
 
 // Defaults for a DocsConfig left at zero.
@@ -687,6 +693,8 @@ func ( file *File ) Validate() ( err error ) {
 	check( docs.TombstoneDays >= 1 && docs.TombstoneDays <= 3650 , "docs.tombstone_days must be 1-3650, got %d" , docs.TombstoneDays )
 	check( docs.MaxCollections >= 1 && docs.MaxCollections <= 100000 , "docs.max_collections must be 1-100000, got %d" , docs.MaxCollections )
 	check( docs.MaxDepth >= 1 && docs.MaxDepth <= 64 , "docs.max_depth must be 1-64, got %d" , docs.MaxDepth )
+	check( docs.ShareQuotaMB >= 0 , "docs.share_quota_mb must be 0 (no cap of its own) or more" )
+	check( docs.ShareMaxCollections >= 0 && docs.ShareMaxCollections <= 100000 , "docs.share_max_collections must be 0-100000, got %d" , docs.ShareMaxCollections )
 
 	docker := file.Docker
 	check( imagePattern.MatchString( docker.Image ) , "docker.image %q is not a valid lowercase image name" , docker.Image )
@@ -1182,6 +1190,8 @@ func docsConfig( section DocsSection ) ( docs DocsConfig ) {
 		TombstoneDays:  section.TombstoneDays,
 		MaxCollections: section.MaxCollections,
 		MaxDepth:       section.MaxDepth,
+		ShareQuotaBytes:     int64( section.ShareQuotaMB ) * 1024 * 1024,
+		ShareMaxCollections: section.ShareMaxCollections,
 	}
 	return
 }

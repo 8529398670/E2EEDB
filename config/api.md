@@ -117,13 +117,13 @@ Every collection (folder) in your account, each parent's children together in th
 | `collections[].updated_at` | string (date-time) | yes |  |  |
 | `collections[].version` | integer | yes |  | Goes up by one on every rename or move. |
 | `doc_count` | integer | yes |  |  |
-| `max_collections` | integer | yes |  | Most folders an account may have. |
+| `max_collections` | integer | yes |  | Most folders an account may have; for an access key, its shared folder (0: only the account's limit). |
 | `max_depth` | integer | yes |  | How deep folders may nest; a top-level folder is depth 1. |
 | `max_doc_bytes` | integer | yes |  | Largest one document may be, in ciphertext bytes. |
 | `next` | integer or null | yes |  | Offset of the next page, or null on the last one. |
-| `quota_bytes` | integer | yes |  | 0: no quota. |
+| `quota_bytes` | integer | yes |  | 0: no quota. For an access key, what its shared folder may hold. |
 | `total` | integer | yes |  |  |
-| `tree_seq` | integer | yes |  | Change number of the last change to your folders; 0 if none. |
+| `tree_seq` | integer or null | no |  | Change number of the last change to your folders; 0 if none. Left out for an access key: it would show changes outside its folder. |
 | `used_bytes` | integer | yes |  | All your live documents. |
 
 ### POST /api/collections

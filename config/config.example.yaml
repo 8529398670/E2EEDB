@@ -244,6 +244,11 @@ docs:
   tombstone_days: 30               # how long deletes stay visible to syncing clients [live]
   max_collections: 2000            # folders per account [live]
   max_depth: 16                    # how deep folders may nest [live]
+  # What writes through one access key (a shared folder) may grow that
+  # folder to, so whoever it was shared with cannot use up the account's
+  # quota or folder limit. 0 = only the account's limits. [live]
+  share_quota_mb: 100              # live documents in the shared folder and under it [live]
+  share_max_collections: 200       # folders in the shared folder, itself included [live]
 
 
 

@@ -30,18 +30,32 @@ func ( client *Client ) cached( collection string ) ( key *CollectionKey ) {
 	return
 }
 
-// madeByShare is whether collection was seen, when its keys were found, to
-// have been made through an access token.
-func ( client *Client ) madeByShare( collection string ) bool {
+// isOwned is whether collection's lockbox, when its keys were opened, held
+// this client's owner tag (Key.ownTag).
+func ( client *Client ) isOwned( collection string ) bool {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
-	return client.byShare[ collection ]
+	return client.owned[ collection ]
 }
 
-func ( client *Client ) remember( key *CollectionKey ) {
+// remember keeps key, and whether the master key made it.
+func ( client *Client ) remember( key *CollectionKey , owned bool ) {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
 	client.keys[ key.collection ] = key
+	client.owned[ key.collection ] = owned
+}
+
+// ownTag is the owner tag for key, "" for a scoped client.
+func ( client *Client ) ownTag( key *CollectionKey ) string {
+	if client.key == nil { return "" }
+	return client.key.ownTag( key.collection , key.id[ : ] )
+}
+
+// rememberLock keeps key, opened from lock: owned if lock holds this
+// client's tag.
+func ( client *Client ) rememberLock( key *CollectionKey , lock string ) {
+	client.remember( key , client.key != nil && client.key.owns( lock , key.collection ) )
 }
 
 // tree is every collection this client can see, by id.
@@ -96,14 +110,11 @@ func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collect
 		key , err = client.createTopLevel( ctx , id )
 		return
 	}
-	client.mutex.Lock()
-	client.byShare[ id ] = entry.ByKey != ""
-	client.mutex.Unlock()
 	holder , err := client.holder( ctx , tree , entry.Parent , create )
 	if err != nil { return }
 	if entry.Lock != "" {
 		if key , err = openLock( entry.Lock , id , holder ); err == nil {
-			client.remember( key )
+			client.rememberLock( key , entry.Lock )
 		}
 		return
 	}
@@ -112,7 +123,13 @@ func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collect
 		return
 	}
 	if key , err = generateCollectionKey( id ); err != nil { return }
-	lock , err := sealLock( key , holder )
+	// Fresh keys for a folder someone else made: the master key tags them
+	// only at the top level, where it alone holds them. Under a parent, the
+	// folder could be anyone's who holds the parent's keys (a sharee's, put
+	// there with no lockbox by a server), so it stays untagged.
+	own := ""
+	if entry.Parent == "" { own = client.ownTag( key ) }
+	lock , err := sealLock( key , holder , own )
 	if err != nil { return }
 	err = client.call( ctx , http.MethodPost , collectionPath( id ) , map[string]any{ "lock": lock } , nil )
 	var refused *APIError
@@ -124,10 +141,11 @@ func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collect
 			err = fmt.Errorf( "%w: collection %s lost its keys" , ErrCorrupt , id )
 			return
 		}
-		key , err = openLock( entry.Lock , id , holder )
+		lock = entry.Lock
+		key , err = openLock( lock , id , holder )
 	}
 	if err == nil {
-		client.remember( key )
+		client.rememberLock( key , lock )
 	}
 	return
 }
@@ -160,7 +178,7 @@ func ( client *Client ) holder( ctx context.Context , tree map[ string ]Collecti
 // after the id, or "id (2)" and so on when that name is taken.
 func ( client *Client ) createTopLevel( ctx context.Context , id string ) ( key *CollectionKey , err error ) {
 	if key , err = generateCollectionKey( id ); err != nil { return }
-	lock , err := sealLock( key , client.key )
+	lock , err := sealLock( key , client.key , client.ownTag( key ) )
 	if err != nil { return }
 	name := id
 	for n := 2 ; ; n++ {
@@ -182,7 +200,7 @@ func ( client *Client ) createTopLevel( ctx context.Context , id string ) ( key 
 		return
 	}
 	if err == nil {
-		client.remember( key )
+		client.remember( key , true )
 	}
 	return
 }

@@ -77,10 +77,20 @@ Known limits, by design:
 - **Sharing with write access lets someone add folders.** Whoever holds a
   read/write access key can make folders inside the shared one. They always
   get random ids, and the Go client refuses to write your own documents into
-  them unless asked to. Making a folder with an id that is already taken is
+  them unless asked to. It knows them by the owner tag in each lockbox,
+  which only your master key makes, not by anything the server says. The
+  Documents screen marks them in the folder list once your key is unlocked.
+  Making a folder with an id that is already taken is
   refused, so someone who already knows one of your folder ids can learn that
   it exists, even outside what you shared. Ids are random and never shown to
-  them, so they would have to get it some other way.
+  them, so they would have to get it some other way. What a key adds is
+  capped (`docs.share_quota_mb`, `docs.share_max_collections`), so it cannot
+  use up your quota or folder limit. You can still add to a shared folder
+  past that cap.
+- **An access key sees that you are busy elsewhere.** Change numbers count
+  every change in the account, so the gaps in what an access key syncs show
+  how much changed outside its folder, though not where or what. Each account
+  has its own counter, so nobody sees another account's activity.
 - **The web page trusts the server it came from.** The browser runs the
   JavaScript the server sends, so a dishonest server could send a page that
   takes the master key (or an access token) as you type it. Only the Go client,
@@ -138,9 +148,11 @@ Whoever gets it pastes it under **Have an access key?** on the signed-out page
 scoped key cannot move, delete or leave its own collection, or make one at the
 top level. It can make, move and delete collections inside its own, always
 with random ids (22 characters, as `client.NewID()` makes), so it cannot take
-an id your own code writes to by name. A collection made that way says so
-(`by_key`), and the Go client will not write your documents into one unless
-you pass `client.AllowShared()` (`ErrSharedCollection` otherwise).
+an id your own code writes to by name. A collection made that way has no
+owner tag in its lockbox (see "Lockboxes"), and the Go client will not write
+your documents into one unless you pass `client.AllowShared()`
+(`ErrSharedCollection` otherwise). The server also reports it (`by_key`), but
+neither client goes by that: a dishonest server could leave it out.
 
 Sharing first gives every collection in the subtree its keys, and seals any
 private envelope in it (which only the master key opens) again as a
@@ -190,7 +202,8 @@ change number N, oldest first and without bodies. Start from 0. Keep calling
 with `next_since` while `more` is true, and store `next_since` for next time.
 A deleted document shows up once with `deleted: true` and is purged after
 `docs.tombstone_days`. A client that last synced before that gets
-`410 sync_expired` and starts again from 0.
+`410 sync_expired` and starts again from 0. Change numbers are counted per
+account.
 
 ### Conditional writes
 
@@ -300,10 +313,26 @@ lock_seed = BLAKE2b-256( key = M , message = "e2eedb/lock/sign-seed" )
 sig       = Ed25519-sign( holder , "e2eedb/lock/sign" || 0x00 || c || 0x00 || parent || 0x00 || key_id || nonce_r || read || nonce_w || write )
 ```
 
+A collection whose keys the master key made also carries the owner tag
+`own`, which only the master key can make or check:
+
+```
+own = BLAKE2b-256( key = M , message = "e2eedb/lock/own" || 0x00 || c || 0x00 || key_id )
+```
+
 ```json
 {"parent":"<parent id, or \"\">","by":"<holder's key id>","key_id":"<c's key id>",
- "nonce_r":"…","read":"…","nonce_w":"…","write":"…","sig":"…"}
+ "nonce_r":"…","read":"…","nonce_w":"…","write":"…","sig":"…","own":"…"}
 ```
+
+`sig` does not cover `own`, so a re-wrap for a move carries it over unchanged,
+whoever does the move. It names `c` and `key_id`, not the parent, so it stays
+true, and copying it onto other keys makes it fail. Clients add it when they
+make a collection with the master key in hand. They leave it out when they
+give keys to an existing folder that has none, unless that folder is at the
+top level: under a parent, such a folder could be anyone's who holds the
+parent's keys. A master-key client treats a collection without a valid `own`
+as made through an access token.
 
 Every reader checks `sig` before opening `read`, and a lockbox without a valid
 one opens for nobody. A read-only key holds the parent's `vk` but not its
@@ -354,6 +383,10 @@ for an admin's key, since admin rights here only decide who gets in.
 Data lives in `~/.config/e2eedb/`: `app.db` (bbolt: accounts, sessions,
 keys) and `docs.db` (SQLite: documents). `manage backup` and the scheduled
 backup include both. `docs:` in `config/config.yaml` sets the largest document
-(`max_doc_kb`), the per-account quota (`quota_mb`), and how long deletes stay
-visible to syncing clients (`tombstone_days`). The hourly `docs` job purges old
+(`max_doc_kb`), the per-account quota (`quota_mb`), how long deletes stay
+visible to syncing clients (`tombstone_days`), and how much writes through one
+access key may grow its shared folder (`share_quota_mb`,
+`share_max_collections`; 0 leaves only the account's limits). An access key
+that reaches either cap, or the account's own, gets `413
+share_quota_exceeded` or `413 share_too_many_collections`. The hourly `docs` job purges old
 tombstones and the documents of deleted accounts.

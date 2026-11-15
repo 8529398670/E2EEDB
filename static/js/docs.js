@@ -115,8 +115,12 @@ const Docs = {
     } else {
       if ( !create ) throw DocsCrypto.fail( "corrupt" );
       key = DocsCrypto.generateCollectionKey( collection );
+      // Tagged as the owner's only at the top level, as the Go client does:
+      // under a parent, a folder with no lockbox could be anyone's who holds
+      // the parent's keys.
+      const own = folder.parent === "" ? this.ownTag( key ) : "";
       try {
-        const done = await Api.updateCollection( collection , { lock: DocsCrypto.sealLock( key , holder ) } );
+        const done = await Api.updateCollection( collection , { lock: DocsCrypto.sealLock( key , holder , null , null , own ) } );
         folder.lock = done.lock;
       } catch ( error ) {
         if ( !( error.payload && error.payload.error === "lock_exists" ) ) throw error;
@@ -143,13 +147,29 @@ const Docs = {
     if ( !this.hasKey() ) return null;
     const holder = await this.holderFor( parent , true );
     const key = DocsCrypto.generateCollectionKey( id );
-    return { key: key , lock: DocsCrypto.sealLock( key , holder ) };
+    return { key: key , lock: DocsCrypto.sealLock( key , holder , null , null , this.ownTag( key ) ) };
+  },
+
+  // The owner tag for keys this screen made, "" without the master key.
+  ownTag( key ) {
+    return this.key ? DocsCrypto.ownTag( this.key , key.collection , key.id ) : "";
+  },
+
+  // Whether folder's keys were made through an access token rather than with
+  // the master key: its lockbox has no owner tag. Only the master key can
+  // tell; false without it, and for a folder with no keys yet.
+  madeByShare( folder ) {
+    if ( !this.key || !folder.lock ) return false;
+    if ( !this.ownedLocks ) this.ownedLocks = new Map();
+    const at = folder.id + "\n" + folder.lock;
+    if ( !this.ownedLocks.has( at ) ) this.ownedLocks.set( at , DocsCrypto.owns( this.key , folder.lock , folder.id ) );
+    return !this.ownedLocks.get( at );
   },
 
   // A top-level collection with keys, named after its id (or "id (2)"...).
   async createTopLevel( id ) {
     const key = DocsCrypto.generateCollectionKey( id );
-    const lock = DocsCrypto.sealLock( key , this.key );
+    const lock = DocsCrypto.sealLock( key , this.key , null , null , this.ownTag( key ) );
     for ( let n = 1; ; n++ ) {
       try {
         await Api.createCollection( { id: id , name: n === 1 ? id : id + " (" + n + ")" , lock: lock } );
@@ -169,7 +189,9 @@ const Docs = {
     const folder = DocsTree.get( id );
     if ( !folder || !folder.lock ) return null;
     const key = await this.keyFor( id , false );
-    return DocsCrypto.sealLock( key , await this.holderFor( parent , true ) );
+    // The owner tag goes along as it was: a move does not change who made
+    // the keys.
+    return DocsCrypto.sealLock( key , await this.holderFor( parent , true ) , null , null , DocsCrypto.lockOwn( folder.lock ) );
   },
 
   // A body (base64 envelope) in, JSON text out: a private envelope with the
@@ -285,6 +307,14 @@ const Docs = {
     }
     if ( error.payload && error.payload.error === "doc_too_large" ) return this.say( "docs.error_too_large" , { size: this.size( error.payload.max_bytes ) } );
     if ( error.payload && error.payload.error === "quota_exceeded" ) return this.say( "docs.error_quota" , { size: this.size( error.payload.quota_bytes ) } );
+    // With no cap of the share's own (0), the account's limit was hit:
+    // the answer does not say what it is.
+    if ( error.payload && error.payload.error === "share_quota_exceeded" ) {
+      return error.payload.quota_bytes ? this.say( "docs.error_share_quota" , { size: this.size( error.payload.quota_bytes ) } ) : I18n.get( "docs.error_share_full" );
+    }
+    if ( error.payload && error.payload.error === "share_too_many_collections" ) {
+      return error.payload.max_collections ? this.say( "docs.error_share_too_many" , { count: error.payload.max_collections } ) : I18n.get( "docs.error_share_full" );
+    }
     return error.message;
   },
 
@@ -332,7 +362,10 @@ const Docs = {
   unlockWith( key ) {
     this.key = key;
     this.folderKeys.clear();
+    this.ownedLocks = null;
     this.renderLock();
+    // The tree can now mark folders made through an access key.
+    DocsTree.render();
     // The document list can now say which ones this key opens.
     if ( this.collection ) this.refreshDocs();
     const link = this.pendingLink;
@@ -414,9 +447,11 @@ const Docs = {
     }
     this.key = null;
     this.folderKeys.clear();
+    this.ownedLocks = null;
     this.hideShared();
     this.closeEditor();
     this.renderLock();
+    DocsTree.render();
     if ( this.collection ) this.refreshDocs();
   },
 

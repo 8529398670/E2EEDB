@@ -57,8 +57,13 @@ page.sodium.ready.then( () => {
   check( "verify key" , C.b64( notes.verify ) === vectors.verify_key );
   check( "read key id" , C.b64( notes.id ) === vectors.read_key_id );
   check( "collection seal" , C.sealCollection( notes , vectors.doc_id , vectors.plaintext , nonce ) === vectors.envelope_collection );
-  check( "lockbox seal" , C.sealLock( notes , master , nonce , nonce_w ) === vectors.lockbox );
-  check( "child lockbox seal" , C.sealLock( child , notes , nonce , nonce_w ) === vectors.child_lockbox );
+  check( "lockbox seal" , C.sealLock( notes , master , nonce , nonce_w , C.ownTag( master , notes.collection , notes.id ) ) === vectors.lockbox );
+  check( "child lockbox seal" , C.sealLock( child , notes , nonce , nonce_w , C.ownTag( master , child.collection , child.id ) ) === vectors.child_lockbox );
+  // The owner tag: the master key's, for these keys only.
+  check( "owner tag" , C.owns( master , vectors.lockbox , vectors.collection ) && C.owns( master , vectors.child_lockbox , vectors.child ) );
+  check( "owner tag elsewhere" , !C.owns( master , vectors.lockbox , vectors.child ) && !C.owns( C.keyFrom( new Bytes( 32 ).fill( 9 ) ) , vectors.lockbox , vectors.collection ) );
+  const squat = C.generateCollectionKey( vectors.child );
+  check( "owner tag copied onto other keys" , !C.owns( master , C.sealLock( squat , notes , null , null , C.lockOwn( vectors.child_lockbox ) ) , vectors.child ) );
   check( "token" , C.makeToken( vectors.api_key , C.readOnly( notes ) ) === vectors.access_token_read_only );
 
   // And opening what Go wrote.

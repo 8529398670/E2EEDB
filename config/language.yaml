@@ -137,6 +137,9 @@ docs:
   error_conflict: "Changed somewhere else since you opened it (now version {version}). Reopen it to see the latest."
   error_too_large: "Too large: one document can be at most {size} encrypted."
   error_quota: "Over your quota of {size}."
+  error_share_quota: "This shared collection is full: it can hold {size} of documents through an access key."
+  error_share_full: "This shared collection is full."
+  error_share_too_many: "This shared collection is full: it can hold at most {count} collections through an access key."
   # Folders: collections inside collections (static/js/docs_tree.js).
   docs_heading_none: "Documents"
   docs_none: "Choose a collection to see its documents."
@@ -153,6 +156,7 @@ docs:
   folder_delete: "Delete"
   folder_actions: "Actions for {name}"
   folder_count: "{count} documents in this collection"
+  folder_by_share: "Not made with your key: made through an access key, so whoever holds that key knows its keys"
   folder_top: "Top level"
   folder_top_drop: "Drop here to move to the top level"
   folder_delete_question: "Delete {name} and the {docs} documents in it?"

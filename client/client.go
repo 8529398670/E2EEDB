@@ -96,7 +96,9 @@ type Collection struct {
 	// cannot.
 	Lock string `json:"lock,omitempty"`
 	// ByKey is set when the folder was made through an access token (a
-	// scoped API key), not by the account itself.
+	// scoped API key), not by the account itself. The server says so, so it
+	// is only for showing: a master-key client checks the lockbox's owner
+	// tag instead (AllowShared).
 	ByKey string `json:"by_key,omitempty"`
 }
 
@@ -129,10 +131,10 @@ type Client struct {
 
 	mutex sync.Mutex
 	keys  map[ string ]*CollectionKey // opened lockboxes, by collection
-	// byShare is the collections seen to have been made through an access
-	// token (Collection.ByKey), which a master-key client does not write
-	// into unless asked to (AllowShared).
-	byShare map[ string ]bool
+	// owned is the collections whose lockbox carries the master key's owner
+	// tag: the ones a master-key client made. It does not write into the
+	// others unless asked to (AllowShared).
+	owned map[ string ]bool
 }
 
 // Option changes how a Client is made.
@@ -165,7 +167,7 @@ func NewScoped( baseURL string , token string , options ...Option ) ( client *Cl
 }
 
 func newClient( baseURL string , apiKey string , key *Key , options []Option ) ( client *Client ) {
-	client = &Client{ base: strings.TrimRight( baseURL , "/" ) , apiKey: apiKey , key: key , http: &http.Client{ Timeout: 30 * time.Second } , keys: map[ string ]*CollectionKey{} , byShare: map[ string ]bool{} }
+	client = &Client{ base: strings.TrimRight( baseURL , "/" ) , apiKey: apiKey , key: key , http: &http.Client{ Timeout: 30 * time.Second } , keys: map[ string ]*CollectionKey{} , owned: map[ string ]bool{} }
 	for _ , option := range options {
 		option( client )
 	}
@@ -193,25 +195,28 @@ type writeOptions struct {
 	allowShared bool
 }
 
-// AllowShared lets a master-key client write into a collection that was made
-// through an access token. Without it such a write is ErrSharedCollection:
-// someone holding a read/write access token can make a folder inside the one
-// shared with them, and a service writing to a collection by id must not
-// end up sealing its documents with keys that person holds.
+// AllowShared lets a master-key client write into a collection whose keys the
+// master key did not make: one made through an access token. Without it such
+// a write is ErrSharedCollection: someone holding a read/write access token
+// can make a folder inside the one shared with them, and a service writing to
+// a collection by id must not end up sealing its documents with keys that
+// person made. Which keys the master key made is told by the owner tag in
+// each lockbox, which only the master key can make, so a server cannot hide
+// a sharee's folder by leaving out by_key.
 func AllowShared() WriteOption {
 	return func( options *writeOptions ) { options.allowShared = true }
 }
 
-// ErrSharedCollection: the collection written to was made through an access
-// token, so its keys are known to that token's holder. Pass AllowShared to
-// write there anyway.
-var ErrSharedCollection = errors.New( "e2eedb: this collection was made through an access token; pass AllowShared to write into it" )
+// ErrSharedCollection: the collection written to has keys this master key did
+// not make (it was made through an access token), so someone else made them.
+// Pass AllowShared to write there anyway.
+var ErrSharedCollection = errors.New( "e2eedb: this collection was not made with this master key (made through an access token?); pass AllowShared to write into it" )
 
 // writeKey is the key a write to collection seals with, refusing a
 // collection made through an access token unless options allow it.
 func ( client *Client ) writeKey( ctx context.Context , collection string , options []WriteOption ) ( key *CollectionKey , err error ) {
 	if key , err = client.CollectionKey( ctx , collection , true ); err != nil { return }
-	if client.key != nil && client.madeByShare( collection ) && writeOpts( options ).allowShared == false {
+	if client.key != nil && client.isOwned( collection ) == false && writeOpts( options ).allowShared == false {
 		key , err = nil , ErrSharedCollection
 	}
 	return
@@ -381,14 +386,14 @@ func ( client *Client ) CreateCollection( ctx context.Context , folder NewCollec
 	if err != nil { return }
 	key , err := generateCollectionKey( folder.ID )
 	if err != nil { return }
-	lock , err := sealLock( key , holder )
+	lock , err := sealLock( key , holder , client.ownTag( key ) )
 	if err != nil { return }
 	request := map[string]any{ "id": folder.ID , "lock": lock }
 	if folder.Name != "" { request[ "name" ] = folder.Name }
 	if folder.Parent != "" { request[ "parent" ] = folder.Parent }
 	if folder.Before != "" { request[ "before" ] = folder.Before }
 	if err = client.call( ctx , http.MethodPost , "/api/collections" , request , &collection ); err != nil { return }
-	client.remember( key )
+	client.remember( key , client.key != nil )
 	return
 }
 
@@ -414,7 +419,9 @@ func ( client *Client ) MoveCollection( ctx context.Context , id string , parent
 		if key_err != nil { return collection , key_err }
 		holder , holder_err := client.holder( ctx , tree , parent , true )
 		if holder_err != nil { return collection , holder_err }
-		lock , lock_err := sealLock( key , holder )
+		// The owner tag goes along as it was: a move does not change who
+		// made the keys.
+		lock , lock_err := sealLock( key , holder , lockOwn( entry.Lock ) )
 		if lock_err != nil { return collection , lock_err }
 		request[ "lock" ] = lock
 	}

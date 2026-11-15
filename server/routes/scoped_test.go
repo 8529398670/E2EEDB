@@ -248,3 +248,57 @@ func bornOf( t *testing.T , fixture *authFixture , collection string ) int64 {
 	if err != nil { t.Fatal( err ) }
 	return entry.Born
 }
+
+// An access key sees its share, not the account: no account-wide tree_seq,
+// its root at position 0, the share's limits, and the share's errors even
+// when the account's own limits are what refused it.
+func TestScopedKeysSeeOnlyTheirShare( t *testing.T ) {
+	fixture := newAuthFixture( t )
+	base := serve( t , fixture )
+	api_key := issueKey( t , fixture , fixture.alice , models.RoleUser )
+	master_text , _ := client.GenerateKey()
+	owner , err := client.New( base , api_key , master_text )
+	if err != nil { t.Fatal( err ) }
+	ctx := context.Background()
+	for _ , id := range []string{ "first" , "second" , "shared" } {
+		if _ , err = owner.CreateCollection( ctx , client.NewCollection{ ID: id } ); err != nil { t.Fatal( err ) }
+	}
+	write_key , err := owner.PrepareShare( ctx , "shared" , true )
+	if err != nil { t.Fatal( err ) }
+	scoped_api , _ , err := models.IssueScopedAPIKey( fixture.store , fixture.alice.ID , "sharee" , models.KeyScope{ Collection: "shared" , Write: true , Born: bornOf( t , fixture , "shared" ) } , time.Hour )
+	if err != nil { t.Fatal( err ) }
+	token , _ := client.NewAccessToken( scoped_api , write_key )
+	sharee , err := client.NewScoped( base , token )
+	if err != nil { t.Fatal( err ) }
+
+	fixture.cfg.Docs = fixture.cfg.Docs.Limits()
+	fixture.cfg.Docs.ShareMaxCollections = 2
+	fixture.cfg.Docs.ShareQuotaBytes = 1000
+
+	status , reply := fixture.withKey( t , api_key , fiber.MethodGet , "/api/collections" , nil )
+	if _ , found := reply[ "tree_seq" ]; status != 200 || found == false { t.Fatalf( "owner list: %d %v" , status , reply ) }
+	status , reply = fixture.withKey( t , scoped_api , fiber.MethodGet , "/api/collections" , nil )
+	if status != 200 { t.Fatalf( "scoped list: %d %v" , status , reply ) }
+	if _ , found := reply[ "tree_seq" ]; found { t.Fatalf( "an access key got the account's tree_seq: %v" , reply ) }
+	if reply[ "max_collections" ] != float64( 2 ) || reply[ "quota_bytes" ] != float64( 1000 ) { t.Fatalf( "scoped limits: %v" , reply ) }
+	rows , _ := reply[ "collections" ].( []any )
+	if len( rows ) != 1 || rows[ 0 ].( map[ string ]any )[ "position" ] != float64( 0 ) { t.Fatalf( "scoped root row: %v" , rows ) }
+
+	// Two folders in the share, then no more through the key...
+	if _ , err = sharee.CreateCollection( ctx , client.NewCollection{ Name: "one" , Parent: "shared" } ); err != nil { t.Fatal( err ) }
+	_ , err = sharee.CreateCollection( ctx , client.NewCollection{ Name: "two" , Parent: "shared" } )
+	var refused *client.APIError
+	if errors.As( err , &refused ) == false || refused.Message != "share_too_many_collections" { t.Fatalf( "past the share's folders: %v" , err ) }
+	// ...while the owner may still add to it.
+	if _ , err = owner.CreateCollection( ctx , client.NewCollection{ ID: "owners" , Parent: "shared" } ); err != nil { t.Fatalf( "owner folder in the share: %v" , err ) }
+	// Bytes: a big document is refused with the share's error.
+	big := strings.Repeat( "x" , 1200 )
+	if _ , err = sharee.Set( ctx , "shared" , "big" , map[ string ]string{ "x": big } ); errors.As( err , &refused ) == false || refused.Message != "share_quota_exceeded" {
+		t.Fatalf( "past the share's bytes: %v" , err )
+	}
+	// The account full: the key hears the share's error, not the account's.
+	fixture.cfg.Docs.ShareMaxCollections = 0
+	fixture.cfg.Docs.MaxCollections = 5
+	status , reply = fixture.withKey( t , scoped_api , fiber.MethodPost , "/api/collections" , fiber.Map{ "name": "three" , "parent": "shared" } )
+	if status != 413 || reply[ "error" ] != "share_too_many_collections" || reply[ "max_collections" ] != float64( 0 ) { t.Fatalf( "account full, scoped: %d %v" , status , reply ) }
+}

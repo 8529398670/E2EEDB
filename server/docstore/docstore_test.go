@@ -196,3 +196,47 @@ func TestListByteBudget( t *testing.T ) {
 	docs , _ , _ = store.List( 1 , "notes" , 0 , 100 , false , 1000 )
 	if len( docs ) != 3 { t.Fatalf( "metadata only is not budgeted: %d" , len( docs ) ) }
 }
+
+// Each account counts its own changes: another account's writes leave no
+// gap in its numbers, and a purge in one account expires no sync in another.
+func TestChangeNumbersPerAccount( t *testing.T ) {
+	store , _ := open( t )
+	first , _ := store.Set( 1 , "n" , "a" , envelope( 1 , 60 ) , nil , limits )
+	for n := 0 ; n < 5 ; n++ {
+		store.Set( 2 , "n" , "x" , envelope( byte( n ) , 60 ) , nil , limits )
+	}
+	second , err := store.Set( 1 , "n" , "b" , envelope( 1 , 60 ) , nil , limits )
+	if err != nil || first.Seq != 1 || second.Seq != 2 { t.Fatalf( "account 1 numbers: %d %d %v" , first.Seq , second.Seq , err ) }
+	if mine , _ := store.Set( 2 , "n" , "y" , envelope( 1 , 60 ) , nil , limits ); mine.Seq != 6 { t.Fatalf( "account 2 number %d, want 6" , mine.Seq ) }
+
+	store.Delete( 2 , "n" , "y" , nil )
+	if _ , err = store.Sweep( time.Now().Add( 31 * 24 * time.Hour ) , 30 , func( uint64 ) bool { return true } ); err != nil { t.Fatal( err ) }
+	if _ , _ , err = store.Changes( 2 , 1 , 10 ); errors.Is( err , ErrSyncExpired ) == false { t.Fatalf( "account 2 after its purge: %v" , err ) }
+	if _ , _ , err = store.Changes( 1 , 1 , 10 ); err != nil { t.Fatalf( "account 1 expired by account 2's purge: %v" , err ) }
+}
+
+// A scoped write is held to its share's limits, and the account's own limits
+// answer it with the share's errors.
+func TestShareLimits( t *testing.T ) {
+	store , _ := open( t )
+	plenty := Limits{ MaxDocBytes: 1024 }
+	for _ , folder := range []struct{ id , parent string }{ { "shared" , "" } , { "inner" , "shared" } , { "other" , "" } } {
+		if _ , err := store.CreateCollection( 1 , folder.id , CollectionChange{ Parent: &folder.parent } , plenty ); err != nil { t.Fatal( err ) }
+	}
+	store.Set( 1 , "other" , "big" , envelope( 1 , 500 ) , nil , plenty )
+	inner := "inner"
+	share := Limits{ MaxDocBytes: 1024 , Share: "shared" , ShareQuotaBytes: 150 , ShareMaxCollections: 3 , NoAutoCreate: true }
+	if _ , err := store.Set( 1 , "inner" , "a" , envelope( 1 , 100 ) , nil , share ); err != nil { t.Fatalf( "within the share: %v" , err ) }
+	if _ , err := store.Set( 1 , "shared" , "b" , envelope( 1 , 60 ) , nil , share ); errors.Is( err , ErrShareQuota ) == false { t.Fatalf( "past the share's bytes: %v" , err ) }
+	// Rewriting a document counts it once.
+	if _ , err := store.Set( 1 , "inner" , "a" , envelope( 2 , 140 ) , nil , share ); err != nil { t.Fatalf( "rewrite within the share: %v" , err ) }
+	if _ , err := store.CreateCollection( 1 , "third" , CollectionChange{ Parent: &inner } , share ); err != nil { t.Fatalf( "third folder: %v" , err ) }
+	if _ , err := store.CreateCollection( 1 , "fourth" , CollectionChange{ Parent: &inner } , share ); errors.Is( err , ErrShareTooMany ) == false { t.Fatalf( "past the share's folders: %v" , err ) }
+	// The owner is held only to the account's limits.
+	if _ , err := store.CreateCollection( 1 , "fourth" , CollectionChange{ Parent: &inner } , plenty ); err != nil { t.Fatalf( "owner folder: %v" , err ) }
+	// The account full: a scoped write hears the share's error.
+	full := share
+	full.ShareQuotaBytes , full.ShareMaxCollections , full.QuotaBytes , full.MaxCollections = 0 , 0 , 700 , 5
+	if _ , err := store.CreateCollection( 1 , "fifth" , CollectionChange{ Parent: &inner } , full ); errors.Is( err , ErrShareTooMany ) == false { t.Fatalf( "account folders full: %v" , err ) }
+	if _ , err := store.Set( 1 , "inner" , "c" , envelope( 1 , 100 ) , nil , full ); errors.Is( err , ErrShareQuota ) == false { t.Fatalf( "account quota full: %v" , err ) }
+}

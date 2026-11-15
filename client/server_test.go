@@ -67,7 +67,7 @@ func TestEachRefusesForeignRow( t *testing.T ) {
 func TestPrepareShareRefusesForeignRow( t *testing.T ) {
 	encoded , key := testKey( t )
 	folder , _ := generateCollectionKey( "shared" )
-	lock , err := sealLock( folder , key )
+	lock , err := sealLock( folder , key , "" )
 	if err != nil { t.Fatal( err ) }
 	secret , _ := key.Seal( "private" , "diary" , []byte( `{"secret":1}` ) )
 	var leaked []string
@@ -107,4 +107,44 @@ func TestParentCycleIsCorrupt( t *testing.T ) {
 	if _ , err := store.CollectionKey( context.Background() , "A" , false ); errors.Is( err , ErrCorrupt ) == false {
 		t.Fatalf( "CollectionKey = %v, want ErrCorrupt" , err )
 	}
+}
+
+// A server that leaves out by_key cannot hide a sharee's folder: the owner's
+// client goes by the owner tag in the lockbox, which a sharee cannot make. A
+// write by id into an untagged folder is refused; a tagged one is written.
+func TestOwnerTagNotServerTrust( t *testing.T ) {
+	encoded , key := testKey( t )
+	shared , _ := generateCollectionKey( "shared" )
+	shared_lock , _ := sealLock( shared , key , key.ownTag( "shared" , shared.id[ : ] ) )
+	// The sharee's folder, under an id a service writes to, by_key left out.
+	squat , _ := generateCollectionKey( "invoices" )
+	squat_lock , _ := sealLock( squat , shared , "" )
+	mine , _ := generateCollectionKey( "reports" )
+	mine_lock , _ := sealLock( mine , shared , key.ownTag( "reports" , mine.id[ : ] ) )
+	var wrote []string
+	server := fakeServer( t , func( w http.ResponseWriter , r *http.Request ) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/collections":
+			json.NewEncoder( w ).Encode( map[string]any{ "collections": []any{
+				map[string]any{ "id": "shared" , "name": "shared" , "lock": shared_lock } ,
+				map[string]any{ "id": "invoices" , "name": "invoices" , "parent": "shared" , "lock": squat_lock } ,
+				map[string]any{ "id": "reports" , "name": "reports" , "parent": "shared" , "lock": mine_lock } ,
+			} } )
+		case r.Method == http.MethodPost && strings.Contains( r.URL.Path , "/docs/" ):
+			wrote = append( wrote , r.URL.Path )
+			json.NewEncoder( w ).Encode( map[string]any{ "version": 1 } )
+		default:
+			http.NotFound( w , r )
+		}
+	} )
+	owner , err := New( server.URL , "kid.secret" , encoded )
+	if err != nil { t.Fatal( err ) }
+	ctx := context.Background()
+	if _ , err = owner.Set( ctx , "invoices" , "x" , map[string]any{ "secret": 1 } ); errors.Is( err , ErrSharedCollection ) == false {
+		t.Fatalf( "write into an untagged folder: %v" , err )
+	}
+	if len( wrote ) != 0 { t.Fatalf( "sent %v" , wrote ) }
+	if _ , err = owner.Set( ctx , "reports" , "x" , map[string]any{ "n": 1 } ); err != nil { t.Fatalf( "write into a tagged folder: %v" , err ) }
+	if _ , err = owner.Set( ctx , "invoices" , "y" , map[string]any{ "n": 2 } , AllowShared() ); err != nil { t.Fatalf( "AllowShared: %v" , err ) }
+	if len( wrote ) != 2 { t.Fatalf( "sent %v" , wrote ) }
 }

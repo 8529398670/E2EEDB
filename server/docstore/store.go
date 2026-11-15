@@ -38,6 +38,9 @@ var (
 	ErrConflict    = errors.New( "version_conflict" )
 	ErrTooLarge    = errors.New( "doc_too_large" )
 	ErrQuota       = errors.New( "quota_exceeded" )
+	// ErrShareQuota: a scoped key's write would take its folder past what a
+	// share may hold (Limits.ShareQuotaBytes).
+	ErrShareQuota  = errors.New( "share_quota_exceeded" )
 	ErrSyncExpired = errors.New( "sync_expired" )
 )
 
@@ -118,7 +121,9 @@ func Snapshot( path string , out string ) ( err error ) {
 // many have run. Append; never edit one that has shipped.
 var migrations = []string{
 	// docs: every document and tombstone. keyrings: each account's wrapped
-	// master key. collections: the folder tree. lock is a folder's lockbox,
+	// master key. counters: each account's change numbers and purge horizon
+	// (one counter per account, so nobody's numbers show another account's
+	// writes). collections: the folder tree. lock is a folder's lockbox,
 	// opaque text the client wraps (README.md, "Crypto format"), "" for none
 	// yet. by_key is the id of the scoped API key that made it ("" when the
 	// account itself did), so a client can refuse to write into a folder
@@ -144,11 +149,11 @@ var migrations = []string{
 		version    INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL
 	);
-	CREATE TABLE meta (
-		key   TEXT PRIMARY KEY,
-		value INTEGER NOT NULL
+	CREATE TABLE counters (
+		user_id INTEGER PRIMARY KEY,
+		seq     INTEGER NOT NULL DEFAULT 0,
+		horizon INTEGER NOT NULL DEFAULT 0
 	);
-	INSERT INTO meta ( key , value ) VALUES ( 'seq' , 0 ) , ( 'horizon' , 0 );
 	CREATE TABLE collections (
 		user_id    INTEGER NOT NULL,
 		id         TEXT    NOT NULL,
@@ -203,9 +208,11 @@ func ( store *Store ) write( fn func( tx *sql.Tx ) error ) ( err error ) {
 	return
 }
 
-// nextSeq is the next change number, shared by every account: one counter is
-// simpler than one each, and a client only ever compares its own numbers.
-func nextSeq( tx *sql.Tx ) ( seq int64 , err error ) {
-	err = tx.QueryRow( "UPDATE meta SET value = value + 1 WHERE key = 'seq' RETURNING value" ).Scan( &seq )
+// nextSeq is the account's next change number. Each account has its own
+// counter: one shared by all would let anyone who syncs see, from the gaps,
+// how much everyone else writes.
+func nextSeq( tx *sql.Tx , user_id uint64 ) ( seq int64 , err error ) {
+	err = tx.QueryRow( `INSERT INTO counters ( user_id , seq ) VALUES ( ? , 1 )
+		ON CONFLICT ( user_id ) DO UPDATE SET seq = seq + 1 RETURNING seq` , user_id ).Scan( &seq )
 	return
 }

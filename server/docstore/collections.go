@@ -30,6 +30,9 @@ var (
 	ErrCycle        = errors.New( "collection_cycle" )
 	ErrTooDeep      = errors.New( "too_deep" )
 	ErrTooMany      = errors.New( "too_many_collections" )
+	// ErrShareTooMany: a scoped key's folder already holds as many folders
+	// as a share may (Limits.ShareMaxCollections).
+	ErrShareTooMany = errors.New( "share_too_many_collections" )
 	ErrSamePlace    = errors.New( "same_place" )
 	// ErrLockRequired: a folder with a lockbox moved to a new parent needs
 	// its lockbox wrapped again for that parent, sent with the move.
@@ -398,7 +401,15 @@ func readCollection( tx *sql.Tx , user_id uint64 , id string ) ( entry Collectio
 func checkCount( tx *sql.Tx , user_id uint64 , limits Limits ) ( err error ) {
 	var count int
 	if err = tx.QueryRow( `SELECT COUNT(*) FROM collections WHERE user_id = ?` , user_id ).Scan( &count ); err != nil { return }
-	if count >= limits.maxCollections() { err = ErrTooMany }
+	if count >= limits.maxCollections() {
+		err = ErrTooMany
+		if limits.Share != "" { err = ErrShareTooMany }
+		return
+	}
+	if limits.Share != "" && limits.ShareMaxCollections > 0 {
+		err = tx.QueryRow( shareSub + `SELECT COUNT(*) FROM sub` , user_id , limits.Share , user_id ).Scan( &count )
+		if err == nil && count >= limits.ShareMaxCollections { err = ErrShareTooMany }
+	}
 	return
 }
 
@@ -555,7 +566,7 @@ func place( tx *sql.Tx , user_id uint64 , id string , parent string , before str
 
 // touchTree takes a change number for a change to the account's folders.
 func touchTree( tx *sql.Tx , user_id uint64 ) ( seq int64 , err error ) {
-	if seq , err = nextSeq( tx ); err != nil { return }
+	if seq , err = nextSeq( tx , user_id ); err != nil { return }
 	err = markTree( tx , user_id , "" , seq )
 	return
 }

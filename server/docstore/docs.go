@@ -88,7 +88,23 @@ type Limits struct {
 	// writes set it: its scope was checked before the write's transaction,
 	// and a folder deleted in between must not come back outside it.
 	NoAutoCreate bool
+	// Share is a scoped key's folder: its writes may not take that folder's
+	// subtree past ShareQuotaBytes of live documents (0: no limit) or
+	// ShareMaxCollections folders (0: no limit), so someone it was shared
+	// with cannot use up the account's quota or folder limit. A scoped
+	// write that the account's own limits refuse is answered with the share
+	// errors too, so it does not learn the account is full.
+	Share               string
+	ShareQuotaBytes     int64
+	ShareMaxCollections int
 }
+
+// shareSub is a WITH clause naming sub: the share's folder and every folder
+// under it. It takes user_id , root , user_id.
+const shareSub = `WITH RECURSIVE sub ( id ) AS (
+		SELECT id FROM collections WHERE user_id = ? AND id = ?
+		UNION ALL SELECT c.id FROM collections c JOIN sub ON c.parent = sub.id WHERE c.user_id = ?
+	) `
 
 // Defaults for the folder limits left at zero.
 const (
@@ -178,10 +194,22 @@ func setTx( tx *sql.Tx , user_id uint64 , collection string , id string , body [
 		if live { used -= int64( row.size ) }
 		if used + int64( len( body ) ) > limits.QuotaBytes {
 			err = ErrQuota
+			if limits.Share != "" { err = ErrShareQuota }
 			return
 		}
 	}
-	seq , err := nextSeq( tx )
+	if limits.Share != "" && limits.ShareQuotaBytes > 0 {
+		var used int64
+		err = tx.QueryRow( shareSub + `SELECT COALESCE( SUM( size ) , 0 ) FROM docs WHERE user_id = ? AND deleted = 0 AND collection IN ( SELECT id FROM sub )` ,
+			user_id , limits.Share , user_id , user_id ).Scan( &used )
+		if err != nil { return }
+		if live { used -= int64( row.size ) }
+		if used + int64( len( body ) ) > limits.ShareQuotaBytes {
+			err = ErrShareQuota
+			return
+		}
+	}
+	seq , err := nextSeq( tx , user_id )
 	if err != nil { return }
 	doc = Doc{ Collection: collection , ID: id , Version: row.version + 1 , Seq: seq , UpdatedAt: fromMillis( millis( now ) ) , Size: len( body ) }
 	_ , err = tx.Exec( `INSERT INTO docs ( user_id , collection , doc_id , version , seq , updated_at , deleted , size , body )
@@ -214,7 +242,7 @@ func deleteTx( tx *sql.Tx , user_id uint64 , collection string , id string , if_
 		return
 	}
 	if err = checkVersion( if_version , true , row.version ); err != nil { return }
-	seq , err := nextSeq( tx )
+	seq , err := nextSeq( tx , user_id )
 	if err != nil { return }
 	doc = Doc{ Collection: collection , ID: id , Version: row.version + 1 , Seq: seq , UpdatedAt: fromMillis( millis( now ) ) , Deleted: true }
 	_ , err = tx.Exec( `UPDATE docs SET version = ? , seq = ? , updated_at = ? , deleted = 1 , size = 0 , body = NULL
@@ -294,7 +322,9 @@ func ( store *Store ) Changes( user_id uint64 , since int64 , limit int ) ( docs
 func ( store *Store ) ChangesIn( user_id uint64 , root string , since int64 , limit int ) ( docs []Doc , more bool , err error ) {
 	if since > 0 {
 		var horizon int64
-		if err = store.db.QueryRow( `SELECT value FROM meta WHERE key = 'horizon'` ).Scan( &horizon ); err != nil { return }
+		err = store.db.QueryRow( `SELECT horizon FROM counters WHERE user_id = ?` , user_id ).Scan( &horizon )
+		if errors.Is( err , sql.ErrNoRows ) { err = nil }
+		if err != nil { return }
 		if since < horizon {
 			err = ErrSyncExpired
 			return

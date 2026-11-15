@@ -19,6 +19,7 @@ package client
 
 import (
 	ed25519 "crypto/ed25519"
+	hmac "crypto/hmac"
 	rand "crypto/rand"
 	base64 "encoding/base64"
 	json "encoding/json"
@@ -46,6 +47,7 @@ const (
 	lockWriteLabel     = "e2eedb/lock/write"
 	lockSignLabel      = "e2eedb/lock/sign"
 	lockSeedLabel      = "e2eedb/lock/sign-seed"
+	lockOwnLabel       = "e2eedb/lock/own"
 
 	// AccessTokenPrefix starts every access token (NewAccessToken).
 	AccessTokenPrefix = "e2eedb-ck."
@@ -227,6 +229,39 @@ type lockbox struct {
 	NonceW string `json:"nonce_w"`
 	Write  string `json:"write"`
 	Sig    string `json:"sig"`
+	// Own is the owner's tag (Key.ownTag): set when the master key made
+	// these keys, so its clients can tell the folders the account made from
+	// ones made through an access token without asking the server.
+	Own string `json:"own,omitempty"`
+}
+
+// ownTag is what says the master key made collection's keys (key_id): a MAC
+// only the master key can make or check.
+//
+//	own = BLAKE2b-256( key = M , "e2eedb/lock/own" || 0 || c || 0 || key_id (16) )
+//
+// The lockbox's sig does not cover it, so whoever re-wraps a lockbox for a
+// move (a write-key holder) carries it over as it is; it names the keys, not
+// the parent, so it stays true. Nobody without M can make one for other keys.
+func ( key *Key ) ownTag( collection string , key_id []byte ) string {
+	message := lockOwnLabel + "\x00" + collection + "\x00" + string( key_id )
+	return b64.EncodeToString( generichash( 32 , key.master[ : ] , message ) )
+}
+
+// owns is whether lockbox text holds this master key's tag for collection.
+func ( key *Key ) owns( text string , collection string ) bool {
+	var box lockbox
+	if json.Unmarshal( []byte( text ) , &box ) != nil || box.Own == "" { return false }
+	key_id , err := b64.DecodeString( box.KeyID )
+	if err != nil || len( key_id ) != keyIDSize { return false }
+	return hmac.Equal( []byte( box.Own ) , []byte( key.ownTag( collection , key_id ) ) )
+}
+
+// lockOwn is the owner's tag a lockbox carries, "" for none.
+func lockOwn( text string ) string {
+	var box lockbox
+	json.Unmarshal( []byte( text ) , &box )
+	return box.Own
 }
 
 func lockAD( label string , collection string , parent string ) []byte {
@@ -251,17 +286,17 @@ func lockSigned( collection string , parent string , key_id []byte , nonce_r []b
 }
 
 // sealLock wraps key's halves for holder and signs them. Both must be able
-// to write.
-func sealLock( key *CollectionKey , holder lockHolder ) ( text string , err error ) {
+// to write. own is the owner's tag to carry (Key.ownTag), "" for none.
+func sealLock( key *CollectionKey , holder lockHolder , own string ) ( text string , err error ) {
 	nonce_r := make( []byte , nonceSize )
 	nonce_w := make( []byte , nonceSize )
 	if _ , err = rand.Read( nonce_r ); err != nil { return }
 	if _ , err = rand.Read( nonce_w ); err != nil { return }
-	text , err = sealLockWith( key , holder , nonce_r , nonce_w )
+	text , err = sealLockWith( key , holder , nonce_r , nonce_w , own )
 	return
 }
 
-func sealLockWith( key *CollectionKey , holder lockHolder , nonce_r []byte , nonce_w []byte ) ( text string , err error ) {
+func sealLockWith( key *CollectionKey , holder lockHolder , nonce_r []byte , nonce_w []byte , own string ) ( text string , err error ) {
 	wrap_write := holder.wrapWrite()
 	if key.sign == nil || wrap_write == nil {
 		err = ErrReadOnly
@@ -279,6 +314,7 @@ func sealLockWith( key *CollectionKey , holder lockHolder , nonce_r []byte , non
 		NonceR: b64.EncodeToString( nonce_r ) , Read: b64.EncodeToString( read ) ,
 		NonceW: b64.EncodeToString( nonce_w ) , Write: b64.EncodeToString( write ) ,
 		Sig: b64.EncodeToString( ed25519.Sign( holder.lockSigner() , lockSigned( key.collection , parent , key.id[ : ] , nonce_r , read , nonce_w , write ) ) ) ,
+		Own: own ,
 	}
 	encoded , err := json.Marshal( box )
 	text = string( encoded )

@@ -182,6 +182,10 @@ const DocsTree = {
         twisty,
         Dom.el( "i" , { class: "bi " + ( selected ? "bi-folder2-open" : "bi-folder" ) + " docs-node-icon" , attrs: { "aria-hidden": "true" } } ),
         name,
+        ...( Docs.madeByShare( folder ) ? [ Dom.el( "i" , {
+          class: "bi bi-person-fill-lock text-warning flex-shrink-0 docs-node-shared",
+          attrs: { title: I18n.get( "docs.folder_by_share" ) , "aria-label": I18n.get( "docs.folder_by_share" ) , role: "img" },
+        } ) ] : [] ),
         Dom.el( "span" , { class: "badge rounded-pill docs-node-count" , text: folder.count , attrs: { title: Docs.say( "docs.folder_count" , { count: folder.count } ) } } ),
         this.menu( folder ),
       ],

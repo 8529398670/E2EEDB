@@ -289,9 +289,41 @@ const DocsCrypto = {
     return this.join( this.utf8( label ) , zero , this.utf8( collection ) , zero , this.utf8( parent ) );
   },
 
+  // The owner tag: says the master key made a collection's keys (key_id), so
+  // the account's clients can tell its own folders from ones made through an
+  // access token without asking the server. Only the master key makes or
+  // checks it; the lockbox's sig does not cover it, so a re-wrap carries it.
+  // own = BLAKE2b-256( key = M , "e2eedb/lock/own" || 0 || c || 0 || key_id )
+  ownTag( master_key , collection , key_id ) {
+    const zero = new Uint8Array( [ 0 ] );
+    return this.b64( this.sodium.crypto_generichash( 32 , this.join( this.utf8( "e2eedb/lock/own" ) , zero , this.utf8( collection ) , zero , key_id ) , master_key.master ) );
+  },
+
+  // Whether lockbox text carries master_key's owner tag for collection.
+  owns( master_key , text , collection ) {
+    try {
+      const box = JSON.parse( text );
+      if ( !box || !box.own ) return false;
+      const key_id = this.unb64( box.key_id );
+      if ( key_id.length !== this.KEY_ID_BYTES ) return false;
+      return this.sodium.memcmp( this.utf8( box.own ) , this.utf8( this.ownTag( master_key , collection , key_id ) ) );
+    } catch ( error ) {
+      return false;
+    }
+  },
+
+  // The owner tag a lockbox carries, "" for none.
+  lockOwn( text ) {
+    try {
+      return ( JSON.parse( text ) || {} ).own || "";
+    } catch ( error ) {
+      return "";
+    }
+  },
+
   // The lockbox text for key, wrapped by holder and signed. Both need their
-  // write half.
-  sealLock( key , holder , nonce_r , nonce_w ) {
+  // write half. own is the owner tag to carry (ownTag), "" for none.
+  sealLock( key , holder , nonce_r , nonce_w , own ) {
     const sodium = this.sodium;
     const wrap_write = this.holderWrap( holder , true );
     if ( !key.seed || !wrap_write ) throw this.fail( "read_only" );
@@ -300,11 +332,13 @@ const DocsCrypto = {
     nonce_w = nonce_w || sodium.randombytes_buf( this.NONCE_BYTES );
     const read = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( this.join( key.read , key.verify ) , this.lockAssociated( "e2eedb/lock/read" , key.collection , parent ) , null , nonce_r , this.holderWrap( holder , false ) );
     const write = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( key.seed , this.lockAssociated( "e2eedb/lock/write" , key.collection , parent ) , null , nonce_w , wrap_write );
-    return JSON.stringify( {
+    const box = {
       parent: parent , by: this.b64( holder.id ) , key_id: this.b64( key.id ) ,
       nonce_r: this.b64( nonce_r ) , read: this.b64( read ) , nonce_w: this.b64( nonce_w ) , write: this.b64( write ) ,
       sig: this.b64( sodium.crypto_sign_detached( this.lockSigned( key.collection , parent , key.id , nonce_r , read , nonce_w , write ) , this.holderSigner( holder ).sign ) ) ,
-    } );
+    };
+    if ( own ) box.own = own;
+    return JSON.stringify( box );
   },
 
   // collection's keys from its lockbox: the write half too when holder has

@@ -27,13 +27,14 @@ type Swept struct {
 func ( store *Store ) Sweep( now time.Time , tombstone_days int , exists func( user_id uint64 ) bool ) ( swept Swept , err error ) {
 	cutoff := millis( now.Add( -time.Duration( tombstone_days ) * 24 * time.Hour ) )
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
-		var newest sql.NullInt64
-		tx_err = tx.QueryRow( `SELECT MAX( seq ) FROM docs WHERE deleted = 1 AND updated_at < ?` , cutoff ).Scan( &newest )
-		if tx_err != nil || newest.Valid == false { return }
+		// Each account's horizon moves past its own newest purged tombstone.
+		_ , tx_err = tx.Exec( `UPDATE counters SET horizon = MAX( horizon , (
+				SELECT MAX( seq ) FROM docs WHERE docs.user_id = counters.user_id AND deleted = 1 AND updated_at < ? ) )
+			WHERE EXISTS ( SELECT 1 FROM docs WHERE docs.user_id = counters.user_id AND deleted = 1 AND updated_at < ? )` , cutoff , cutoff )
+		if tx_err != nil { return }
 		result , tx_err := tx.Exec( `DELETE FROM docs WHERE deleted = 1 AND updated_at < ?` , cutoff )
 		if tx_err != nil { return }
 		swept.Tombstones , _ = result.RowsAffected()
-		_ , tx_err = tx.Exec( `UPDATE meta SET value = MAX( value , ? ) WHERE key = 'horizon'` , newest.Int64 )
 		return
 	} )
 	if err != nil { return }
@@ -43,7 +44,7 @@ func ( store *Store ) Sweep( now time.Time , tombstone_days int , exists func( u
 	for _ , user_id := range owners {
 		if exists( user_id ) { continue }
 		err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
-			for _ , table := range []string{ "docs" , "collections" , "trees" , "keyrings" } {
+			for _ , table := range []string{ "docs" , "collections" , "trees" , "keyrings" , "counters" } {
 				if _ , tx_err = tx.Exec( `DELETE FROM `+ table +` WHERE user_id = ?` , user_id ); tx_err != nil { return }
 			}
 			return
