@@ -3,8 +3,16 @@ package client
 // Finding a collection's keys: its lockbox is wrapped by its parent's keys,
 // or by the master key at the top level, so the client opens lockboxes from
 // the top (or from a scoped client's own collection) down to the one it
-// needs, and keeps what it opened. A collection's keys never change, so the
-// cache never goes stale; a move only re-wraps the lockbox.
+// needs, and keeps what it opened. A move only re-wraps a lockbox, so the
+// keys stay; a rotation (RotateKeys) replaces them, and the cache is dropped
+// and filled again when the server says a write used old keys (stale_key)
+// or a document names keys the cache does not hold.
+//
+// While a rotation is under way a collection has two lockboxes: lock (the
+// keys it had) and next_lock (the new ones, wrapped for its parent's new
+// keys, or for its parent's keys when only it and those under it are being
+// rotated). Documents may be sealed with either until it is done; writes use
+// the new ones.
 
 import (
 	context "context"
@@ -28,6 +36,36 @@ func ( client *Client ) cached( collection string ) ( key *CollectionKey ) {
 	defer client.mutex.Unlock()
 	key = client.keys[ collection ]
 	return
+}
+
+// cachedNext is collection's new keys, mid-rotation, if opened already.
+func ( client *Client ) cachedNext( collection string ) ( key *CollectionKey ) {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+	key = client.next[ collection ]
+	return
+}
+
+// rememberNext keeps collection's new keys, opened from lock.
+func ( client *Client ) rememberNext( key *CollectionKey , lock string ) {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+	client.next[ key.collection ] = key
+	client.owned[ key.collection ] = client.key != nil && client.key.owns( lock , key.collection )
+}
+
+// forget drops every key opened from a lockbox, for when they may have been
+// rotated. A scoped client keeps its own collection's, which came with its
+// token.
+func ( client *Client ) forget() {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+	client.keys = map[ string ]*CollectionKey{}
+	client.next = map[ string ]*CollectionKey{}
+	client.owned = map[ string ]bool{}
+	if client.scope != nil {
+		client.keys[ client.scope.collection ] = client.scope
+	}
 }
 
 // isOwned is whether collection's lockbox, when its keys were opened, held
@@ -110,6 +148,11 @@ func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collect
 		key , err = client.createTopLevel( ctx , id )
 		return
 	}
+	if entry.Lock == "" && entry.NextLock != "" {
+		// Given its first keys by a rotation: they are its new ones.
+		err = ErrRotating
+		return
+	}
 	holder , err := client.holder( ctx , tree , entry.Parent , create )
 	if err != nil { return }
 	if entry.Lock != "" {
@@ -147,6 +190,69 @@ func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collect
 	if err == nil {
 		client.rememberLock( key , lock )
 	}
+	return
+}
+
+// resolveNext is id's new keys while a rotation is under way, nil when id
+// has none (or is not in tree). They are wrapped for the parent's new keys when the parent is
+// being rotated too, else for its keys (or the master key's).
+func ( client *Client ) resolveNext( ctx context.Context , tree map[ string ]Collection , id string ) ( key *CollectionKey , err error ) {
+	if key = client.cachedNext( id ); key != nil { return }
+	entry , found := tree[ id ]
+	if found == false || entry.NextLock == "" { return }
+	var holder lockHolder
+	if parent , inside := tree[ entry.Parent ]; inside && parent.NextLock != "" {
+		next , next_err := client.resolveNext( ctx , tree , entry.Parent )
+		if next_err != nil { return nil , next_err }
+		holder = next
+	} else if holder , err = client.holder( ctx , tree , entry.Parent , false ); err != nil {
+		return
+	}
+	if key , err = openLock( entry.NextLock , id , holder ); err == nil {
+		client.rememberNext( key , entry.NextLock )
+	}
+	return
+}
+
+// sealingKey is what a write to collection seals with: its new keys while a
+// rotation is under way, else its keys, given to it now if it has none.
+func ( client *Client ) sealingKey( ctx context.Context , collection string ) ( key *CollectionKey , err error ) {
+	if key = client.cachedNext( collection ); key != nil { return }
+	if key = client.cached( collection ); key != nil { return }
+	tree , err := client.tree( ctx )
+	if err != nil { return }
+	if key , err = client.resolveNext( ctx , tree , collection ); key != nil || err != nil { return }
+	key , err = client.resolve( ctx , tree , collection , true )
+	return
+}
+
+// openingKey is the keys that open a collection envelope in collection: the
+// ones it names, old or new. Keys it names that are not cached may have
+// been rotated in since, so the cache is filled again once before it is
+// ErrWrongKey.
+func ( client *Client ) openingKey( ctx context.Context , collection string , envelope []byte ) ( key *CollectionKey , err error ) {
+	if len( envelope ) < headerSize { return nil , ErrCorrupt }
+	named := string( envelope[ 1:headerSize ] )
+	matching := func() *CollectionKey {
+		for _ , held := range []*CollectionKey{ client.cachedNext( collection ) , client.cached( collection ) } {
+			if held != nil && string( held.id[ : ] ) == named { return held }
+		}
+		return nil
+	}
+	if key = matching(); key != nil { return }
+	client.forget()
+	tree , err := client.tree( ctx )
+	if err != nil { return }
+	entry , found := tree[ collection ]
+	if found == false { return nil , errOutOfScope }
+	if _ , err = client.resolveNext( ctx , tree , collection ); err != nil { return }
+	switch {
+	case entry.Lock != "":
+		if _ , err = client.resolve( ctx , tree , collection , false ); err != nil { return }
+	case entry.NextLock == "":
+		return nil , fmt.Errorf( "%w: collection %s has no keys yet" , ErrCorrupt , collection )
+	}
+	if key = matching(); key == nil { err = ErrWrongKey }
 	return
 }
 

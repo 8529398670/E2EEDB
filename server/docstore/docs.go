@@ -170,6 +170,7 @@ func ( store *Store ) Set( user_id uint64 , collection string , id string , body
 	err = store.write( func( tx *sql.Tx ) ( tx_err error ) {
 		created , tx_err := ensureCollection( tx , user_id , collection , limits , now )
 		if tx_err != nil { return }
+		if tx_err = checkEnvelopeKey( tx , user_id , collection , body ); tx_err != nil { return }
 		if doc , tx_err = setTx( tx , user_id , collection , id , body , if_version , limits , now ); tx_err != nil { return }
 		if created { tx_err = markTree( tx , user_id , collection , doc.Seq ) }
 		return

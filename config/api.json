@@ -209,6 +209,10 @@
             "description": "Shown name, unique among its siblings ignoring case. A collection made by writing a document is named after its id.",
             "type": "string"
           },
+          "next_lock": {
+            "description": "Present while its keys are being rotated: the lockbox of the new keys, wrapped like lock (for the parent's new keys, when the parent is being rotated too). Collection envelopes written meanwhile must be sealed with them. See README.md, Rotating keys.",
+            "type": "string"
+          },
           "parent": {
             "description": "The parent's id; \"\" for the top level.",
             "type": "string"
@@ -4801,6 +4805,10 @@
                             "description": "Shown name, unique among its siblings ignoring case. A collection made by writing a document is named after its id.",
                             "type": "string"
                           },
+                          "next_lock": {
+                            "description": "Present while its keys are being rotated: the lockbox of the new keys, wrapped like lock (for the parent's new keys, when the parent is being rotated too). Collection envelopes written meanwhile must be sealed with them. See README.md, Rotating keys.",
+                            "type": "string"
+                          },
                           "parent": {
                             "description": "The parent's id; \"\" for the top level.",
                             "type": "string"
@@ -5798,6 +5806,215 @@
           }
         ],
         "summary": "Move a document to another collection",
+        "tags": [
+          "Documents"
+        ]
+      }
+    },
+    "/api/collections/{collection}/rotate": {
+      "post": {
+        "description": "Sets the lockboxes of new keys for the collection and the collections under it, parents first, in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and revokes every access key scoped to a collection in the subtree. Meanwhile collection envelopes written there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 rotating: a collection above or under it is already being rotated. 409 lock_exists: that collection already has its new lockbox. 409 rotate_parent_first. An access key cannot rotate (403).",
+        "operationId": "post_api_collections_collection_rotate",
+        "parameters": [
+          {
+            "description": "The collection's id: 1-64 of A-Z a-z 0-9 _ -",
+            "in": "path",
+            "name": "collection",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "csrf_token": {
+                    "description": "From GET /api/me. Browser sessions only.",
+                    "type": "string"
+                  },
+                  "locks": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call.",
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "locks"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "pending": {
+                      "description": "Collections in the subtree still without a new lockbox.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "revoked": {
+                      "description": "Access keys revoked because they reached a collection whose keys are changing (only on the call that began it). Share again once it is done.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "started": {
+                      "description": "This call began the rotation.",
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "pending",
+                    "revoked",
+                    "started"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "summary": "Start rotating a collection's keys",
+        "tags": [
+          "Documents"
+        ]
+      }
+    },
+    "/api/collections/{collection}/rotate/commit": {
+      "post": {
+        "description": "Once every collection in the subtree has its new lockbox and every collection envelope in them is sealed with the new keys, the new lockboxes replace the old ones, all at once. 409 rotate_incomplete (with collections and docs: how many are left). 409 not_rotating: no rotation of this collection is under way. 409 rotating: it is inside one; commit that one's collection.",
+        "operationId": "post_api_collections_collection_rotate_commit",
+        "parameters": [
+          {
+            "description": "The collection's id: 1-64 of A-Z a-z 0-9 _ -",
+            "in": "path",
+            "name": "collection",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "csrf_token": {
+                    "description": "From GET /api/me. Browser sessions only.",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "collections": {
+                      "description": "Every collection now on its new keys, parents first.",
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "collections"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "$ref": "#/components/responses/E400"
+          },
+          "401": {
+            "$ref": "#/components/responses/E401"
+          },
+          "403": {
+            "$ref": "#/components/responses/E403"
+          },
+          "404": {
+            "$ref": "#/components/responses/E404"
+          },
+          "409": {
+            "$ref": "#/components/responses/E409"
+          },
+          "429": {
+            "$ref": "#/components/responses/E429"
+          },
+          "503": {
+            "$ref": "#/components/responses/E503"
+          }
+        },
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "apiKey": []
+          }
+        ],
+        "summary": "Finish rotating a collection's keys",
         "tags": [
           "Documents"
         ]

@@ -54,6 +54,8 @@ An error reply is a JSON object whose `error` says what went wrong.
 | POST | [`/api/collections/{collection}/docs/{doc_id}`](#post-apicollectionscollectiondocsdoc_id) | Create or replace a document | browser session or API key, anyone signed in |
 | POST | [`/api/collections/{collection}/docs/{doc_id}/delete`](#post-apicollectionscollectiondocsdoc_iddelete) | Delete a document | browser session or API key, anyone signed in |
 | POST | [`/api/collections/{collection}/docs/{doc_id}/move`](#post-apicollectionscollectiondocsdoc_idmove) | Move a document to another collection | browser session or API key, anyone signed in |
+| POST | [`/api/collections/{collection}/rotate`](#post-apicollectionscollectionrotate) | Start rotating a collection's keys | browser session or API key, anyone signed in |
+| POST | [`/api/collections/{collection}/rotate/commit`](#post-apicollectionscollectionrotatecommit) | Finish rotating a collection's keys | browser session or API key, anyone signed in |
 | GET | [`/api/keyring`](#get-apikeyring) | Your wrapped master key | browser session only, anyone signed in |
 | POST | [`/api/keyring`](#post-apikeyring) | Set or change your passphrase | browser session only, anyone signed in |
 
@@ -112,6 +114,7 @@ Every collection (folder) in your account, each parent's children together in th
 | `collections[].id` | string | yes |  | What its documents are filed under and their encryption is bound to. Never changes. |
 | `collections[].lock` | string | no |  | The collection's lockbox: its own keys, wrapped by the client for its parent (or the master key at the top level). Opaque to the server. Absent until a client gives the collection keys. See README.md, Crypto format. |
 | `collections[].name` | string | yes |  | Shown name, unique among its siblings ignoring case. A collection made by writing a document is named after its id. |
+| `collections[].next_lock` | string | no |  | Present while its keys are being rotated: the lockbox of the new keys, wrapped like lock (for the parent's new keys, when the parent is being rotated too). Collection envelopes written meanwhile must be sealed with them. See README.md, Rotating keys. |
 | `collections[].parent` | string | yes |  | The parent's id; "" for the top level. |
 | `collections[].position` | integer | yes |  | Place among its siblings, from 0. |
 | `collections[].updated_at` | string (date-time) | yes |  |  |
@@ -363,6 +366,67 @@ In one step: the document is written at to_collection/to_id and the old one beco
 |---|---|---|---|---|
 | `deleted` | [`DocChange`](#docchange) | yes |  | The tombstone left where it was. |
 | `doc` | [`DocMeta`](#docmeta) | yes |  | The document in its new place. |
+
+### POST /api/collections/{collection}/rotate
+
+Start rotating a collection's keys
+
+Sets the lockboxes of new keys for the collection and the collections under it, parents first, in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and revokes every access key scoped to a collection in the subtree. Meanwhile collection envelopes written there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 rotating: a collection above or under it is already being rotated. 409 lock_exists: that collection already has its new lockbox. 409 rotate_parent_first. An access key cannot rotate (403).
+
+|  |  |
+|---|---|
+| Who may call | browser session or API key, anyone signed in |
+| Errors | 400, 401, 403, 404, 409, 429, 503 |
+
+**Parameters**
+
+| Name | In | Type | Required | Limits | Description |
+|---|---|---|---|---|---|
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
+
+**Request body**
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
+| `locks` | map of string | yes |  | Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call. |
+
+**Reply 200**: Success
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `pending` | array of string | yes |  | Collections in the subtree still without a new lockbox. |
+| `revoked` | array of string | yes |  | Access keys revoked because they reached a collection whose keys are changing (only on the call that began it). Share again once it is done. |
+| `started` | boolean | yes |  | This call began the rotation. |
+
+### POST /api/collections/{collection}/rotate/commit
+
+Finish rotating a collection's keys
+
+Once every collection in the subtree has its new lockbox and every collection envelope in them is sealed with the new keys, the new lockboxes replace the old ones, all at once. 409 rotate_incomplete (with collections and docs: how many are left). 409 not_rotating: no rotation of this collection is under way. 409 rotating: it is inside one; commit that one's collection.
+
+|  |  |
+|---|---|
+| Who may call | browser session or API key, anyone signed in |
+| Errors | 400, 401, 403, 404, 409, 429, 503 |
+
+**Parameters**
+
+| Name | In | Type | Required | Limits | Description |
+|---|---|---|---|---|---|
+| `collection` | path | string | yes | 1 to 64 characters | The collection's id: 1-64 of A-Z a-z 0-9 _ - |
+
+**Request body**
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `csrf_token` | string | no |  | From GET /api/me. Browser sessions only. |
+
+**Reply 200**: Success
+
+| Field | Type | Required | Limits | Description |
+|---|---|---|---|---|
+| `collections` | array of string | yes |  | Every collection now on its new keys, parents first. |
 
 ### GET /api/keyring
 
@@ -2094,6 +2158,7 @@ The shapes the routes above refer to by name.
 | `id` | string | yes |  | What its documents are filed under and their encryption is bound to. Never changes. |
 | `lock` | string | no |  | The collection's lockbox: its own keys, wrapped by the client for its parent (or the master key at the top level). Opaque to the server. Absent until a client gives the collection keys. See README.md, Crypto format. |
 | `name` | string | yes |  | Shown name, unique among its siblings ignoring case. A collection made by writing a document is named after its id. |
+| `next_lock` | string | no |  | Present while its keys are being rotated: the lockbox of the new keys, wrapped like lock (for the parent's new keys, when the parent is being rotated too). Collection envelopes written meanwhile must be sealed with them. See README.md, Rotating keys. |
 | `parent` | string | yes |  | The parent's id; "" for the top level. |
 | `position` | integer | yes |  | Place among its siblings, from 0. |
 | `updated_at` | string (date-time) | yes |  |  |

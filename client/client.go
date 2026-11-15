@@ -43,6 +43,15 @@ var (
 	ErrTooLarge    = errors.New( "e2eedb: document too large" )
 	ErrQuota       = errors.New( "e2eedb: quota exceeded" )
 	ErrSyncExpired = errors.New( "e2eedb: sync expired, start again from 0" )
+	// ErrStaleKey: a write sealed with keys its collection no longer uses
+	// (they were rotated). Set and MoveDoc fetch the new keys and try once
+	// more before answering it.
+	ErrStaleKey = errors.New( "e2eedb: sealed with keys the collection no longer uses" )
+	// ErrRotating: the collection is in a key rotation that has not reached
+	// it yet, or what was asked (a move, a new folder, an access key) waits
+	// until the rotation is done. RotateKeys on the rotation's collection
+	// finishes it.
+	ErrRotating = errors.New( "e2eedb: the collection's keys are being rotated" )
 )
 
 // ConflictError is ErrConflict with the version the server has now (0 and
@@ -95,6 +104,9 @@ type Collection struct {
 	// for its parent or the master key. The client opens it; the server
 	// cannot.
 	Lock string `json:"lock,omitempty"`
+	// NextLock is set while the collection's keys are being rotated
+	// (RotateKeys): the lockbox of its new keys.
+	NextLock string `json:"next_lock,omitempty"`
 	// ByKey is set when the folder was made through an access token (a
 	// scoped API key), not by the account itself. The server says so, so it
 	// is only for showing: a master-key client checks the lockbox's owner
@@ -131,6 +143,9 @@ type Client struct {
 
 	mutex sync.Mutex
 	keys  map[ string ]*CollectionKey // opened lockboxes, by collection
+	// next is the opened next lockboxes of collections whose keys are
+	// being rotated: what they are written with until it is done.
+	next  map[ string ]*CollectionKey
 	// owned is the collections whose lockbox carries the master key's owner
 	// tag: the ones a master-key client made. It does not write into the
 	// others unless asked to (AllowShared).
@@ -167,7 +182,7 @@ func NewScoped( baseURL string , token string , options ...Option ) ( client *Cl
 }
 
 func newClient( baseURL string , apiKey string , key *Key , options []Option ) ( client *Client ) {
-	client = &Client{ base: strings.TrimRight( baseURL , "/" ) , apiKey: apiKey , key: key , http: &http.Client{ Timeout: 30 * time.Second } , keys: map[ string ]*CollectionKey{} , owned: map[ string ]bool{} }
+	client = &Client{ base: strings.TrimRight( baseURL , "/" ) , apiKey: apiKey , key: key , http: &http.Client{ Timeout: 30 * time.Second } , keys: map[ string ]*CollectionKey{} , next: map[ string ]*CollectionKey{} , owned: map[ string ]bool{} }
 	for _ , option := range options {
 		option( client )
 	}
@@ -215,7 +230,7 @@ var ErrSharedCollection = errors.New( "e2eedb: this collection was not made with
 // writeKey is the key a write to collection seals with, refusing a
 // collection made through an access token unless options allow it.
 func ( client *Client ) writeKey( ctx context.Context , collection string , options []WriteOption ) ( key *CollectionKey , err error ) {
-	if key , err = client.CollectionKey( ctx , collection , true ); err != nil { return }
+	if key , err = client.sealingKey( ctx , collection ); err != nil { return }
 	if client.key != nil && client.isOwned( collection ) == false && writeOpts( options ).allowShared == false {
 		key , err = nil , ErrSharedCollection
 	}
@@ -246,6 +261,15 @@ func docPath( collection string , id string ) string {
 func ( client *Client ) Set( ctx context.Context , collection string , id string , value any , options ...WriteOption ) ( meta Meta , err error ) {
 	plaintext , err := json.Marshal( value )
 	if err != nil { return }
+	for attempt := 0 ; ; attempt++ {
+		meta , err = client.set( ctx , collection , id , plaintext , options )
+		// Keys rotated since they were cached: fetch them and try again.
+		if attempt > 0 || errors.Is( err , ErrStaleKey ) == false { return }
+		client.forget()
+	}
+}
+
+func ( client *Client ) set( ctx context.Context , collection string , id string , plaintext []byte , options []WriteOption ) ( meta Meta , err error ) {
 	key , err := client.writeKey( ctx , collection , options )
 	if err != nil { return }
 	envelope , err := key.Seal( id , plaintext )
@@ -297,7 +321,7 @@ func ( client *Client ) openEnvelope( ctx context.Context , collection string , 
 		}
 		plaintext , err = client.key.Open( collection , id , envelope )
 	case EnvelopeCollection:
-		key , key_err := client.CollectionKey( ctx , collection , false )
+		key , key_err := client.openingKey( ctx , collection , envelope )
 		if key_err != nil { return nil , key_err }
 		plaintext , err = key.Open( id , envelope )
 	default:
@@ -455,19 +479,22 @@ func ( client *Client ) MoveDoc( ctx context.Context , collection string , id st
 	if err != nil { return meta , ErrCorrupt }
 	plaintext , err := client.openEnvelope( ctx , collection , id , envelope )
 	if err != nil { return }
-	key , err := client.writeKey( ctx , to , options )
-	if err != nil { return }
-	sealed , err := key.Seal( id , plaintext )
-	if err != nil { return }
 	if_version := current.Version
 	if opts := writeOpts( options ); opts.ifVersion != nil { if_version = *opts.ifVersion }
-	request := map[string]any{ "to_collection": to , "body": b64.EncodeToString( sealed ) , "if_version": if_version }
-	var reply struct {
-		Doc Meta `json:"doc"`
+	for attempt := 0 ; ; attempt++ {
+		key , key_err := client.writeKey( ctx , to , options )
+		if key_err != nil { return meta , key_err }
+		sealed , seal_err := key.Seal( id , plaintext )
+		if seal_err != nil { return meta , seal_err }
+		request := map[string]any{ "to_collection": to , "body": b64.EncodeToString( sealed ) , "if_version": if_version }
+		var reply struct {
+			Doc Meta `json:"doc"`
+		}
+		err = client.call( ctx , http.MethodPost , docPath( collection , id ) + "/move" , request , &reply )
+		meta = reply.Doc
+		if attempt > 0 || errors.Is( err , ErrStaleKey ) == false { return }
+		client.forget()
 	}
-	err = client.call( ctx , http.MethodPost , docPath( collection , id ) + "/move" , request , &reply )
-	meta = reply.Doc
-	return
 }
 
 // Changes is what changed after since (0 for everything), oldest first, up
@@ -529,6 +556,10 @@ func ( client *Client ) call( ctx context.Context , method string , path string 
 		err = ErrSyncExpired
 	case response.StatusCode == http.StatusForbidden && refusal.Error == "read_only":
 		err = ErrReadOnly
+	case response.StatusCode == http.StatusConflict && refusal.Error == "stale_key":
+		err = ErrStaleKey
+	case response.StatusCode == http.StatusConflict && refusal.Error == "rotating":
+		err = ErrRotating
 	default:
 		message := refusal.Error
 		if message == "" { message = strings.TrimSpace( string( raw ) ) }

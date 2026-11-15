@@ -329,6 +329,13 @@ func ( handlers *Handlers ) checkKeyScope( user_id uint64 , request keyScope , r
 		refused = handlers.docRefusal( err )
 		return
 	}
+	// Mid-rotation, the keys a token would carry are about to go.
+	rotating , err := handlers.Docs.InRotation( user_id , request.Collection )
+	if err == nil && rotating { err = docstore.ErrRotating }
+	if err != nil {
+		refused = handlers.docRefusal( err )
+		return
+	}
 	scope = models.KeyScope{ Collection: request.Collection , Write: request.Access == "write" , Born: entry.Born }
 	return
 }

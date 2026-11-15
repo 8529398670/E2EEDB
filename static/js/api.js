@@ -155,6 +155,10 @@ const Api = {
     if ( ifVersion !== undefined && ifVersion !== null ) request.if_version = ifVersion;
     return this.post( "/api/collections/" + encodeURIComponent( id ) + "/delete" , request );
   },
+  // Rotating a collection's keys: locks maps collection ids to the
+  // lockboxes of their new keys, parents first; then commit.
+  rotateCollection( id , locks ) { return this.post( "/api/collections/" + encodeURIComponent( id ) + "/rotate" , { locks: locks } ); },
+  commitRotation( id )         { return this.post( "/api/collections/" + encodeURIComponent( id ) + "/rotate/commit" , {} ); },
   keyring()                    { return this.request( "/api/keyring" ); },
   setKeyring( text , ifVersion ) { return this.post( "/api/keyring" , { keyring: text , if_version: ifVersion } ); },
   listTeam( offset )           { return this.request( "/api/team" + this.query( { offset: offset } ) ); },

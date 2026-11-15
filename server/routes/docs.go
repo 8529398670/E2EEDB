@@ -176,6 +176,7 @@ func ( handlers *Handlers ) docLimitsFor( c fiber.Ctx ) ( limits docstore.Limits
 // docRefusal turns what the store said no with into an answer.
 func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 	var conflict *docstore.ConflictError
+	var incomplete *docstore.RotateIncomplete
 	limits := handlers.docLimits()
 	switch {
 	case errors.As( cause , &conflict ):
@@ -196,6 +197,16 @@ func ( handlers *Handlers ) docRefusal( cause error ) ( refused *refusal ) {
 		refused = refuse( fiber.StatusConflict , "lock_required" )
 	case errors.Is( cause , docstore.ErrLockExists ):
 		refused = refuse( fiber.StatusConflict , "lock_exists" )
+	case errors.Is( cause , docstore.ErrRotating ):
+		refused = refuse( fiber.StatusConflict , "rotating" )
+	case errors.Is( cause , docstore.ErrNotRotating ):
+		refused = refuse( fiber.StatusConflict , "not_rotating" )
+	case errors.Is( cause , docstore.ErrRotateParentFirst ):
+		refused = refuse( fiber.StatusConflict , "rotate_parent_first" )
+	case errors.Is( cause , docstore.ErrStaleKey ):
+		refused = refuse( fiber.StatusConflict , "stale_key" )
+	case errors.As( cause , &incomplete ):
+		refused = refuse( fiber.StatusConflict , "rotate_incomplete" , fiber.Map{ "collections": incomplete.Collections , "docs": incomplete.Docs } )
 	case errors.Is( cause , docstore.ErrSamePlace ):
 		refused = refuse( fiber.StatusBadRequest , "same_place" )
 	case errors.Is( cause , docstore.ErrTooLarge ):
@@ -224,6 +235,7 @@ type collectionRow struct {
 	Version   int64     `json:"version" jsonschema_description:"Goes up by one on every rename or move."`
 	UpdatedAt time.Time `json:"updated_at"`
 	Lock      string    `json:"lock,omitempty" jsonschema_description:"The collection's lockbox: its own keys, wrapped by the client for its parent (or the master key at the top level). Opaque to the server. Absent until a client gives the collection keys. See README.md, Crypto format."`
+	NextLock  string    `json:"next_lock,omitempty" jsonschema_description:"Present while its keys are being rotated: the lockbox of the new keys, wrapped like lock (for the parent's new keys, when the parent is being rotated too). Collection envelopes written meanwhile must be sealed with them. See README.md, Rotating keys."`
 	// ByKey: made through someone's access key, so a client writing by id
 	// can refuse to put the account's own documents there.
 	ByKey string `json:"by_key,omitempty" jsonschema_description:"Present when the collection was made through an access token: the id of that scoped API key. The Go client will not write the account's own documents into such a collection unless asked to (client.AllowShared)."`
@@ -232,7 +244,7 @@ type collectionRow struct {
 func ( collectionRow ) APIName() ( name string ) { name = "Collection"; return }
 
 func newCollectionRow( entry docstore.Collection ) ( row collectionRow ) {
-	row = collectionRow{ ID: entry.ID , Name: entry.Name , Parent: entry.Parent , Position: entry.Position , Version: entry.Version , UpdatedAt: entry.UpdatedAt , Lock: entry.Lock , ByKey: entry.ByKey }
+	row = collectionRow{ ID: entry.ID , Name: entry.Name , Parent: entry.Parent , Position: entry.Position , Version: entry.Version , UpdatedAt: entry.UpdatedAt , Lock: entry.Lock , NextLock: entry.NextLock , ByKey: entry.ByKey }
 	return
 }
 
@@ -551,6 +563,110 @@ func ( handlers *Handlers ) deleteCollection( c fiber.Ctx , in *deleteCollection
 		rows = append( rows , newDocChange( doc , true ) )
 	}
 	reply = &deleteCollectionReply{ Collections: deleted.Collections , Docs: rows }
+	return
+}
+
+type rotateRequest struct {
+	collectionPath
+	Locks map[ string ]string `json:"locks" jsonschema_description:"Collection id to the lockbox of its new keys (1-2048 bytes each, at most 500 per call). The first call must carry the collection's own; each other's parent must have its new lockbox already, or in the same call." error:"locks must map collection ids to lockboxes"`
+}
+
+type rotateReply struct {
+	Started bool     `json:"started" jsonschema_description:"This call began the rotation."`
+	Revoked []string `json:"revoked" jsonschema_description:"Access keys revoked because they reached a collection whose keys are changing (only on the call that began it). Share again once it is done."`
+	Pending []string `json:"pending" jsonschema_description:"Collections in the subtree still without a new lockbox."`
+}
+
+// rotateMaxLocks caps the lockboxes one rotate call carries, so it stays
+// well inside the body limit.
+const rotateMaxLocks = 500
+
+// rotateKeys stages new keys for a collection and every collection under
+// it: the first step of a rotation (docstore/rotate.go, README.md "Rotating
+// keys"). Starting one revokes every access key that reaches into the
+// subtree: what they hold is the keys being replaced.
+//
+// @route("POST /api/collections/{collection}/rotate", summary="Start rotating a collection's keys",
+//     tag="Documents", errors=(403, 404, 409),
+//     description="Sets the lockboxes of new keys for the collection and the collections under it, parents first, "
+//         "in as many calls as it takes. The first call, carrying the collection's own, starts the rotation and "
+//         "revokes every access key scoped to a collection in the subtree. Meanwhile collection envelopes written "
+//         "there must be sealed with the new keys (409 stale_key otherwise), and collections there cannot be made, "
+//         "moved or given lockboxes (409 rotating). Re-seal every document, then POST .../rotate/commit. 409 "
+//         "rotating: a collection above or under it is already being rotated. 409 lock_exists: that collection "
+//         "already has its new lockbox. 409 rotate_parent_first. An access key cannot rotate (403).",
+// )
+func ( handlers *Handlers ) rotateKeys( c fiber.Ctx , in *rotateRequest ) ( reply *rotateReply , err error ) {
+	if refused := in.check(); refused != nil {
+		err = refused
+		return
+	}
+	if docScope( c ) != nil {
+		err = refuse( fiber.StatusForbidden , "an access key cannot rotate keys" )
+		return
+	}
+	if len( in.Locks ) > rotateMaxLocks {
+		err = refuse( fiber.StatusBadRequest , "at most " + strconv.Itoa( rotateMaxLocks ) + " locks per call" )
+		return
+	}
+	for id , lock := range in.Locks {
+		if docstore.ValidCollection( id ) == false || lock == "" || len( lock ) > docstore.LockMaxBytes {
+			err = refuse( fiber.StatusBadRequest , "locks must map collection ids to lockboxes of 1-" + strconv.Itoa( docstore.LockMaxBytes ) + " bytes" )
+			return
+		}
+	}
+	owner := docOwner( c )
+	rotation , stage_err := handlers.Docs.StageRotation( owner , in.Collection , in.Locks )
+	if stage_err != nil {
+		err = handlers.docRefusal( stage_err )
+		return
+	}
+	reply = &rotateReply{ Started: rotation.Started , Revoked: []string{} , Pending: rotation.Pending }
+	if rotation.Started {
+		handlers.audit( c , logs.KindAdmin , "collection keys rotation started" , fiber.Map{ "collection": in.Collection , "collections": len( rotation.Subtree ) } )
+		revoked , revoke_err := models.RevokeScopedKeys( handlers.Store , owner , rotation.Subtree )
+		for _ , key_id := range revoked {
+			handlers.audit( c , logs.KindAdmin , "api key revoked: its collection's keys are being rotated" , fiber.Map{ "key_id": key_id , "collection": in.Collection } )
+		}
+		if revoke_err != nil {
+			err = revoke_err
+			return
+		}
+		reply.Revoked = append( reply.Revoked , revoked... )
+	}
+	return
+}
+
+type commitRotationReply struct {
+	Collections []string `json:"collections" jsonschema_description:"Every collection now on its new keys, parents first."`
+}
+
+// commitRotation ends a rotation: every new lockbox becomes the
+// collection's lockbox, in one step.
+//
+// @route("POST /api/collections/{collection}/rotate/commit", summary="Finish rotating a collection's keys",
+//     tag="Documents", errors=(403, 404, 409),
+//     description="Once every collection in the subtree has its new lockbox and every collection envelope in them "
+//         "is sealed with the new keys, the new lockboxes replace the old ones, all at once. 409 rotate_incomplete "
+//         "(with collections and docs: how many are left). 409 not_rotating: no rotation of this collection is "
+//         "under way. 409 rotating: it is inside one; commit that one's collection.",
+// )
+func ( handlers *Handlers ) commitRotation( c fiber.Ctx , in *collectionPath ) ( reply *commitRotationReply , err error ) {
+	if refused := in.check(); refused != nil {
+		err = refused
+		return
+	}
+	if docScope( c ) != nil {
+		err = refuse( fiber.StatusForbidden , "an access key cannot rotate keys" )
+		return
+	}
+	ids , commit_err := handlers.Docs.CommitRotation( docOwner( c ) , in.Collection )
+	if commit_err != nil {
+		err = handlers.docRefusal( commit_err )
+		return
+	}
+	handlers.audit( c , logs.KindAdmin , "collection keys rotated" , fiber.Map{ "collection": in.Collection , "collections": len( ids ) } )
+	reply = &commitRotationReply{ Collections: ids }
 	return
 }
 

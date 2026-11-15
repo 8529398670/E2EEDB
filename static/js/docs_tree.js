@@ -186,6 +186,10 @@ const DocsTree = {
           class: "bi bi-person-fill-lock text-warning flex-shrink-0 docs-node-shared",
           attrs: { title: I18n.get( "docs.folder_by_share" ) , "aria-label": I18n.get( "docs.folder_by_share" ) , role: "img" },
         } ) ] : [] ),
+        ...( folder.next_lock ? [ Dom.el( "i" , {
+          class: "bi bi-arrow-repeat text-warning flex-shrink-0 docs-node-shared",
+          attrs: { title: I18n.get( "docs.folder_rotating" ) , "aria-label": I18n.get( "docs.folder_rotating" ) , role: "img" },
+        } ) ] : [] ),
         Dom.el( "span" , { class: "badge rounded-pill docs-node-count" , text: folder.count , attrs: { title: Docs.say( "docs.folder_count" , { count: folder.count } ) } } ),
         this.menu( folder ),
       ],
@@ -261,6 +265,7 @@ const DocsTree = {
     if ( writable && !root ) entries.push( item( "bi-pencil" , "docs.folder_rename" , () => this.rename( folder.id ) ) );
     if ( writable && !root ) entries.push( item( "bi-arrow-right-square" , "docs.folder_move" , () => this.moveTo( folder.id ) ) );
     if ( !scoped ) entries.push( item( "bi-share" , "docs.folder_share" , () => Docs.share( folder.id ) ) );
+    if ( !scoped ) entries.push( item( "bi-arrow-repeat" , folder.next_lock ? "docs.folder_rotate_finish" : "docs.folder_rotate" , () => Docs.rotate( folder.id ) ) );
     if ( writable && !root ) {
       entries.push( Dom.el( "li" , { children: [ Dom.el( "hr" , { class: "dropdown-divider" } ) ] } ) );
       entries.push( item( "bi-trash" , "docs.folder_delete" , () => this.remove( folder.id ) , true ) );

@@ -71,6 +71,9 @@ type Collection struct {
 	// Lock is the folder's lockbox: its keys, wrapped by the client for its
 	// parent (or the master key). The server stores it and cannot open it.
 	Lock      string
+	// NextLock is the lockbox of the keys a rotation under way is moving
+	// the folder to (StageRotation), "" when none is.
+	NextLock  string
 	// ByKey is the scoped API key that made the folder, "" when the
 	// account itself did.
 	ByKey     string
@@ -111,7 +114,7 @@ type DeletedTree struct {
 func ( store *Store ) Collections( user_id uint64 , offset int , limit int ) ( result []Collection , total int , err error ) {
 	err = store.db.QueryRow( `SELECT COUNT(*) FROM collections WHERE user_id = ?` , user_id ).Scan( &total )
 	if err != nil { return }
-	rows , err := store.db.Query( `SELECT c.id , c.name , c.parent , c.position , c.version , c.lock , c.by_key , c.born ,
+	rows , err := store.db.Query( `SELECT c.id , c.name , c.parent , c.position , c.version , c.lock , c.next_lock , c.by_key , c.born ,
 			COALESCE( d.n , 0 ) , COALESCE( d.bytes , 0 ) , MAX( c.updated_at , COALESCE( d.updated , 0 ) )
 		FROM collections c
 		LEFT JOIN ( SELECT collection , COUNT(*) AS n , SUM( size ) AS bytes , MAX( updated_at ) AS updated
@@ -124,7 +127,7 @@ func ( store *Store ) Collections( user_id uint64 , offset int , limit int ) ( r
 	for rows.Next() {
 		var entry Collection
 		var updated int64
-		if err = rows.Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.ByKey , &entry.Born , &entry.Count , &entry.Bytes , &updated ); err != nil { return }
+		if err = rows.Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.NextLock , &entry.ByKey , &entry.Born , &entry.Count , &entry.Bytes , &updated ); err != nil { return }
 		entry.UpdatedAt = fromMillis( updated )
 		result = append( result , entry )
 	}
@@ -144,8 +147,8 @@ func ( store *Store ) TreeSeq( user_id uint64 ) ( seq int64 , err error ) {
 // GetCollection is one folder, without its counts.
 func ( store *Store ) GetCollection( user_id uint64 , id string ) ( entry Collection , err error ) {
 	var updated int64
-	err = store.db.QueryRow( `SELECT id , name , parent , position , version , lock , by_key , born , updated_at FROM collections WHERE user_id = ? AND id = ?` ,
-		user_id , id ).Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.ByKey , &entry.Born , &updated )
+	err = store.db.QueryRow( `SELECT id , name , parent , position , version , lock , next_lock , by_key , born , updated_at FROM collections WHERE user_id = ? AND id = ?` ,
+		user_id , id ).Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.NextLock , &entry.ByKey , &entry.Born , &updated )
 	if errors.Is( err , sql.ErrNoRows ) {
 		err = ErrNoCollection
 		return
@@ -186,6 +189,9 @@ func ( store *Store ) CreateCollection( user_id uint64 , id string , change Coll
 				tx_err = ErrTooDeep
 				return
 			}
+			// A folder made inside one whose keys are being rotated would
+			// get a lockbox wrapped for keys that are about to go.
+			if tx_err = refuseRotating( tx , user_id , parent ); tx_err != nil { return }
 		}
 		if tx_err = checkName( tx , user_id , parent , name , "" ); tx_err != nil { return }
 		seq , tx_err := touchTree( tx , user_id )
@@ -224,6 +230,15 @@ func ( store *Store ) UpdateCollection( user_id uint64 , id string , change Coll
 		moving := change.Parent != nil || change.Before != nil
 		if parent != current.Parent {
 			if tx_err = checkMove( tx , user_id , id , parent , limits ); tx_err != nil { return }
+		}
+		// While keys are being rotated, the folders involved keep their
+		// place and their lockboxes: a move or a new lockbox would be
+		// wrapped for keys that are about to go.
+		if parent != current.Parent || change.Lock != nil {
+			if tx_err = refuseRotating( tx , user_id , id ); tx_err != nil { return }
+			if parent != "" {
+				if tx_err = refuseRotating( tx , user_id , parent ); tx_err != nil { return }
+			}
 		}
 		lock := current.Lock
 		switch {
@@ -330,6 +345,7 @@ func ( store *Store ) MoveDoc( user_id uint64 , from string , id string , to str
 			tx_err = &ConflictError{ Current: target.version , Live: true }
 			return
 		}
+		if tx_err = checkEnvelopeKey( tx , user_id , to , body ); tx_err != nil { return }
 		if gone , tx_err = deleteTx( tx , user_id , from , id , nil , now ); tx_err != nil { return }
 		moved , tx_err = setTx( tx , user_id , to , to_id , body , version0() , limits , now )
 		return
@@ -387,8 +403,8 @@ func markTree( tx *sql.Tx , user_id uint64 , id string , seq int64 ) ( err error
 
 func readCollection( tx *sql.Tx , user_id uint64 , id string ) ( entry Collection , found bool , err error ) {
 	var updated int64
-	err = tx.QueryRow( `SELECT id , name , parent , position , version , lock , by_key , born , updated_at FROM collections WHERE user_id = ? AND id = ?` ,
-		user_id , id ).Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.ByKey , &entry.Born , &updated )
+	err = tx.QueryRow( `SELECT id , name , parent , position , version , lock , next_lock , by_key , born , updated_at FROM collections WHERE user_id = ? AND id = ?` ,
+		user_id , id ).Scan( &entry.ID , &entry.Name , &entry.Parent , &entry.Position , &entry.Version , &entry.Lock , &entry.NextLock , &entry.ByKey , &entry.Born , &updated )
 	if errors.Is( err , sql.ErrNoRows ) {
 		err = nil
 		return

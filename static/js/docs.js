@@ -20,6 +20,9 @@ const Docs = {
   key: null,
   // Collection keys opened so far: id -> DocsCrypto.collectionKey.
   folderKeys: new Map(),
+  // The new keys of collections whose keys are being rotated (next_lock),
+  // opened so far: what they are written with until it is done.
+  folderNextKeys: new Map(),
   // Opened with an access token: { key , api_key }; null when signed in.
   scope: null,
   // The account's keyring reply (GET /api/keyring), or null when none is set.
@@ -108,6 +111,9 @@ const Docs = {
       if ( !create || !this.key ) throw DocsCrypto.fail( "no_folder" );
       return this.createTopLevel( collection );
     }
+    // Given its first keys by a rotation still under way: those are its
+    // new keys (nextKeyFor), and it has no others.
+    if ( !folder.lock && folder.next_lock ) throw DocsCrypto.fail( "rotating" );
     const holder = await this.holderFor( folder.parent , create , depth + 1 );
     let key;
     if ( folder.lock ) {
@@ -131,6 +137,57 @@ const Docs = {
     }
     this.folderKeys.set( collection , key );
     return key;
+  },
+
+  // collection's new keys while its keys are being rotated, from its
+  // next_lock; null when they are not. They are wrapped for the parent's new
+  // keys when the parent is being rotated too, else for its keys.
+  async nextKeyFor( collection , depth = 0 ) {
+    if ( this.folderNextKeys.has( collection ) ) return this.folderNextKeys.get( collection );
+    if ( depth > 64 ) throw DocsCrypto.fail( "corrupt" );
+    const folder = DocsTree.get( collection );
+    if ( !folder || !folder.next_lock ) return null;
+    const parent = folder.parent === "" ? null : DocsTree.get( folder.parent );
+    const holder = parent && parent.next_lock ? await this.nextKeyFor( parent.id , depth + 1 ) : await this.holderFor( folder.parent , false , depth + 1 );
+    const key = DocsCrypto.openLock( folder.next_lock , collection , holder );
+    this.folderNextKeys.set( collection , key );
+    return key;
+  },
+
+  // Forgets every collection key opened, for when they may have been
+  // rotated. With an access token, its own collection's stay: they came
+  // with it.
+  forgetKeys() {
+    this.folderKeys.clear();
+    this.folderNextKeys.clear();
+    if ( this.scope ) this.folderKeys.set( this.scope.key.collection , this.scope.key );
+  },
+
+  // The keys that open a collection envelope in collection: the ones it
+  // names, old or new. Keys it names that are not held may have been rotated
+  // in since, so the tree is fetched again once before it is wrong_key.
+  async openingKey( collection , body ) {
+    const named = DocsCrypto.envelopeKeyId( body );
+    const matching = () => [ this.folderNextKeys.get( collection ) , this.folderKeys.get( collection ) ]
+      .find( ( key ) => key && DocsCrypto.b64( key.id ) === named );
+    let key = matching();
+    if ( key ) return key;
+    await this.loadKeys( collection );
+    key = matching();
+    if ( key ) return key;
+    this.forgetKeys();
+    await DocsTree.refresh();
+    await this.loadKeys( collection );
+    key = matching();
+    if ( !key ) throw DocsCrypto.fail( "wrong_key" );
+    return key;
+  },
+
+  // Opens what collection has: its keys and, mid-rotation, its new ones.
+  async loadKeys( collection ) {
+    await this.nextKeyFor( collection );
+    const folder = DocsTree.get( collection );
+    if ( folder && folder.lock ) await this.keyFor( collection , false );
   },
 
   // What wraps a collection under parent: the master key at the top level,
@@ -201,13 +258,28 @@ const Docs = {
       if ( !this.key ) throw DocsCrypto.fail( "wrong_key" );
       return DocsCrypto.open( this.key , collection , id , body );
     }
-    return DocsCrypto.openCollection( await this.keyFor( collection , false ) , id , body );
+    return DocsCrypto.openCollection( await this.openingKey( collection , body ) , id , body );
   },
 
   // JSON text in, a collection envelope sealed and signed for collection/id
-  // out.
+  // out: with its new keys while they are being rotated.
   async sealBody( collection , id , text ) {
-    return DocsCrypto.sealCollection( await this.keyFor( collection , true ) , id , text );
+    const key = ( await this.nextKeyFor( collection ) ) || ( await this.keyFor( collection , true ) );
+    return DocsCrypto.sealCollection( key , id , text );
+  },
+
+  // Runs send( sealed ) with text sealed for collection/id, and once more
+  // with freshly fetched keys if the server says they were rotated since
+  // (stale_key).
+  async sealAndSend( collection , id , text , send ) {
+    try {
+      return await send( await this.sealBody( collection , id , text ) );
+    } catch ( error ) {
+      if ( !( error.status === 409 && error.payload && error.payload.error === "stale_key" ) ) throw error;
+      this.forgetKeys();
+      await DocsTree.refresh();
+      return send( await this.sealBody( collection , id , text ) );
+    }
   },
 
   // ---- links to a document -------------------------------------------------
@@ -305,6 +377,7 @@ const Docs = {
     if ( error.status === 409 && error.payload && error.payload.error === "version_conflict" ) {
       return this.say( "docs.error_conflict" , { version: error.payload.current_version } );
     }
+    if ( error.payload && error.payload.error === "rotating" ) return I18n.get( "docs.error_rotating" );
     if ( error.payload && error.payload.error === "doc_too_large" ) return this.say( "docs.error_too_large" , { size: this.size( error.payload.max_bytes ) } );
     if ( error.payload && error.payload.error === "quota_exceeded" ) return this.say( "docs.error_quota" , { size: this.size( error.payload.quota_bytes ) } );
     // With no cap of the share's own (0), the account's limit was hit:
@@ -361,7 +434,7 @@ const Docs = {
 
   unlockWith( key ) {
     this.key = key;
-    this.folderKeys.clear();
+    this.forgetKeys();
     this.ownedLocks = null;
     this.renderLock();
     // The tree can now mark folders made through an access key.
@@ -446,7 +519,7 @@ const Docs = {
       return;
     }
     this.key = null;
-    this.folderKeys.clear();
+    this.forgetKeys();
     this.ownedLocks = null;
     this.hideShared();
     this.closeEditor();
@@ -524,9 +597,13 @@ const Docs = {
     if ( DocsCrypto.envelopeKind( row.body ) === DocsCrypto.ENVELOPE_MASTER ) {
       mine = this.key ? DocsCrypto.keyId( this.key ) : "";
     } else {
-      const key = this.folderKeys.get( row.collection || this.collection );
+      const at = row.collection || this.collection;
+      const key = this.folderKeys.get( at );
       if ( !key ) return null;
       mine = DocsCrypto.b64( key.id );
+      // Mid-rotation, its new keys open it too.
+      const next = this.folderNextKeys.get( at );
+      if ( next && named === DocsCrypto.b64( next.id ) ) return null;
     }
     if ( named === mine ) return null;
     return Dom.badge( I18n.get( "docs.other_key" ) , "warning" );
@@ -540,7 +617,7 @@ const Docs = {
     // With a key, the folder's keys first, so the rows can say which bodies
     // they open.
     if ( this.hasKey() ) {
-      try { await this.keyFor( collection , false ); } catch ( error ) { /* no keys yet, or not this page's */ }
+      try { await this.loadKeys( collection ); } catch ( error ) { /* no keys yet, or not this page's */ }
     }
     const writable = this.canWrite();
     await Pager.load( "docs-table" , "docs" , ( offset ) => Api.docs( collection , offset , this.pageSize , this.hasKey() ) , ( row ) => {
@@ -667,7 +744,7 @@ const Docs = {
       throw error;
     }
     const text = await this.openBody( from , id , doc.body );
-    const moved = await Api.moveDoc( from , id , to , await this.sealBody( to , id , text ) , doc.version );
+    const moved = await this.sealAndSend( to , id , text , ( sealed ) => Api.moveDoc( from , id , to , sealed , doc.version ) );
     return moved.doc.version;
   },
 
@@ -899,7 +976,7 @@ const Docs = {
 
   // Seals text for collection/id and stores it; answers the new metadata.
   async write( collection , id , text , ifVersion ) {
-    return Api.setDoc( collection , id , await this.sealBody( collection , id , text ) , ifVersion );
+    return this.sealAndSend( collection , id , text , ( sealed ) => Api.setDoc( collection , id , sealed , ifVersion ) );
   },
 
   async onSave( event ) {
@@ -1101,6 +1178,119 @@ const Docs = {
       }
     }
     return this.keyFor( id , false );
+  },
+
+  // ---- rotating a collection's keys -----------------------------------------
+
+  // Rotate keys...: new keys for id and every collection under it, every
+  // collection envelope in them sealed again, and every access key reaching
+  // into them revoked (README.md, "Rotating keys"). Needs the master key.
+  // Safe to stop half way: running it again on the same collection finishes
+  // it.
+  async rotate( id ) {
+    const folder = DocsTree.get( id );
+    if ( !folder ) return;
+    if ( !this.key ) {
+      Dom.toast( I18n.get( "docs.rotate_needs_key" ) , "error" );
+      Dom.reveal( Dom.get( "docs-unlock-card" ) );
+      return;
+    }
+    const ids = DocsTree.subtree( id );
+    const docs = ids.reduce( ( sum , at ) => sum + ( DocsTree.get( at ).count || 0 ) , 0 );
+    const question = this.say( folder.next_lock ? "docs.rotate_resume_question" : ( ids.length > 1 ? "docs.rotate_question_tree" : "docs.rotate_question" ) ,
+      { name: folder.name , folders: ids.length - 1 , docs: docs } );
+    if ( !( await Dom.confirm( question ) ) ) return;
+    Dom.toast( this.say( "docs.rotate_started" , { name: folder.name } ) , "ok" );
+    let done;
+    try {
+      done = await this.rotateKeys( id );
+    } catch ( error ) {
+      Dom.toast( this.say( "docs.rotate_failed" , { name: folder.name , reason: this.failed( error ) } ) , "error" );
+      await DocsTree.refresh();
+      return;
+    }
+    await DocsTree.refresh();
+    Dom.toast( this.say( done.revoked ? "docs.rotate_done_revoked" : "docs.rotate_done" ,
+      { name: folder.name , folders: done.folders , docs: done.docs , revoked: done.revoked } ) , "ok" );
+    if ( Keys.me ) Keys.refresh().catch( () => {} );
+    if ( this.collection ) this.refreshDocs();
+  },
+
+  // The rotation itself, as client.RotateKeys does it: new lockboxes,
+  // parents first (or the ones a rotation already under way staged), every
+  // collection envelope sealed again with the new keys, then the switch.
+  // Answers { folders , docs , revoked } (how many).
+  async rotateKeys( id ) {
+    this.forgetKeys();
+    await DocsTree.refresh();
+    const order = DocsTree.subtree( id );
+    const olds = new Map();
+    const news = new Map();
+    const staged = [];
+    for ( const at of order ) {
+      const folder = DocsTree.get( at );
+      if ( folder.lock ) olds.set( at , await this.keyFor( at , false ) );
+      if ( folder.next_lock ) {
+        news.set( at , await this.nextKeyFor( at ) );
+        continue;
+      }
+      const holder = at === id ? await this.holderFor( folder.parent , false ) : news.get( folder.parent );
+      const key = DocsCrypto.generateCollectionKey( at );
+      // The owner tag stays as it was: keys a sharee made are not the
+      // account's, rotated or not. A folder with no keys yet gets it only
+      // at the top level, as when it is first given keys.
+      const owned = folder.lock ? DocsCrypto.owns( this.key , folder.lock , at ) : folder.parent === "";
+      news.set( at , key );
+      staged.push( [ at , DocsCrypto.sealLock( key , holder , null , null , owned ? this.ownTag( key ) : "" ) ] );
+    }
+    let revoked = 0;
+    for ( let start = 0; start < staged.length; start += 200 ) {
+      const reply = await Api.rotateCollection( id , Object.fromEntries( staged.slice( start , start + 200 ) ) );
+      revoked += ( reply.revoked || [] ).length;
+    }
+    news.forEach( ( key , at ) => this.folderNextKeys.set( at , key ) );
+    let docs = 0;
+    for ( let pass = 0; ; pass++ ) {
+      for ( const at of order ) docs += await this.reseal( at , olds.get( at ) , news.get( at ) );
+      try {
+        const done = await Api.commitRotation( id );
+        this.forgetKeys();
+        return { folders: done.collections.length , docs: docs , revoked: revoked };
+      } catch ( error ) {
+        // Something changed under this pass: the next one picks it up.
+        if ( !( error.status === 409 && error.payload && error.payload.error === "rotate_incomplete" ) || pass >= 3 ) throw error;
+      }
+    }
+  },
+
+  // Seals every collection envelope in collection that next did not seal
+  // again with next, each only if it has not changed since it was read.
+  // Answers how many it wrote. One sealed with neither old nor next cannot
+  // be opened, so it cannot move to the new keys: that stops it.
+  async reseal( collection , old , next ) {
+    const next_id = DocsCrypto.b64( next.id );
+    let count = 0;
+    let offset = 0;
+    while ( offset !== null && offset !== undefined ) {
+      const page = await Api.docs( collection , offset , 200 , true );
+      for ( const row of page.docs ) {
+        if ( row.collection && row.collection !== collection ) throw DocsCrypto.fail( "corrupt" );
+        if ( DocsCrypto.envelopeKind( row.body ) !== DocsCrypto.ENVELOPE_COLLECTION ) continue;
+        const named = DocsCrypto.envelopeKeyId( row.body );
+        if ( named === next_id ) continue;
+        if ( !old || named !== DocsCrypto.b64( old.id ) ) throw new Error( this.say( "docs.rotate_unreadable" , { id: row.id } ) );
+        const text = DocsCrypto.openCollection( old , row.id , row.body );
+        try {
+          await Api.setDoc( collection , row.id , DocsCrypto.sealCollection( next , row.id , text ) , row.version );
+          count++;
+        } catch ( error ) {
+          // Changed or deleted meanwhile: the next pass looks again.
+          if ( error.status !== 409 && error.status !== 404 ) throw error;
+        }
+      }
+      offset = page.next;
+    }
+    return count;
   },
 
   showShared( name , made ) {

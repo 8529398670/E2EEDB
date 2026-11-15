@@ -129,7 +129,9 @@ var migrations = []string{
 	// account itself did), so a client can refuse to write into a folder
 	// someone it shared with made. born is random and never changes: it
 	// tells a folder from a later one that reuses its id, so a scoped key
-	// minted for one never reaches the other.
+	// minted for one never reaches the other. next_lock is the lockbox of
+	// the keys a rotation (StageRotation) is moving the folder to, "" when
+	// none is under way.
 	`CREATE TABLE docs (
 		user_id    INTEGER NOT NULL,
 		collection TEXT    NOT NULL,
@@ -164,6 +166,7 @@ var migrations = []string{
 		seq        INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL,
 		lock       TEXT    NOT NULL DEFAULT '',
+		next_lock  TEXT    NOT NULL DEFAULT '',
 		by_key     TEXT    NOT NULL DEFAULT '',
 		born       INTEGER NOT NULL,
 		PRIMARY KEY ( user_id , id )

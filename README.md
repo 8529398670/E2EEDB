@@ -29,7 +29,7 @@ every route.
 | size of each ciphertext, version, change number, when it changed | |
 | a 16-byte key id per document (which key sealed it, not the key) | any collection's keys |
 | the account's keyring: the master key sealed under the passphrase | |
-| each collection's lockbox: its keys, sealed under its parent's keys or the master key | |
+| each collection's lockbox: its keys, sealed under its parent's keys or the master key (two, while its keys are being rotated) | |
 | which API keys are scoped to which collection, read or write | |
 
 Put nothing secret in collection names or document ids. `client.NewID()` gives
@@ -162,12 +162,23 @@ are minted from a signed-in browser only, as for every key.
 
 **Revoking** the API key cuts access at once. Deleting the collection revokes
 every access key for it, and a key never reaches a later collection that
-reuses the id. It does not change the
-collection's keys: someone who kept a copy of the ciphertext, or a backup,
-could still read what they could read before. Rotating a collection's keys
-(new keys, every document sealed again) is not in this version. Likewise,
-moving a collection out of a shared subtree stops the server serving it to
-that token, but its keys stay the same.
+reuses the id. Revoking does not change the collection's keys, though: the
+server stops serving them, but someone who kept the token still holds keys
+that open whatever the collection holds later and sign documents its readers
+accept, if they get the ciphertext some other way (a leak, a backup, a
+dishonest server). Moving a collection out of a shared subtree is the same:
+the server stops serving it to that token, but its keys stay.
+
+**Rotate keys...** in a collection's menu closes that. It gives the collection,
+and every collection under it, new keys, and seals every document in them
+again under those (see "Rotating keys" below). From then on the old keys open
+nothing new, and nothing signed with them is accepted. It revokes every
+access key for a collection in that subtree, since what their tokens carry is
+the old keys: share again afterwards. Access keys for a collection above it
+keep working. What someone could read before, they could have copied, so
+documents nobody changes since are not made secret again: they are sealed
+again so that forgeries under the old write key are refused. In Go,
+`store.RotateKeys( ctx , "projects" )`.
 
 ## Go client
 
@@ -188,11 +199,16 @@ _ , err = store.MoveCollection( ctx , "invoices" , folder.ID , "" ) // nest invo
 _ , err = store.Delete( ctx , "invoices" , meta.ID )
 
 changes , err := store.Changes( ctx , since , 500 )  // sync: keep changes.NextSince
+
+rotation , err := store.RotateKeys( ctx , "projects" )  // after revoking someone's access key
 ```
 
 Errors: `ErrNotFound`, `*ConflictError` (`ErrConflict`, with the current
 version), `ErrWrongKey`, `ErrCorrupt`, `ErrTooLarge`, `ErrQuota`,
-`ErrSyncExpired` (start again from 0), and `*APIError` for anything else. The
+`ErrSyncExpired` (start again from 0), `ErrRotating` (the collection's keys
+are being rotated: finish that first), and `*APIError` for anything else. A
+client that cached a collection's keys before they were rotated fetches the
+new ones by itself (`Set` and `MoveDoc` retry once on `ErrStaleKey`). The
 package depends only on the standard library and `golang.org/x/crypto`.
 
 ### Sync
@@ -345,6 +361,44 @@ The server sets a lockbox only once (`409 lock_exists`). The one exception is
 a move: moving a collection to another parent sends its lockbox wrapped again
 for that parent, and the server refuses the move without one
 (`409 lock_required`).
+
+### Rotating keys
+
+A rotation gives a collection `R` and every collection under it new keys.
+Each one gets a second lockbox, `next_lock`, in the same format as `lock`:
+
+- `R`'s is wrapped for the same holder as its `lock` (its parent's keys, or
+  the master key at the top level), which is not rotated;
+- every other one's is wrapped for its parent's **new** keys, so the new
+  keys form a tree of their own.
+
+The owner tag carries over as it was: a collection the master key's keys
+made gets one for its new keys, one made through an access token does not.
+
+It runs in three steps, because the documents are too much for one request:
+
+1. `POST /api/collections/{R}/rotate` with `locks`, the new lockboxes, parents
+   first, in as many calls as it takes. The call that carries `R`'s starts
+   the rotation and revokes every access key scoped to a collection in the
+   subtree.
+2. The client seals every collection envelope in the subtree again with the
+   new keys, each with `if_version`, through the ordinary write route.
+3. `POST /api/collections/{R}/rotate/commit`. Once every collection has a
+   `next_lock` and every collection envelope in them names the new keys'
+   `key_id`, each `next_lock` becomes its `lock`, all at once. Otherwise it
+   is `409 rotate_incomplete`, saying how many are left.
+
+Meanwhile readers open a collection envelope with whichever keys it names,
+old or new, and writers seal with the new ones. The server reads the
+`key_id` a lockbox names and the 16 bytes after an envelope's first byte,
+and takes a collection envelope only if it names the keys its collection
+uses now: the new ones mid-rotation, otherwise `lock`'s (`409 stale_key`).
+Until the commit, the subtree's collections cannot be made, moved or given
+lockboxes, and no access key can be made for them (`409 rotating`).
+
+A rotation stopped half way stays as it is: documents open with either
+keys, and starting it again on `R` finishes it (the new keys already staged
+are kept). Private envelopes are not touched: only the master key opens them.
 
 ### Access tokens
 
