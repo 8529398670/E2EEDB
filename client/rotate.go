@@ -59,7 +59,7 @@ func ( client *Client ) RotateKeys( ctx context.Context , collection string ) ( 
 	for _ , id := range order {
 		entry := tree[ id ]
 		if entry.Lock != "" {
-			if olds[ id ] , err = client.resolve( ctx , tree , id , false ); err != nil { return }
+			if olds[ id ] , err = client.resolve( ctx , tree , id , mintNever ); err != nil { return }
 		}
 		if entry.NextLock != "" {
 			if news[ id ] , err = client.resolveNext( ctx , tree , id ); err != nil { return }
@@ -67,11 +67,18 @@ func ( client *Client ) RotateKeys( ctx context.Context , collection string ) ( 
 		}
 		var holder lockHolder
 		if id == collection {
-			if holder , err = client.holder( ctx , tree , entry.Parent , false ); err != nil { return }
+			if holder , err = client.holder( ctx , tree , entry.Parent , mintNever ); err != nil { return }
 		} else {
 			holder = news[ entry.Parent ]
 		}
-		key , key_err := generateCollectionKey( id )
+		// One epoch on from the keys they replace, so a client that sees
+		// these refuses the old lockbox from then on.
+		epoch := client.freshEpochFor( id )
+		if old := olds[ id ]; old != nil {
+			if old.epoch >= maxEpoch { return rotation , fmt.Errorf( "%w: %s is at the last epoch" , ErrCorrupt , id ) }
+			epoch = old.epoch + 1
+		}
+		key , key_err := generateCollectionKey( id , epoch )
 		if key_err != nil { return rotation , key_err }
 		// The owner tag stays as it was: keys a sharee made are not the
 		// account's, rotated or not. A folder with no keys yet gets the tag
@@ -80,6 +87,7 @@ func ( client *Client ) RotateKeys( ctx context.Context , collection string ) ( 
 		if ( entry.Lock != "" && client.key.owns( entry.Lock , id ) ) || ( entry.Lock == "" && entry.Parent == "" ) {
 			own = client.ownTag( key )
 		}
+		key.owned = own != "" && client.holderOwned( holder )
 		lock , lock_err := sealLock( key , holder , own )
 		if lock_err != nil { return rotation , lock_err }
 		news[ id ] = key
@@ -98,8 +106,11 @@ func ( client *Client ) RotateKeys( ctx context.Context , collection string ) ( 
 		if err = client.call( ctx , http.MethodPost , collectionPath( collection ) + "/rotate" , map[string]any{ "locks": batch } , &reply ); err != nil { return }
 		rotation.Revoked = append( rotation.Revoked , reply.Revoked... )
 	}
+	// Staged: from here a lockbox from before this rotation, on its own,
+	// is refused.
 	for _ , id := range order {
-		client.rememberNext( news[ id ] , lockOf( staged[ id ] , tree[ id ].NextLock ) )
+		client.rememberNext( news[ id ] )
+		if err = client.noteEpoch( id , true , news[ id ].epoch ); err != nil { return }
 	}
 
 	// Every collection envelope sealed again, then the switch. A document
@@ -122,15 +133,12 @@ func ( client *Client ) RotateKeys( ctx context.Context , collection string ) ( 
 		rotation.Collections = reply.Collections
 		break
 	}
+	// Committed: only the new lockboxes are good now.
+	for _ , id := range order {
+		if err = client.noteEpoch( id , false , news[ id ].epoch ); err != nil { return }
+	}
 	client.forget()
 	return
-}
-
-// lockOf is the lockbox text that holds a collection's new keys: the one
-// just staged, or the one already there.
-func lockOf( staged string , existing string ) string {
-	if staged != "" { return staged }
-	return existing
 }
 
 // subtreeOf is root and every collection under it in tree, parents first.

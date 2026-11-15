@@ -69,6 +69,13 @@ Known limits, by design:
   document, or move one to another collection or id: the ciphertext is bound
   to its place. It can still serve an older version it kept, or pretend a
   document does not exist. Version numbers are not authenticated.
+- **A key rotation can be rolled back for a client with no memory.** Once a
+  client has seen a rotation (see "Rotating keys"), it refuses the lockbox
+  from before it. A client that never saw it cannot tell: a new device, a
+  browser whose site data was cleared or that used **Forget this device**, or
+  a Go client without `client.WithState`, which remembers only while the
+  process runs. A dishonest server can hand such a client the old lockbox,
+  whose keys a revoked access token still holds.
 - **The keyring can be guessed against.** Anyone holding the database can try
   passphrases offline. Argon2id makes each guess expensive, but a weak
   passphrase is still weak. Use a long one, or never set one: services use the
@@ -150,13 +157,25 @@ top level. It can make, move and delete collections inside its own, always
 with random ids (22 characters, as `client.NewID()` makes), so it cannot take
 an id your own code writes to by name. A collection made that way has no
 owner tag in its lockbox (see "Lockboxes"), and the Go client will not write
-your documents into one unless you pass `client.AllowShared()`
-(`ErrSharedCollection` otherwise). The server also reports it (`by_key`), but
-neither client goes by that: a dishonest server could leave it out.
+your documents into one, or into anything under one, unless you pass
+`client.AllowShared()` (`ErrSharedCollection` otherwise). The Documents
+screen asks first. The server also reports it (`by_key`), but neither client
+goes by that: a dishonest server could leave it out.
+
+Where a collection sits is only the server's word, so a client never quietly
+gives keys to a folder that has none yet and that the server puts under a
+parent: they would be wrapped for the parent's keys, which open for whoever
+holds an access key to the parent. The Go client refuses
+(`ErrSharedCollection`) unless you pass `AllowShared`, and the Documents
+screen asks, naming the parent. A folder at the top level gets its keys
+without asking, since only the master key opens those.
 
 Sharing first gives every collection in the subtree its keys, and seals any
 private envelope in it (which only the master key opens) again as a
-collection envelope. In Go, `PrepareShare` does that and returns the keys, and
+collection envelope. A collection in the subtree whose keys are not your own,
+or that has none yet, could be there only because the server says so: if it
+holds private envelopes, sharing stops before it changes anything and names
+it. Move it out, or its documents, then share again. In Go, `PrepareShare` does that and returns the keys, and
 `client.NewAccessToken( scopedAPIKey , keys )` builds the token. API keys
 are minted from a signed-in browser only, as for every key.
 
@@ -186,7 +205,8 @@ again so that forgeries under the old write key are refused. In Go,
 import client "github.com/8529398670/E2EEDB/client"
 
 key , _ := client.GenerateKey()        // once; keep it with your secrets
-store , err := client.New( "https://docs.example.com" , apiKey , key )
+store , err := client.New( "https://docs.example.com" , apiKey , key ,
+	client.WithState( "/var/lib/myapp/e2eedb-state.json" ) )  // remembers key rotations seen
 
 meta , err := store.Set( ctx , "invoices" , client.NewID() , invoice , client.MustNotExist() )
 _ , err = store.Get( ctx , "invoices" , meta.ID , &invoice )
@@ -206,7 +226,10 @@ rotation , err := store.RotateKeys( ctx , "projects" )  // after revoking someon
 Errors: `ErrNotFound`, `*ConflictError` (`ErrConflict`, with the current
 version), `ErrWrongKey`, `ErrCorrupt`, `ErrTooLarge`, `ErrQuota`,
 `ErrSyncExpired` (start again from 0), `ErrRotating` (the collection's keys
-are being rotated: finish that first), and `*APIError` for anything else. A
+are being rotated: finish that first), `ErrSharedCollection` (the keys are not
+this master key's own, or would not be: pass `AllowShared` to write anyway),
+`ErrRolledBack` (the server sent keys from before a rotation this client has
+seen), and `*APIError` for anything else. A
 client that cached a collection's keys before they were rotated fetches the
 new ones by itself (`Set` and `MoveDoc` retry once on `ErrStaleKey`). The
 package depends only on the standard library and `golang.org/x/crypto`.
@@ -326,8 +349,14 @@ it:
 
 ```
 lock_seed = BLAKE2b-256( key = M , message = "e2eedb/lock/sign-seed" )
-sig       = Ed25519-sign( holder , "e2eedb/lock/sign" || 0x00 || c || 0x00 || parent || 0x00 || key_id || nonce_r || read || nonce_w || write )
+sig       = Ed25519-sign( holder , "e2eedb/lock/sign" || 0x00 || c || 0x00 || parent || 0x00 || key_id || epoch || nonce_r || read || nonce_w || write )
 ```
+
+`epoch` is 8 bytes, big-endian: how new the keys are. Keys made fresh get the
+time in Unix seconds, or one more than the highest epoch the client has seen
+for that id when that is later. A rotation's new keys get one more than the
+keys they replace. A move re-wraps the same keys, so it keeps the epoch. It
+is at least 1 and at most 2^53 - 1, so a browser's numbers hold it exactly.
 
 A collection whose keys the master key made also carries the owner tag
 `own`, which only the master key can make or check:
@@ -337,7 +366,7 @@ own = BLAKE2b-256( key = M , message = "e2eedb/lock/own" || 0x00 || c || 0x00 ||
 ```
 
 ```json
-{"parent":"<parent id, or \"\">","by":"<holder's key id>","key_id":"<c's key id>",
+{"parent":"<parent id, or \"\">","by":"<holder's key id>","key_id":"<c's key id>","epoch":1793000000,
  "nonce_r":"…","read":"…","nonce_w":"…","write":"…","sig":"…","own":"…"}
 ```
 
@@ -347,8 +376,11 @@ true, and copying it onto other keys makes it fail. Clients add it when they
 make a collection with the master key in hand. They leave it out when they
 give keys to an existing folder that has none, unless that folder is at the
 top level: under a parent, such a folder could be anyone's who holds the
-parent's keys. A master-key client treats a collection without a valid `own`
-as made through an access token.
+parent's keys. A master-key client treats a collection as its own only if
+its lockbox, and every lockbox above it, carries a valid `own`. A folder made
+inside one that is not its own gets no `own` either. Ownership belongs to
+each set of keys: a collection's `next_lock` is judged by its own `own`, not
+by `lock`'s.
 
 Every reader checks `sig` before opening `read`, and a lockbox without a valid
 one opens for nobody. A read-only key holds the parent's `vk` but not its
@@ -399,6 +431,27 @@ lockboxes, and no access key can be made for them (`409 rotating`).
 A rotation stopped half way stays as it is: documents open with either
 keys, and starting it again on `R` finishes it (the new keys already staged
 are kept). Private envelopes are not touched: only the master key opens them.
+
+**Rolling it back.** Each `next_lock` carries an epoch one more than its
+`lock` (see "Lockboxes"). Every client remembers the highest epoch it has
+seen for each collection, as a `lock` and as a `next_lock`, and refuses a
+lockbox below it (`ErrRolledBack` in Go):
+
+- a `lock` below the highest `lock` seen;
+- a `lock` below the highest `next_lock` seen, unless a `next_lock` one epoch
+  on is still there and opens (the rotation still under way);
+- a `next_lock` below either.
+
+So once a client has seen a rotation staged, the server cannot go back to the
+old keys alone, and once it has seen the commit, not even dressed up as a
+rotation still under way. The client that rotates records both.
+
+The browser keeps this in IndexedDB, per account (or per access token), and
+**Forget this device** on the Documents screen drops it. The Go client keeps
+it in memory for as long as the `Client` lives, and across restarts with
+`client.WithState( path )`: a JSON file, mode 0600, written atomically, that
+several accounts and tokens can share. A client with no memory cannot tell
+(see "Known limits").
 
 ### Access tokens
 

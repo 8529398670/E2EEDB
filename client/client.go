@@ -146,10 +146,11 @@ type Client struct {
 	// next is the opened next lockboxes of collections whose keys are
 	// being rotated: what they are written with until it is done.
 	next  map[ string ]*CollectionKey
-	// owned is the collections whose lockbox carries the master key's owner
-	// tag: the ones a master-key client made. It does not write into the
-	// others unless asked to (AllowShared).
-	owned map[ string ]bool
+	// marks is the highest lockbox epochs seen, by collection (epochs.go).
+	// forget keeps them.
+	marks map[ string ]epochMark
+	statePath  string
+	stateMutex sync.Mutex
 }
 
 // Option changes how a Client is made.
@@ -166,6 +167,7 @@ func New( baseURL string , apiKey string , masterKey string , options ...Option 
 	key , err := ParseKey( masterKey )
 	if err != nil { return }
 	client = newClient( baseURL , apiKey , key , options )
+	if err = client.loadState(); err != nil { client = nil }
 	return
 }
 
@@ -178,11 +180,12 @@ func NewScoped( baseURL string , token string , options ...Option ) ( client *Cl
 	client = newClient( baseURL , api_key , nil , options )
 	client.scope = key
 	client.keys[ key.collection ] = key
+	if err = client.loadState(); err != nil { client = nil }
 	return
 }
 
 func newClient( baseURL string , apiKey string , key *Key , options []Option ) ( client *Client ) {
-	client = &Client{ base: strings.TrimRight( baseURL , "/" ) , apiKey: apiKey , key: key , http: &http.Client{ Timeout: 30 * time.Second } , keys: map[ string ]*CollectionKey{} , next: map[ string ]*CollectionKey{} , owned: map[ string ]bool{} }
+	client = &Client{ base: strings.TrimRight( baseURL , "/" ) , apiKey: apiKey , key: key , http: &http.Client{ Timeout: 30 * time.Second } , keys: map[ string ]*CollectionKey{} , next: map[ string ]*CollectionKey{} , marks: map[ string ]epochMark{} }
 	for _ , option := range options {
 		option( client )
 	}
@@ -228,10 +231,16 @@ func AllowShared() WriteOption {
 var ErrSharedCollection = errors.New( "e2eedb: this collection was not made with this master key (made through an access token?); pass AllowShared to write into it" )
 
 // writeKey is the key a write to collection seals with, refusing a
-// collection made through an access token unless options allow it.
+// collection whose keys are not the master key's own (made through an access
+// token, or under one) unless options allow it. Without AllowShared it also
+// never gives keys to a collection the server says sits under a parent and
+// has none yet: they would be wrapped for whoever holds that parent's.
 func ( client *Client ) writeKey( ctx context.Context , collection string , options []WriteOption ) ( key *CollectionKey , err error ) {
-	if key , err = client.sealingKey( ctx , collection ); err != nil { return }
-	if client.key != nil && client.isOwned( collection ) == false && writeOpts( options ).allowShared == false {
+	allow := writeOpts( options ).allowShared
+	mode := mintOwn
+	if allow { mode = mintShared }
+	if key , err = client.sealingKey( ctx , collection , mode ); err != nil { return }
+	if client.key != nil && key.owned == false && allow == false {
 		key , err = nil , ErrSharedCollection
 	}
 	return
@@ -406,18 +415,24 @@ func collectionPath( id string ) string {
 // with no folder also makes one, at the top level, named after the id.
 func ( client *Client ) CreateCollection( ctx context.Context , folder NewCollection ) ( collection Collection , err error ) {
 	if folder.ID == "" { folder.ID = NewID() }
-	holder , err := client.holder( ctx , nil , folder.Parent , true )
+	holder , err := client.holder( ctx , nil , folder.Parent , mintOwn )
 	if err != nil { return }
-	key , err := generateCollectionKey( folder.ID )
+	key , err := generateCollectionKey( folder.ID , client.freshEpochFor( folder.ID ) )
 	if err != nil { return }
-	lock , err := sealLock( key , holder , client.ownTag( key ) )
+	// The owner tag only under keys that are the master key's own: a folder
+	// made inside one a sharee made is on the sharee's side.
+	key.owned = client.holderOwned( holder )
+	own := ""
+	if key.owned { own = client.ownTag( key ) }
+	lock , err := sealLock( key , holder , own )
 	if err != nil { return }
 	request := map[string]any{ "id": folder.ID , "lock": lock }
 	if folder.Name != "" { request[ "name" ] = folder.Name }
 	if folder.Parent != "" { request[ "parent" ] = folder.Parent }
 	if folder.Before != "" { request[ "before" ] = folder.Before }
 	if err = client.call( ctx , http.MethodPost , "/api/collections" , request , &collection ); err != nil { return }
-	client.remember( key , client.key != nil )
+	if err = client.noteEpoch( folder.ID , false , key.epoch ); err != nil { return }
+	client.remember( key )
 	return
 }
 
@@ -439,9 +454,9 @@ func ( client *Client ) MoveCollection( ctx context.Context , id string , parent
 	tree , err := client.tree( ctx )
 	if err != nil { return }
 	if entry , found := tree[ id ]; found && entry.Lock != "" && entry.Parent != parent {
-		key , key_err := client.resolve( ctx , tree , id , false )
+		key , key_err := client.resolve( ctx , tree , id , mintNever )
 		if key_err != nil { return collection , key_err }
-		holder , holder_err := client.holder( ctx , tree , parent , true )
+		holder , holder_err := client.holder( ctx , tree , parent , mintOwn )
 		if holder_err != nil { return collection , holder_err }
 		// The owner tag goes along as it was: a move does not change who
 		// made the keys.

@@ -38,6 +38,10 @@ type vectors struct {
 	ChildRead    string `json:"child_read_key"`
 	ChildWrite   string `json:"child_write_key"`
 	ChildLockbox string `json:"child_lockbox"`
+	// The two lockboxes' epochs: the child's is past 2^32, so all eight
+	// signed bytes are checked.
+	Epoch        uint64 `json:"epoch"`
+	ChildEpoch   uint64 `json:"child_epoch"`
 	APIKey       string `json:"api_key"`
 	AccessToken  string `json:"access_token_read_only"`
 }
@@ -55,7 +59,9 @@ func fixedVectors( t *testing.T ) ( result vectors ) {
 	ring , err := key.wrapWith( "correct horse battery staple" , salt , nonce , keyringOps , keyringMem )
 	if err != nil { t.Fatal( err ) }
 	notes := fixedCollectionKey( t , "notes" , 0x40 )
+	notes.epoch = 1793000000
 	child := fixedCollectionKey( t , "notes-2024" , 0x60 )
+	child.epoch = 1 << 32 + 1
 	envelope_collection , err := notes.sealWithNonce( "doc-1" , []byte( plaintext ) , nonce )
 	if err != nil { t.Fatal( err ) }
 	nonce_w := bytes.Repeat( []byte{ 0x42 } , nonceSize )
@@ -70,7 +76,7 @@ func fixedVectors( t *testing.T ) ( result vectors ) {
 		VerifyKey: b64.EncodeToString( notes.verify ) , ReadKeyID: notes.ID() ,
 		EnvelopeCollection: b64.EncodeToString( envelope_collection ) , Lockbox: lock ,
 		Child: "notes-2024" , ChildRead: b64.EncodeToString( child.read[ : ] ) , ChildWrite: b64.EncodeToString( child.sign.Seed() ) ,
-		ChildLockbox: child_lock , APIKey: "kid.secret" , AccessToken: token ,
+		ChildLockbox: child_lock , Epoch: notes.epoch , ChildEpoch: child.epoch , APIKey: "kid.secret" , AccessToken: token ,
 		MasterKey: key.Export() , KeyID: key.ID() , Collection: "notes" , DocID: "doc-1" , Plaintext: plaintext ,
 		Nonce: b64.EncodeToString( nonce ) , Envelope: b64.EncodeToString( envelope ) ,
 		Passphrase: "correct horse battery staple" , Keyring: ring ,
@@ -145,17 +151,17 @@ func ( holder forger ) lockVerifier() ed25519.PublicKey { return holder.sign.Pub
 // lockbox other holders accept: it can wrap the read half, but cannot sign as
 // the parent, and a lockbox without the signature is refused.
 func TestForgedChildLockbox( t *testing.T ) {
-	parent , _ := generateCollectionKey( "parent" )
+	parent , _ := generateCollectionKey( "parent" , 1 )
 	_ , own_sign , _ := ed25519.GenerateKey( nil )
 	fake := forger{ parent: parent.ReadOnly() , sign: own_sign , write: bytes.Repeat( []byte{ 7 } , 32 ) }
-	planted , _ := generateCollectionKey( "child" )
+	planted , _ := generateCollectionKey( "child" , 1 )
 	forged , err := sealLockWith( planted , fake , bytes.Repeat( []byte{ 1 } , nonceSize ) , bytes.Repeat( []byte{ 2 } , nonceSize ) , "" )
 	if err != nil { t.Fatal( err ) }
 	if _ , err = openLock( forged , "child" , parent.ReadOnly() ); err == nil { t.Fatal( "another read-only holder accepted a forged lockbox" ) }
 	if _ , err = openLock( forged , "child" , parent ); err == nil { t.Fatal( "the parent's full holder accepted a forged lockbox" ) }
 	// The real one opens for both, and stops opening once its signature is
 	// stripped.
-	real , _ := generateCollectionKey( "child" )
+	real , _ := generateCollectionKey( "child" , 1 )
 	lock , _ := sealLock( real , parent , "" )
 	if _ , err = openLock( lock , "child" , parent.ReadOnly() ); err != nil { t.Fatalf( "reader: %v" , err ) }
 	if _ , err = openLock( lock , "child" , parent ); err != nil { t.Fatalf( "writer: %v" , err ) }
@@ -222,9 +228,9 @@ func TestParseKey( t *testing.T ) {
 func TestCollectionKeys( t *testing.T ) {
 	encoded , _ := GenerateKey()
 	master , _ := ParseKey( encoded )
-	parent , err := generateCollectionKey( "parent" )
+	parent , err := generateCollectionKey( "parent" , 1 )
 	if err != nil { t.Fatal( err ) }
-	child , _ := generateCollectionKey( "child" )
+	child , _ := generateCollectionKey( "child" , 1 )
 	parent_lock , err := sealLock( parent , master , "" )
 	if err != nil { t.Fatal( err ) }
 	child_lock , err := sealLock( child , parent , "" )
@@ -243,7 +249,7 @@ func TestCollectionKeys( t *testing.T ) {
 	// A lockbox read for another collection, or with the wrong holder, fails.
 	if _ , err = openLock( child_lock , "other" , opened_parent ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "wrong collection: %v" , err ) }
 	if _ , err = openLock( child_lock , "child" , master ); errors.Is( err , ErrCorrupt ) == false { t.Fatalf( "wrong parent: %v" , err ) }
-	stranger , _ := generateCollectionKey( "parent" )
+	stranger , _ := generateCollectionKey( "parent" , 1 )
 	if _ , err = openLock( child_lock , "child" , stranger ); errors.Is( err , ErrWrongKey ) == false { t.Fatalf( "stranger: %v" , err ) }
 	other_encoded , _ := GenerateKey()
 	other_master , _ := ParseKey( other_encoded )
@@ -281,8 +287,8 @@ func TestOwnerTag( t *testing.T ) {
 	key , _ := ParseKey( master )
 	other_master , _ := GenerateKey()
 	other , _ := ParseKey( other_master )
-	parent , _ := generateCollectionKey( "shared" )
-	child , _ := generateCollectionKey( "invoices" )
+	parent , _ := generateCollectionKey( "shared" , 1 )
+	child , _ := generateCollectionKey( "invoices" , 1 )
 	own := key.ownTag( "invoices" , child.id[ : ] )
 	lock , err := sealLock( child , parent , own )
 	if err != nil { t.Fatal( err ) }
@@ -291,7 +297,7 @@ func TestOwnerTag( t *testing.T ) {
 	if key.owns( lock , "other" ) { t.Fatal( "the tag held for another collection" ) }
 	// A sharee's own keys under the same id, with the owner's tag copied
 	// across: the tag names other keys, so it fails.
-	squat , _ := generateCollectionKey( "invoices" )
+	squat , _ := generateCollectionKey( "invoices" , 1 )
 	planted , _ := sealLock( squat , parent , own )
 	if key.owns( planted , "invoices" ) { t.Fatal( "a tag copied onto other keys was accepted" ) }
 	untagged , _ := sealLock( squat , parent , "" )

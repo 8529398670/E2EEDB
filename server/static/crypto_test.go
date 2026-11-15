@@ -14,3 +14,12 @@ func TestBrowserCryptoMatchesTheVectors( t *testing.T ) {
 	output , err := exec.Command( node , "../../scripts/check_crypto.js" ).CombinedOutput()
 	if err != nil { t.Fatalf( "%s" , output ) }
 }
+
+// The Documents screen's key handling (docs.js) against a dishonest server:
+// what the Go client refuses, it refuses or asks about first.
+func TestBrowserKeyHandling( t *testing.T ) {
+	node , err := exec.LookPath( "node" )
+	if err != nil { t.Skip( "node is not installed" ) }
+	output , err := exec.Command( node , "../../scripts/check_docs_keys.js" ).CombinedOutput()
+	if err != nil { t.Fatalf( "%s" , output ) }
+}

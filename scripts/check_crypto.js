@@ -48,12 +48,14 @@ page.sodium.ready.then( () => {
 
   // Collection keys, built from the same fixed bytes the Go test uses.
   const counting = ( start , n ) => Bytes.from( { length: n } , ( _ , i ) => ( start + i ) & 255 );
-  const fixed = ( collection , start ) => {
+  const fixed = ( collection , start , epoch ) => {
     const seed = counting( start + 32 , 32 );
-    return C.collectionKey( collection , counting( start , 32 ) , C.sodium.crypto_sign_seed_keypair( seed ).publicKey , seed );
+    const key = C.collectionKey( collection , counting( start , 32 ) , C.sodium.crypto_sign_seed_keypair( seed ).publicKey , seed );
+    key.epoch = epoch;
+    return key;
   };
-  const notes = fixed( vectors.collection , 0x40 );
-  const child = fixed( vectors.child , 0x60 );
+  const notes = fixed( vectors.collection , 0x40 , vectors.epoch );
+  const child = fixed( vectors.child , 0x60 , vectors.child_epoch );
   check( "verify key" , C.b64( notes.verify ) === vectors.verify_key );
   check( "read key id" , C.b64( notes.id ) === vectors.read_key_id );
   check( "collection seal" , C.sealCollection( notes , vectors.doc_id , vectors.plaintext , nonce ) === vectors.envelope_collection );
@@ -69,6 +71,15 @@ page.sodium.ready.then( () => {
   // And opening what Go wrote.
   const opened = C.openLock( vectors.lockbox , vectors.collection , master );
   check( "lockbox open" , C.canWrite( opened ) && C.openCollection( opened , vectors.doc_id , vectors.envelope_collection ) === vectors.plaintext );
+  check( "lockbox epoch" , opened.epoch === vectors.epoch );
+  // The epoch is signed: a lockbox served with an older one opens for nobody.
+  for ( const epoch of [ vectors.epoch - 1 , 0 , 1.5 , "1" , null , 2 ** 53 ] ) {
+    const changed = JSON.parse( vectors.lockbox );
+    changed.epoch = epoch;
+    let code = "";
+    try { C.openLock( JSON.stringify( changed ) , vectors.collection , master ); } catch ( error ) { code = error.code; }
+    check( "changed epoch refused (" + epoch + ")" , code === "corrupt" );
+  }
   check( "child lockbox open" , C.b64( C.openLock( vectors.child_lockbox , vectors.child , opened ).read ) === vectors.child_read_key );
   const token = C.parseToken( vectors.access_token_read_only );
   check( "token parse" , token && token.api_key === vectors.api_key && !C.canWrite( token.key ) );
@@ -85,10 +96,10 @@ page.sodium.ready.then( () => {
   }
   // A reader planting a child lockbox: it can wrap the read half, but its
   // signature is not the parent's.
-  const planted = fixed( "planted" , 0x10 );
+  const planted = fixed( "planted" , 0x10 , 1 );
   const box = JSON.parse( C.sealLock( planted , notes , nonce , nonce_w ) );
   const own = C.sodium.crypto_sign_seed_keypair( counting( 0x90 , 32 ) );
-  box.sig = C.b64( C.sodium.crypto_sign_detached( C.lockSigned( "planted" , box.parent , C.unb64( box.key_id ) , C.unb64( box.nonce_r ) , C.unb64( box.read ) , C.unb64( box.nonce_w ) , C.unb64( box.write ) ) , own.privateKey ) );
+  box.sig = C.b64( C.sodium.crypto_sign_detached( C.lockSigned( "planted" , box.parent , C.unb64( box.key_id ) , box.epoch , C.unb64( box.nonce_r ) , C.unb64( box.read ) , C.unb64( box.nonce_w ) , C.unb64( box.write ) ) , own.privateKey ) );
   let forged_lock = "";
   try { C.openLock( JSON.stringify( box ) , "planted" , token.key ); } catch ( error ) { forged_lock = error.code; }
   check( "forged lockbox refused to a reader" , forged_lock === "corrupt" );

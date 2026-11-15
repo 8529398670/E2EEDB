@@ -46,42 +46,51 @@ func ( client *Client ) cachedNext( collection string ) ( key *CollectionKey ) {
 	return
 }
 
-// rememberNext keeps collection's new keys, opened from lock.
-func ( client *Client ) rememberNext( key *CollectionKey , lock string ) {
+// rememberNext keeps collection's new keys.
+func ( client *Client ) rememberNext( key *CollectionKey ) {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
 	client.next[ key.collection ] = key
-	client.owned[ key.collection ] = client.key != nil && client.key.owns( lock , key.collection )
 }
 
 // forget drops every key opened from a lockbox, for when they may have been
 // rotated. A scoped client keeps its own collection's, which came with its
-// token.
+// token. The epochs seen stay (epochs.go).
 func ( client *Client ) forget() {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
 	client.keys = map[ string ]*CollectionKey{}
 	client.next = map[ string ]*CollectionKey{}
-	client.owned = map[ string ]bool{}
 	if client.scope != nil {
 		client.keys[ client.scope.collection ] = client.scope
 	}
 }
 
-// isOwned is whether collection's lockbox, when its keys were opened, held
-// this client's owner tag (Key.ownTag).
-func ( client *Client ) isOwned( collection string ) bool {
-	client.mutex.Lock()
-	defer client.mutex.Unlock()
-	return client.owned[ collection ]
-}
-
-// remember keeps key, and whether the master key made it.
-func ( client *Client ) remember( key *CollectionKey , owned bool ) {
+// remember keeps key.
+func ( client *Client ) remember( key *CollectionKey ) {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
 	client.keys[ key.collection ] = key
-	client.owned[ key.collection ] = owned
+}
+
+// holderOwned is whether keys wrapped by holder can be the master key's own:
+// the master key itself, or keys that are owned.
+func ( client *Client ) holderOwned( holder lockHolder ) bool {
+	if client.key == nil { return false }
+	switch held := holder.( type ) {
+	case *Key:
+		return true
+	case *CollectionKey:
+		return held.owned
+	}
+	return false
+}
+
+// ownedUnder is whether keys opened with holder from lock (collection's)
+// are the master key's own: lock carries its owner tag, and so does every
+// lockbox above it.
+func ( client *Client ) ownedUnder( holder lockHolder , lock string , collection string ) bool {
+	return client.holderOwned( holder ) && client.key.owns( lock , collection )
 }
 
 // ownTag is the owner tag for key, "" for a scoped client.
@@ -90,11 +99,22 @@ func ( client *Client ) ownTag( key *CollectionKey ) string {
 	return client.key.ownTag( key.collection , key.id[ : ] )
 }
 
-// rememberLock keeps key, opened from lock: owned if lock holds this
-// client's tag.
-func ( client *Client ) rememberLock( key *CollectionKey , lock string ) {
-	client.remember( key , client.key != nil && client.key.owns( lock , key.collection ) )
-}
+// mint is when resolve may give a collection with no keys yet its first.
+type mint int
+
+const (
+	// mintNever: a collection with no keys is ErrCorrupt.
+	mintNever mint = iota
+	// mintOwn: only where no one else gets them: at the top level (the
+	// master key wraps them), or for a scoped client (whose own they are).
+	// A master-key client refuses one under a parent with
+	// ErrSharedCollection, since where a collection sits is only the
+	// server's word, and keys under a parent open for whoever holds the
+	// parent's (an access token's holder).
+	mintOwn
+	// mintShared: under a parent too (AllowShared, PrepareShare).
+	mintShared
+)
 
 // tree is every collection this client can see, by id.
 func ( client *Client ) tree( ctx context.Context ) ( tree map[ string ]Collection , err error ) {
@@ -128,24 +148,30 @@ func ( client *Client ) tree( ctx context.Context ) ( tree map[ string ]Collecti
 // parent; and one that does not exist yet is made at the top level, which
 // needs the master key. Without create, a collection with no keys is
 // ErrCorrupt (nothing in it can be a collection envelope).
+//
+// With the master key, a collection the server says sits under a parent
+// and has no keys yet is not given keys here (ErrSharedCollection): give it
+// keys by writing to it with AllowShared, or share its parent (PrepareShare).
 func ( client *Client ) CollectionKey( ctx context.Context , collection string , create bool ) ( key *CollectionKey , err error ) {
 	if key = client.cached( collection ); key != nil { return }
 	tree , err := client.tree( ctx )
 	if err != nil { return }
-	key , err = client.resolve( ctx , tree , collection , create )
+	mode := mintNever
+	if create { mode = mintOwn }
+	key , err = client.resolve( ctx , tree , collection , mode )
 	return
 }
 
 // resolve is CollectionKey with the tree in hand.
-func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collection , id string , create bool ) ( key *CollectionKey , err error ) {
+func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collection , id string , mode mint ) ( key *CollectionKey , err error ) {
 	if key = client.cached( id ); key != nil { return }
 	entry , found := tree[ id ]
 	if found == false {
-		if create == false || client.key == nil {
+		if mode == mintNever || client.key == nil {
 			err = errOutOfScope
 			return
 		}
-		key , err = client.createTopLevel( ctx , id )
+		key , err = client.createTopLevel( ctx , id , mode )
 		return
 	}
 	if entry.Lock == "" && entry.NextLock != "" {
@@ -153,25 +179,32 @@ func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collect
 		err = ErrRotating
 		return
 	}
-	holder , err := client.holder( ctx , tree , entry.Parent , create )
+	if entry.Lock == "" {
+		switch {
+		case mode == mintNever:
+			err = fmt.Errorf( "%w: collection %s has no keys yet" , ErrCorrupt , id )
+			return
+		case mode == mintOwn && client.key != nil && entry.Parent != "":
+			err = fmt.Errorf( "%w: collection %s has no keys yet and the server puts it inside %s, so its keys would open for whoever holds %s's; pass AllowShared to give it keys there" , ErrSharedCollection , id , entry.Parent , entry.Parent )
+			return
+		}
+	}
+	holder , err := client.holder( ctx , tree , entry.Parent , mode )
 	if err != nil { return }
 	if entry.Lock != "" {
-		if key , err = openLock( entry.Lock , id , holder ); err == nil {
-			client.rememberLock( key , entry.Lock )
+		if key , err = client.openChecked( ctx , tree , entry , entry.Lock , holder ); err == nil {
+			client.remember( key )
 		}
 		return
 	}
-	if create == false {
-		err = fmt.Errorf( "%w: collection %s has no keys yet" , ErrCorrupt , id )
-		return
-	}
-	if key , err = generateCollectionKey( id ); err != nil { return }
+	if key , err = generateCollectionKey( id , client.freshEpochFor( id ) ); err != nil { return }
 	// Fresh keys for a folder someone else made: the master key tags them
 	// only at the top level, where it alone holds them. Under a parent, the
 	// folder could be anyone's who holds the parent's keys (a sharee's, put
 	// there with no lockbox by a server), so it stays untagged.
 	own := ""
 	if entry.Parent == "" { own = client.ownTag( key ) }
+	key.owned = own != ""
 	lock , err := sealLock( key , holder , own )
 	if err != nil { return }
 	err = client.call( ctx , http.MethodPost , collectionPath( id ) , map[string]any{ "lock": lock } , nil )
@@ -184,12 +217,22 @@ func ( client *Client ) resolve( ctx context.Context , tree map[ string ]Collect
 			err = fmt.Errorf( "%w: collection %s lost its keys" , ErrCorrupt , id )
 			return
 		}
-		lock = entry.Lock
-		key , err = openLock( lock , id , holder )
+		key , err = client.openChecked( ctx , tree , entry , entry.Lock , holder )
+	} else if err == nil {
+		err = client.noteEpoch( id , false , key.epoch )
 	}
 	if err == nil {
-		client.rememberLock( key , lock )
+		client.remember( key )
 	}
+	return
+}
+
+// openChecked opens entry's lock with holder: whether its keys are owned
+// (ownedUnder), and refused if this client has seen newer (checkLock).
+func ( client *Client ) openChecked( ctx context.Context , tree map[ string ]Collection , entry Collection , lock string , holder lockHolder ) ( key *CollectionKey , err error ) {
+	if key , err = openLock( lock , entry.ID , holder ); err != nil { return }
+	key.owned = client.ownedUnder( holder , lock , entry.ID )
+	if err = client.checkLock( ctx , tree , entry , key ); err != nil { key = nil }
 	return
 }
 
@@ -205,24 +248,30 @@ func ( client *Client ) resolveNext( ctx context.Context , tree map[ string ]Col
 		next , next_err := client.resolveNext( ctx , tree , entry.Parent )
 		if next_err != nil { return nil , next_err }
 		holder = next
-	} else if holder , err = client.holder( ctx , tree , entry.Parent , false ); err != nil {
+	} else if holder , err = client.holder( ctx , tree , entry.Parent , mintNever ); err != nil {
 		return
 	}
-	if key , err = openLock( entry.NextLock , id , holder ); err == nil {
-		client.rememberNext( key , entry.NextLock )
+	if key , err = openLock( entry.NextLock , id , holder ); err != nil { return }
+	key.owned = client.ownedUnder( holder , entry.NextLock , id )
+	// A next_lock below one already seen is an older rotation's.
+	if mark := client.mark( id ); key.epoch < mark.Next || key.epoch < mark.Lock {
+		return nil , fmt.Errorf( "%w: %s's new keys are of epoch %d, after %d" , ErrRolledBack , id , key.epoch , max( mark.Next , mark.Lock ) )
 	}
+	if err = client.noteEpoch( id , true , key.epoch ); err != nil { return nil , err }
+	client.rememberNext( key )
 	return
 }
 
 // sealingKey is what a write to collection seals with: its new keys while a
-// rotation is under way, else its keys, given to it now if it has none.
-func ( client *Client ) sealingKey( ctx context.Context , collection string ) ( key *CollectionKey , err error ) {
+// rotation is under way, else its keys, given to it now (as mode allows) if
+// it has none.
+func ( client *Client ) sealingKey( ctx context.Context , collection string , mode mint ) ( key *CollectionKey , err error ) {
 	if key = client.cachedNext( collection ); key != nil { return }
 	if key = client.cached( collection ); key != nil { return }
 	tree , err := client.tree( ctx )
 	if err != nil { return }
 	if key , err = client.resolveNext( ctx , tree , collection ); key != nil || err != nil { return }
-	key , err = client.resolve( ctx , tree , collection , true )
+	key , err = client.resolve( ctx , tree , collection , mode )
 	return
 }
 
@@ -248,7 +297,7 @@ func ( client *Client ) openingKey( ctx context.Context , collection string , en
 	if _ , err = client.resolveNext( ctx , tree , collection ); err != nil { return }
 	switch {
 	case entry.Lock != "":
-		if _ , err = client.resolve( ctx , tree , collection , false ); err != nil { return }
+		if _ , err = client.resolve( ctx , tree , collection , mintNever ); err != nil { return }
 	case entry.NextLock == "":
 		return nil , fmt.Errorf( "%w: collection %s has no keys yet" , ErrCorrupt , collection )
 	}
@@ -258,7 +307,7 @@ func ( client *Client ) openingKey( ctx context.Context , collection string , en
 
 // holder is what wraps a collection under parent: the master key at the top
 // level, otherwise parent's keys.
-func ( client *Client ) holder( ctx context.Context , tree map[ string ]Collection , parent string , create bool ) ( holder lockHolder , err error ) {
+func ( client *Client ) holder( ctx context.Context , tree map[ string ]Collection , parent string , mode mint ) ( holder lockHolder , err error ) {
 	if parent == "" {
 		if client.key == nil {
 			err = errOutOfScope
@@ -274,7 +323,7 @@ func ( client *Client ) holder( ctx context.Context , tree map[ string ]Collecti
 	if tree == nil {
 		if tree , err = client.tree( ctx ); err != nil { return }
 	}
-	key , err := client.resolve( ctx , tree , parent , create )
+	key , err := client.resolve( ctx , tree , parent , mode )
 	if err != nil { return }
 	holder = key
 	return
@@ -282,8 +331,9 @@ func ( client *Client ) holder( ctx context.Context , tree map[ string ]Collecti
 
 // createTopLevel makes the top-level collection id with fresh keys, named
 // after the id, or "id (2)" and so on when that name is taken.
-func ( client *Client ) createTopLevel( ctx context.Context , id string ) ( key *CollectionKey , err error ) {
-	if key , err = generateCollectionKey( id ); err != nil { return }
+func ( client *Client ) createTopLevel( ctx context.Context , id string , mode mint ) ( key *CollectionKey , err error ) {
+	if key , err = generateCollectionKey( id , client.freshEpochFor( id ) ); err != nil { return }
+	key.owned = true
 	lock , err := sealLock( key , client.key , client.ownTag( key ) )
 	if err != nil { return }
 	name := id
@@ -301,12 +351,15 @@ func ( client *Client ) createTopLevel( ctx context.Context , id string ) ( key 
 		tree , tree_err := client.tree( ctx )
 		if tree_err != nil { return nil , tree_err }
 		if _ , found := tree[ id ]; found {
-			key , err = client.resolve( ctx , tree , id , true )
+			key , err = client.resolve( ctx , tree , id , mode )
 		}
 		return
 	}
 	if err == nil {
-		client.remember( key , true )
+		err = client.noteEpoch( id , false , key.epoch )
+	}
+	if err == nil {
+		client.remember( key )
 	}
 	return
 }
@@ -318,25 +371,63 @@ func ( client *Client ) createTopLevel( ctx context.Context , id string ) ( key 
 // envelopes. Pair the answer with a scoped API key from
 // the Account screen in NewAccessToken; the browser's Share dialog does all
 // of it in one step.
+//
+// A collection in the subtree whose keys are not the master key's own (made
+// through an access token, or under one), or that has no keys yet, may be
+// there only because the server says so. If it holds private envelopes,
+// PrepareShare refuses (ErrSharedCollection, naming it) before it changes
+// anything, rather than seal them for the sharee.
 func ( client *Client ) PrepareShare( ctx context.Context , collection string , write bool ) ( key *CollectionKey , err error ) {
 	tree , err := client.tree( ctx )
 	if err != nil { return }
 	if _ , found := tree[ collection ]; found == false { return nil , errOutOfScope }
-	children := map[ string ][]string{}
-	for _ , entry := range tree {
-		children[ entry.Parent ] = append( children[ entry.Parent ] , entry.ID )
+	order := subtreeOf( tree , collection )
+	for _ , id := range order {
+		owned := false
+		if tree[ id ].Lock != "" {
+			folder_key , key_err := client.resolve( ctx , tree , id , mintNever )
+			if key_err != nil { return nil , key_err }
+			owned = folder_key.owned
+		}
+		if owned { continue }
+		private , private_err := client.hasPrivate( ctx , id )
+		if private_err != nil { return nil , private_err }
+		if private {
+			return nil , fmt.Errorf( "%w: %s is inside %s but its keys are not this master key's (or it has none yet), and it holds private envelopes; move it out first" , ErrSharedCollection , id , collection )
+		}
 	}
-	queue := []string{ collection }
-	for len( queue ) > 0 {
-		id := queue[ 0 ]
-		queue = append( queue[ 1: ] , children[ id ]... )
-		folder_key , key_err := client.resolve( ctx , tree , id , true )
+	for _ , id := range order {
+		folder_key , key_err := client.resolve( ctx , tree , id , mintShared )
 		if key_err != nil { return nil , key_err }
 		if err = client.sealForSharing( ctx , folder_key ); err != nil { return }
 	}
 	key = client.cached( collection )
 	if write == false {
 		key = key.ReadOnly()
+	}
+	return
+}
+
+// hasPrivate is whether collection holds a private envelope.
+func ( client *Client ) hasPrivate( ctx context.Context , collection string ) ( found bool , err error ) {
+	offset := 0
+	for offset >= 0 {
+		var reply struct {
+			Docs []struct {
+				Meta
+				Body string `json:"body"`
+			} `json:"docs"`
+			Next *int `json:"next"`
+		}
+		path := "/api/collections/" + url.PathEscape( collection ) + "/docs?include_body=true&" + pageQuery( offset , 200 )
+		if err = client.call( ctx , http.MethodGet , path , nil , &reply ); err != nil { return }
+		for _ , row := range reply.Docs {
+			envelope , decode_err := b64.DecodeString( row.Body )
+			if decode_err != nil || row.Collection != collection { return false , ErrCorrupt }
+			if EnvelopeKind( envelope ) == EnvelopeMaster { return true , nil }
+		}
+		offset = -1
+		if reply.Next != nil { offset = *reply.Next }
 	}
 	return
 }

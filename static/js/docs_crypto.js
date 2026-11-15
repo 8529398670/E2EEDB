@@ -204,9 +204,48 @@ const DocsCrypto = {
     return key;
   },
 
-  generateCollectionKey( collection ) {
+  // Fresh keys for collection. epoch is the lockbox epoch they will carry
+  // (freshEpoch, or one more than the keys they replace).
+  generateCollectionKey( collection , epoch ) {
     const seed = this.sodium.randombytes_buf( 32 );
-    return this.collectionKey( collection , this.sodium.randombytes_buf( 32 ) , this.sodium.crypto_sign_seed_keypair( seed ).publicKey , seed );
+    const key = this.collectionKey( collection , this.sodium.randombytes_buf( 32 ) , this.sodium.crypto_sign_seed_keypair( seed ).publicKey , seed );
+    key.epoch = epoch || this.freshEpoch( 0 );
+    return key;
+  },
+
+  // A lockbox's epoch (README.md, "Lockboxes"): new keys start at the time
+  // they were made, in seconds, and each rotation adds one, so a client that
+  // remembers the highest it has seen can refuse an older lockbox the server
+  // serves again. above is the highest this client has seen for the id.
+  MAX_EPOCH: Number.MAX_SAFE_INTEGER ,
+  freshEpoch( above ) {
+    return Math.max( Math.floor( Date.now() / 1000 ) , ( above || 0 ) + 1 );
+  },
+
+  validEpoch( epoch ) {
+    return Number.isSafeInteger( epoch ) && epoch >= 1 && epoch <= this.MAX_EPOCH;
+  },
+
+  // An epoch as the 8 big-endian bytes lockSigned covers.
+  epochBytes( epoch ) {
+    const bytes = new Uint8Array( 8 );
+    let rest = epoch;
+    for ( let at = 7; at >= 0; at-- ) {
+      bytes[ at ] = rest % 256;
+      rest = Math.floor( rest / 256 );
+    }
+    return bytes;
+  },
+
+  // The epoch a lockbox says it has, unchecked: 0 when it has none. Only for
+  // telling whether a lockbox is there; openLock checks it.
+  lockEpoch( text ) {
+    try {
+      const epoch = ( JSON.parse( text ) || {} ).epoch;
+      return this.validEpoch( epoch ) ? epoch : 0;
+    } catch ( error ) {
+      return 0;
+    }
   },
 
   canWrite( key ) {
@@ -279,9 +318,9 @@ const DocsCrypto = {
 
   // What a lockbox's sig covers:
   // "e2eedb/lock/sign" || 0 || c || 0 || parent || 0 || key_id || nonce_r || read || nonce_w || write
-  lockSigned( collection , parent , key_id , nonce_r , read , nonce_w , write ) {
+  lockSigned( collection , parent , key_id , epoch , nonce_r , read , nonce_w , write ) {
     const zero = new Uint8Array( [ 0 ] );
-    return this.join( this.utf8( "e2eedb/lock/sign" ) , zero , this.utf8( collection ) , zero , this.utf8( parent ) , zero , key_id , nonce_r , read , nonce_w , write );
+    return this.join( this.utf8( "e2eedb/lock/sign" ) , zero , this.utf8( collection ) , zero , this.utf8( parent ) , zero , key_id , this.epochBytes( epoch ) , nonce_r , read , nonce_w , write );
   },
 
   lockAssociated( label , collection , parent ) {
@@ -327,15 +366,16 @@ const DocsCrypto = {
     const sodium = this.sodium;
     const wrap_write = this.holderWrap( holder , true );
     if ( !key.seed || !wrap_write ) throw this.fail( "read_only" );
+    if ( !this.validEpoch( key.epoch ) ) throw this.fail( "corrupt" );
     const parent = this.holderParent( holder );
     nonce_r = nonce_r || sodium.randombytes_buf( this.NONCE_BYTES );
     nonce_w = nonce_w || sodium.randombytes_buf( this.NONCE_BYTES );
     const read = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( this.join( key.read , key.verify ) , this.lockAssociated( "e2eedb/lock/read" , key.collection , parent ) , null , nonce_r , this.holderWrap( holder , false ) );
     const write = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt( key.seed , this.lockAssociated( "e2eedb/lock/write" , key.collection , parent ) , null , nonce_w , wrap_write );
     const box = {
-      parent: parent , by: this.b64( holder.id ) , key_id: this.b64( key.id ) ,
+      parent: parent , by: this.b64( holder.id ) , key_id: this.b64( key.id ) , epoch: key.epoch ,
       nonce_r: this.b64( nonce_r ) , read: this.b64( read ) , nonce_w: this.b64( nonce_w ) , write: this.b64( write ) ,
-      sig: this.b64( sodium.crypto_sign_detached( this.lockSigned( key.collection , parent , key.id , nonce_r , read , nonce_w , write ) , this.holderSigner( holder ).sign ) ) ,
+      sig: this.b64( sodium.crypto_sign_detached( this.lockSigned( key.collection , parent , key.id , key.epoch , nonce_r , read , nonce_w , write ) , this.holderSigner( holder ).sign ) ) ,
     };
     if ( own ) box.own = own;
     return JSON.stringify( box );
@@ -356,10 +396,11 @@ const DocsCrypto = {
     const parent = this.holderParent( holder );
     if ( !box || box.parent !== parent ) throw this.fail( "corrupt" );
     if ( box.by !== this.b64( holder.id ) ) throw this.fail( "wrong_key" );
+    if ( !this.validEpoch( box.epoch ) ) throw this.fail( "corrupt" );
     let opened , seed = null;
     let valid = false;
     try {
-      const signed = this.lockSigned( collection , parent , this.unb64( box.key_id ) , this.unb64( box.nonce_r ) , this.unb64( box.read ) , this.unb64( box.nonce_w ) , this.unb64( box.write ) );
+      const signed = this.lockSigned( collection , parent , this.unb64( box.key_id ) , box.epoch , this.unb64( box.nonce_r ) , this.unb64( box.read ) , this.unb64( box.nonce_w ) , this.unb64( box.write ) );
       valid = sodium.crypto_sign_verify_detached( this.unb64( box.sig ) , signed , this.holderSigner( holder ).verify );
     } catch ( error ) {
       valid = false;
@@ -377,6 +418,7 @@ const DocsCrypto = {
     if ( opened.length !== 64 ) throw this.fail( "corrupt" );
     const key = this.collectionKey( collection , opened.subarray( 0 , 32 ) , opened.subarray( 32 ) , seed );
     if ( this.b64( key.id ) !== box.key_id ) throw this.fail( "corrupt" );
+    key.epoch = box.epoch;
     return key;
   },
 

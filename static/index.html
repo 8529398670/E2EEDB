@@ -203,7 +203,12 @@
                     </form>
                   </div>
                 </div>
-                <button id="docs-generate-button" type="button" class="btn btn-outline-secondary" data-i18n="docs.generate_button"></button>
+                <div class="d-flex flex-wrap gap-2">
+                  <button id="docs-generate-button" type="button" class="btn btn-outline-secondary" data-i18n="docs.generate_button"></button>
+                  <!-- Drops the lockbox epochs this browser remembers
+                       (Docs.forgetDevice). -->
+                  <button id="docs-forget-device" type="button" class="btn btn-outline-secondary" data-i18n="docs.forget_device_button"></button>
+                </div>
                 <div id="docs-new-key-box" class="alert alert-warning mt-3 mb-0" hidden>
                   <p class="mb-2" data-i18n="docs.new_key_notice"></p>
                   <div class="link-box mb-2">

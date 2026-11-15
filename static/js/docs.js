@@ -25,6 +25,18 @@ const Docs = {
   folderNextKeys: new Map(),
   // Opened with an access token: { key , api_key }; null when signed in.
   scope: null,
+  // Who this screen is: me.id when signed in. Names this device's epoch
+  // memory (epochs) for the account.
+  me: null,
+  // The highest lockbox epochs this device has seen, by collection:
+  // { lock , next }. Kept in IndexedDB (epochStore) so a reload remembers;
+  // see checkLockEpoch.
+  epochs: new Map(),
+  epochsFor: null,
+  epochsLoading: null,
+  // Folders this tab was told it may write into although their keys are
+  // not the master key's (askShared): collection + "\n" + key id.
+  sharedAllowed: new Set(),
   // The account's keyring reply (GET /api/keyring), or null when none is set.
   keyring: null,
   collection: null,
@@ -44,6 +56,7 @@ const Docs = {
   editorHost: null,
 
   async init( me ) {
+    this.me = me || null;
     Dom.show( Dom.get( "docs-panel" ) , true );
     // An access token's own collection: its keys are the token's.
     if ( this.scope ) this.folderKeys.set( this.scope.key.collection , this.scope.key );
@@ -55,6 +68,7 @@ const Docs = {
     Dom.onSubmit( Dom.get( "docs-passphrase-form" ) , this.onSetPassphrase.bind( this ) );
     Dom.onSubmit( Dom.get( "docs-editor-form" ) , this.onSave.bind( this ) );
     Dom.onPress( Dom.get( "docs-generate-button" ) , this.onGenerate.bind( this ) );
+    Dom.onPress( Dom.get( "docs-forget-device" ) , this.onForgetDevice.bind( this ) );
     Dom.onPress( Dom.get( "docs-new-key-use" ) , this.onUseNewKey.bind( this ) );
     Dom.get( "docs-new-key-copy" ).addEventListener( "click" , () => Dom.copy( Dom.get( "docs-new-key-value" ) ) );
     Dom.get( "docs-lock-button" ).addEventListener( "click" , () => this.lock() );
@@ -99,9 +113,16 @@ const Docs = {
   // does not exist yet is made at the top level (master key only).
   // depth counts the folders walked up so far: a dishonest server's parent
   // cycle (A in B in A) would otherwise walk forever.
+  //
+  // create "share" also gives keys to a folder under a parent without
+  // asking (prepareShare: sharing the parent is the point). Otherwise, with
+  // the master key, a folder that sits under a parent and has no keys yet
+  // gets them only once the person says so: where it sits is only the
+  // server's word, and the new keys open for everyone the parent's open for.
   async keyFor( collection , create , depth = 0 ) {
     if ( this.folderKeys.has( collection ) ) return this.folderKeys.get( collection );
     if ( depth > 64 ) throw DocsCrypto.fail( "corrupt" );
+    await this.loadEpochs();
     let folder = DocsTree.get( collection );
     if ( !folder ) {
       await DocsTree.refresh();
@@ -114,17 +135,26 @@ const Docs = {
     // Given its first keys by a rotation still under way: those are its
     // new keys (nextKeyFor), and it has no others.
     if ( !folder.lock && folder.next_lock ) throw DocsCrypto.fail( "rotating" );
+    if ( !folder.lock && create && create !== "share" && this.key && folder.parent !== "" ) {
+      const parent = DocsTree.get( folder.parent );
+      const question = this.say( "docs.keys_under_parent_question" , { name: folder.name , parent: parent ? parent.name : folder.parent } );
+      if ( !( await Dom.confirm( question ) ) ) throw DocsCrypto.fail( "cancelled" );
+    }
     const holder = await this.holderFor( folder.parent , create , depth + 1 );
     let key;
     if ( folder.lock ) {
       key = DocsCrypto.openLock( folder.lock , collection , holder );
+      key.owned = this.ownedUnder( holder , folder.lock , collection );
+      await this.checkLockEpoch( folder , key , depth );
     } else {
       if ( !create ) throw DocsCrypto.fail( "corrupt" );
-      key = DocsCrypto.generateCollectionKey( collection );
+      key = DocsCrypto.generateCollectionKey( collection , this.freshEpoch( collection ) );
       // Tagged as the owner's only at the top level, as the Go client does:
       // under a parent, a folder with no lockbox could be anyone's who holds
-      // the parent's keys.
+      // the parent's keys. Asked about above, so writing there asks no more.
       const own = folder.parent === "" ? this.ownTag( key ) : "";
+      key.owned = own !== "";
+      if ( !key.owned ) this.sharedAllowed.add( collection + "\n" + DocsCrypto.b64( key.id ) );
       try {
         const done = await Api.updateCollection( collection , { lock: DocsCrypto.sealLock( key , holder , null , null , own ) } );
         folder.lock = done.lock;
@@ -132,11 +162,164 @@ const Docs = {
         if ( !( error.payload && error.payload.error === "lock_exists" ) ) throw error;
         // Someone else gave it keys first: use theirs.
         await DocsTree.refresh();
-        key = DocsCrypto.openLock( DocsTree.get( collection ).lock , collection , holder );
+        const now = DocsTree.get( collection );
+        key = DocsCrypto.openLock( now.lock , collection , holder );
+        key.owned = this.ownedUnder( holder , now.lock , collection );
+        await this.checkLockEpoch( now , key , depth );
       }
+      await this.noteEpoch( collection , "lock" , key.epoch );
     }
     this.folderKeys.set( collection , key );
     return key;
+  },
+
+  // Whether keys opened from lock (collection's) are the account's own: the
+  // lockbox carries the master key's owner tag, and so does every lockbox
+  // above it (holder is the master key, or keys that are owned). False
+  // without the master key.
+  ownedUnder( holder , lock , collection ) {
+    if ( !this.key || !DocsCrypto.owns( this.key , lock , collection ) ) return false;
+    return holder === this.key || holder.owned === true;
+  },
+
+  // ---- lockbox epochs (README.md, "Rotating keys") -------------------------
+  //
+  // Every lockbox carries a signed epoch, and a rotation's new lockbox one
+  // more than the old. This device remembers the highest it has seen for
+  // each collection, as a lock and as a next_lock, and refuses anything
+  // below that, so a server cannot serve a lockbox from before a rotation
+  // again once this device has seen the rotation. A device that never saw it
+  // (new, or its storage cleared) cannot tell.
+
+  epochAccount() {
+    if ( this.scope ) return "token:" + DocsCrypto.b64( this.scope.key.id );
+    return this.me && this.me.id !== undefined ? "user:" + this.me.id : null;
+  },
+
+  epochKey( collection ) {
+    return this.epochAccount() + "\n" + collection;
+  },
+
+  // The epoch store: one IndexedDB object store, or null where there is
+  // none (memory only then).
+  async epochStore() {
+    if ( this.epochDb !== undefined ) return this.epochDb;
+    this.epochDb = await new Promise( ( resolve ) => {
+      try {
+        const request = indexedDB.open( "e2eedb-epochs" , 1 );
+        request.onupgradeneeded = () => request.result.createObjectStore( "epochs" );
+        request.onsuccess = () => resolve( request.result );
+        request.onerror = () => resolve( null );
+        request.onblocked = () => resolve( null );
+      } catch ( error ) {
+        resolve( null );
+      }
+    } );
+    return this.epochDb;
+  },
+
+  // Reads what this device remembers for the account, once per account.
+  async loadEpochs() {
+    const account = this.epochAccount();
+    if ( account === null || this.epochsFor === account ) return;
+    if ( this.epochsLoading && this.epochsLoading.account === account ) return this.epochsLoading.done;
+    const done = ( async () => {
+      const found = new Map();
+      const db = await this.epochStore();
+      if ( db ) {
+        await new Promise( ( resolve ) => {
+          try {
+            const range = IDBKeyRange.bound( account + "\n" , account + "\n\uffff" );
+            const request = db.transaction( "epochs" , "readonly" ).objectStore( "epochs" ).openCursor( range );
+            request.onsuccess = () => {
+              const cursor = request.result;
+              if ( !cursor ) return resolve();
+              found.set( String( cursor.key ).slice( account.length + 1 ) , cursor.value );
+              cursor.continue();
+            };
+            request.onerror = () => resolve();
+          } catch ( error ) {
+            resolve();
+          }
+        } );
+      }
+      // Anything seen while loading stays.
+      for ( const [ collection , seen ] of this.epochs ) {
+        const had = found.get( collection ) || { lock: 0 , next: 0 };
+        found.set( collection , { lock: Math.max( had.lock || 0 , seen.lock || 0 ) , next: Math.max( had.next || 0 , seen.next || 0 ) } );
+      }
+      this.epochs = found;
+      this.epochsFor = account;
+    } )();
+    this.epochsLoading = { account: account , done: done };
+    return done;
+  },
+
+  epochOf( collection ) {
+    const seen = this.epochs.get( collection ) || {};
+    return { lock: seen.lock || 0 , next: seen.next || 0 };
+  },
+
+  // Remembers that collection had a lockbox (kind "lock" or "next") at epoch.
+  async noteEpoch( collection , kind , epoch ) {
+    const seen = this.epochOf( collection );
+    if ( seen[ kind ] >= epoch ) return;
+    seen[ kind ] = epoch;
+    this.epochs.set( collection , seen );
+    if ( this.epochAccount() === null ) return;
+    const db = await this.epochStore();
+    if ( !db ) return;
+    await new Promise( ( resolve ) => {
+      try {
+        const done = db.transaction( "epochs" , "readwrite" );
+        done.objectStore( "epochs" ).put( seen , this.epochKey( collection ) );
+        done.oncomplete = () => resolve();
+        done.onerror = () => resolve();
+        done.onabort = () => resolve();
+      } catch ( error ) {
+        resolve();
+      }
+    } );
+  },
+
+  // An epoch for keys made now for collection: above any it has had here.
+  freshEpoch( collection ) {
+    const seen = this.epochOf( collection );
+    return DocsCrypto.freshEpoch( Math.max( seen.lock , seen.next ) );
+  },
+
+  // Refuses keys opened from folder's lock when this device has seen newer:
+  // a lock below the highest lock it saw, or below the highest next_lock it
+  // saw unless that rotation is still shown as under way (a next_lock one
+  // epoch on, which opens). Then remembers it.
+  async checkLockEpoch( folder , key , depth ) {
+    const seen = this.epochOf( folder.id );
+    if ( key.epoch < seen.lock ) throw DocsCrypto.fail( "rolled_back" );
+    if ( key.epoch < seen.next ) {
+      const next = folder.next_lock ? await this.nextKeyFor( folder.id , depth ) : null;
+      if ( !next || next.epoch !== key.epoch + 1 ) throw DocsCrypto.fail( "rolled_back" );
+    }
+    await this.noteEpoch( folder.id , "lock" , key.epoch );
+  },
+
+  // Forget this device: drops every epoch this device remembers, for every
+  // account.
+  async forgetDevice() {
+    this.epochs = new Map();
+    this.epochsFor = null;
+    this.epochsLoading = null;
+    const db = await this.epochStore();
+    if ( !db ) return;
+    await new Promise( ( resolve ) => {
+      try {
+        const done = db.transaction( "epochs" , "readwrite" );
+        done.objectStore( "epochs" ).clear();
+        done.oncomplete = () => resolve();
+        done.onerror = () => resolve();
+      } catch ( error ) {
+        resolve();
+      }
+    } );
   },
 
   // collection's new keys while its keys are being rotated, from its
@@ -148,8 +331,14 @@ const Docs = {
     const folder = DocsTree.get( collection );
     if ( !folder || !folder.next_lock ) return null;
     const parent = folder.parent === "" ? null : DocsTree.get( folder.parent );
+    await this.loadEpochs();
     const holder = parent && parent.next_lock ? await this.nextKeyFor( parent.id , depth + 1 ) : await this.holderFor( folder.parent , false , depth + 1 );
     const key = DocsCrypto.openLock( folder.next_lock , collection , holder );
+    key.owned = this.ownedUnder( holder , folder.next_lock , collection );
+    // A next_lock below one already seen is an older rotation's.
+    const seen = this.epochOf( collection );
+    if ( key.epoch < seen.next || key.epoch < seen.lock ) throw DocsCrypto.fail( "rolled_back" );
+    await this.noteEpoch( collection , "next" , key.epoch );
     this.folderNextKeys.set( collection , key );
     return key;
   },
@@ -202,9 +391,14 @@ const Docs = {
   // there is no key to make one with: it gets keys when first written to.
   async newLock( id , parent ) {
     if ( !this.hasKey() ) return null;
+    await this.loadEpochs();
     const holder = await this.holderFor( parent , true );
-    const key = DocsCrypto.generateCollectionKey( id );
-    return { key: key , lock: DocsCrypto.sealLock( key , holder , null , null , this.ownTag( key ) ) };
+    const key = DocsCrypto.generateCollectionKey( id , this.freshEpoch( id ) );
+    // The owner tag only under keys that are the account's own: a folder
+    // made inside one an access key made stays the sharee's side.
+    key.owned = !!this.key && ( holder === this.key || holder.owned === true );
+    await this.noteEpoch( id , "lock" , key.epoch );
+    return { key: key , lock: DocsCrypto.sealLock( key , holder , null , null , key.owned ? this.ownTag( key ) : "" ) };
   },
 
   // The owner tag for keys this screen made, "" without the master key.
@@ -213,19 +407,30 @@ const Docs = {
   },
 
   // Whether folder's keys were made through an access token rather than with
-  // the master key: its lockbox has no owner tag. Only the master key can
-  // tell; false without it, and for a folder with no keys yet.
+  // the master key: its lockbox, or one above it, has no owner tag. Only the
+  // master key can tell; false without it, and for a folder with no keys
+  // yet.
   madeByShare( folder ) {
-    if ( !this.key || !folder.lock ) return false;
+    if ( !this.key || !( folder.lock || folder.next_lock ) ) return false;
     if ( !this.ownedLocks ) this.ownedLocks = new Map();
-    const at = folder.id + "\n" + folder.lock;
-    if ( !this.ownedLocks.has( at ) ) this.ownedLocks.set( at , DocsCrypto.owns( this.key , folder.lock , folder.id ) );
-    return !this.ownedLocks.get( at );
+    const owns = ( at ) => {
+      const lock = at.lock || at.next_lock || "";
+      const cached = at.id + "\n" + lock;
+      if ( !this.ownedLocks.has( cached ) ) this.ownedLocks.set( cached , lock !== "" && DocsCrypto.owns( this.key , lock , at.id ) );
+      return this.ownedLocks.get( cached );
+    };
+    for ( let at = folder , steps = 0; at; at = at.parent === "" ? null : DocsTree.get( at.parent ) , steps++ ) {
+      if ( steps > 64 || !owns( at ) ) return true;
+    }
+    return false;
   },
 
   // A top-level collection with keys, named after its id (or "id (2)"...).
   async createTopLevel( id ) {
-    const key = DocsCrypto.generateCollectionKey( id );
+    await this.loadEpochs();
+    const key = DocsCrypto.generateCollectionKey( id , this.freshEpoch( id ) );
+    key.owned = true;
+    await this.noteEpoch( id , "lock" , key.epoch );
     const lock = DocsCrypto.sealLock( key , this.key , null , null , this.ownTag( key ) );
     for ( let n = 1; ; n++ ) {
       try {
@@ -263,9 +468,24 @@ const Docs = {
 
   // JSON text in, a collection envelope sealed and signed for collection/id
   // out: with its new keys while they are being rotated.
+  //
+  // With the master key, a folder whose keys are not the account's own
+  // (made through an access key, or under one) is written to only once the
+  // person says so, as the Go client needs AllowShared: whoever made those
+  // keys reads what is written with them.
   async sealBody( collection , id , text ) {
     const key = ( await this.nextKeyFor( collection ) ) || ( await this.keyFor( collection , true ) );
+    await this.askShared( collection , key );
     return DocsCrypto.sealCollection( key , id , text );
+  },
+
+  async askShared( collection , key ) {
+    if ( !this.key || key.owned ) return;
+    const allowed = collection + "\n" + DocsCrypto.b64( key.id );
+    if ( this.sharedAllowed.has( allowed ) ) return;
+    const folder = DocsTree.get( collection );
+    if ( !( await Dom.confirm( this.say( "docs.write_shared_question" , { name: folder ? folder.name : collection } ) ) ) ) throw DocsCrypto.fail( "cancelled" );
+    this.sharedAllowed.add( allowed );
   },
 
   // Runs send( sealed ) with text sealed for collection/id, and once more
@@ -436,6 +656,7 @@ const Docs = {
     this.key = key;
     this.forgetKeys();
     this.ownedLocks = null;
+    this.sharedAllowed.clear();
     this.renderLock();
     // The tree can now mark folders made through an access key.
     DocsTree.render();
@@ -494,6 +715,12 @@ const Docs = {
     }
   },
 
+  async onForgetDevice() {
+    if ( !( await Dom.confirm( I18n.get( "docs.forget_device_question" ) ) ) ) return;
+    await this.forgetDevice();
+    Dom.toast( I18n.get( "docs.forget_device_done" ) , "ok" );
+  },
+
   async onGenerate() {
     try {
       await DocsCrypto.load();
@@ -521,6 +748,7 @@ const Docs = {
     this.key = null;
     this.forgetKeys();
     this.ownedLocks = null;
+    this.sharedAllowed.clear();
     this.hideShared();
     this.closeEditor();
     this.renderLock();
@@ -1158,9 +1386,19 @@ const Docs = {
   // Gives id, and every collection under it, keys, and seals any private
   // envelope (which only the master key opens) again as a collection
   // envelope. Answers id's keys.
+  //
+  // A folder in it whose keys are not the account's own, or that has none
+  // yet, could be one the server only says is in there: its private
+  // envelopes are not sealed for the sharee, and sharing stops, naming it.
   async prepareShare( id ) {
-    for ( const at of DocsTree.subtree( id ) ) {
-      const key = await this.keyFor( at , true );
+    const order = DocsTree.subtree( id );
+    for ( const at of order ) {
+      const folder = DocsTree.get( at );
+      const owned = folder.lock ? ( await this.keyFor( at , false ) ).owned : false;
+      if ( !owned && ( await this.hasPrivate( at ) ) ) throw new Error( this.say( "docs.share_not_owned" , { name: folder.name } ) );
+    }
+    for ( const at of order ) {
+      const key = await this.keyFor( at , "share" );
       let offset = 0;
       while ( offset !== null && offset !== undefined ) {
         const page = await Api.docs( at , offset , 200 , true );
@@ -1178,6 +1416,17 @@ const Docs = {
       }
     }
     return this.keyFor( id , false );
+  },
+
+  // Whether collection holds a private envelope.
+  async hasPrivate( collection ) {
+    let offset = 0;
+    while ( offset !== null && offset !== undefined ) {
+      const page = await Api.docs( collection , offset , 200 , true );
+      if ( page.docs.some( ( row ) => DocsCrypto.envelopeKind( row.body ) === DocsCrypto.ENVELOPE_MASTER ) ) return true;
+      offset = page.next;
+    }
+    return false;
   },
 
   // ---- rotating a collection's keys -----------------------------------------
@@ -1235,25 +1484,35 @@ const Docs = {
         continue;
       }
       const holder = at === id ? await this.holderFor( folder.parent , false ) : news.get( folder.parent );
-      const key = DocsCrypto.generateCollectionKey( at );
+      // One epoch on from the keys they replace.
+      const old = olds.get( at );
+      if ( old && old.epoch >= DocsCrypto.MAX_EPOCH ) throw DocsCrypto.fail( "corrupt" );
+      const key = DocsCrypto.generateCollectionKey( at , old ? old.epoch + 1 : this.freshEpoch( at ) );
       // The owner tag stays as it was: keys a sharee made are not the
       // account's, rotated or not. A folder with no keys yet gets it only
       // at the top level, as when it is first given keys.
-      const owned = folder.lock ? DocsCrypto.owns( this.key , folder.lock , at ) : folder.parent === "";
+      const tagged = folder.lock ? DocsCrypto.owns( this.key , folder.lock , at ) : folder.parent === "";
+      key.owned = tagged && ( holder === this.key || holder.owned === true );
       news.set( at , key );
-      staged.push( [ at , DocsCrypto.sealLock( key , holder , null , null , owned ? this.ownTag( key ) : "" ) ] );
+      staged.push( [ at , DocsCrypto.sealLock( key , holder , null , null , tagged ? this.ownTag( key ) : "" ) ] );
     }
     let revoked = 0;
     for ( let start = 0; start < staged.length; start += 200 ) {
       const reply = await Api.rotateCollection( id , Object.fromEntries( staged.slice( start , start + 200 ) ) );
       revoked += ( reply.revoked || [] ).length;
     }
-    news.forEach( ( key , at ) => this.folderNextKeys.set( at , key ) );
+    // Staged: a lockbox from before this rotation, on its own, is old now.
+    for ( const [ at , key ] of news ) {
+      this.folderNextKeys.set( at , key );
+      await this.noteEpoch( at , "next" , key.epoch );
+    }
     let docs = 0;
     for ( let pass = 0; ; pass++ ) {
       for ( const at of order ) docs += await this.reseal( at , olds.get( at ) , news.get( at ) );
       try {
         const done = await Api.commitRotation( id );
+        // Done: from now on only the new lockboxes are good here.
+        for ( const [ at , key ] of news ) await this.noteEpoch( at , "lock" , key.epoch );
         this.forgetKeys();
         return { folders: done.collections.length , docs: docs , revoked: revoked };
       } catch ( error ) {

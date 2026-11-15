@@ -22,10 +22,12 @@ import (
 	hmac "crypto/hmac"
 	rand "crypto/rand"
 	base64 "encoding/base64"
+	binary "encoding/binary"
 	json "encoding/json"
 	errors "errors"
 	fmt "fmt"
 	strings "strings"
+	time "time"
 
 	chacha20poly1305 "golang.org/x/crypto/chacha20poly1305"
 )
@@ -67,7 +69,30 @@ type CollectionKey struct {
 	id         [keyIDSize]byte
 	verify     ed25519.PublicKey
 	sign       ed25519.PrivateKey // nil: read-only
+	// epoch is the lockbox epoch these keys carry (README.md,
+	// "Lockboxes"); 0 for keys from an access token, which name none.
+	epoch      uint64
+	// owned is whether these keys are the master key's own: their lockbox
+	// carries its owner tag, and so does every lockbox above it. Set when
+	// they are opened or made; always false for a scoped client.
+	owned      bool
 }
+
+// maxEpoch is the highest epoch a lockbox may carry: the largest integer a
+// browser's numbers hold exactly.
+const maxEpoch = 1 << 53 - 1
+
+// freshEpoch is the epoch for keys made now: the time in seconds, or one
+// more than above (the highest this client has seen for the collection)
+// when that is later. Each rotation then adds one, so a collection made
+// again under an old id starts above anything it had before.
+func freshEpoch( above uint64 ) uint64 {
+	return max( uint64( time.Now().Unix() ) , above + 1 )
+}
+
+// Epoch is the lockbox epoch of these keys: when they were made, plus one
+// for every rotation since. 0 for keys from an access token.
+func ( key *CollectionKey ) Epoch() uint64 { return key.epoch }
 
 func newCollectionKey( collection string , read []byte , verify []byte , seed []byte ) ( key *CollectionKey , err error ) {
 	if len( read ) != 32 || len( verify ) != ed25519.PublicKeySize || ( seed != nil && len( seed ) != ed25519.SeedSize ) {
@@ -87,14 +112,16 @@ func newCollectionKey( collection string , read []byte , verify []byte , seed []
 	return
 }
 
-// generateCollectionKey makes fresh keys for collection.
-func generateCollectionKey( collection string ) ( key *CollectionKey , err error ) {
+// generateCollectionKey makes fresh keys for collection, to carry epoch.
+func generateCollectionKey( collection string , epoch uint64 ) ( key *CollectionKey , err error ) {
 	read := make( []byte , 32 )
 	seed := make( []byte , ed25519.SeedSize )
 	if _ , err = rand.Read( read ); err != nil { return }
 	if _ , err = rand.Read( seed ); err != nil { return }
 	verify := ed25519.NewKeyFromSeed( seed ).Public().( ed25519.PublicKey )
-	key , err = newCollectionKey( collection , read , verify , seed )
+	if key , err = newCollectionKey( collection , read , verify , seed ); err == nil {
+		key.epoch = epoch
+	}
 	return
 }
 
@@ -224,6 +251,9 @@ type lockbox struct {
 	Parent string `json:"parent"`
 	By     string `json:"by"`
 	KeyID  string `json:"key_id"`
+	// Epoch says how new these keys are (freshEpoch; a rotation's are one
+	// more than the ones they replace). The sig covers it.
+	Epoch  uint64 `json:"epoch"`
 	NonceR string `json:"nonce_r"`
 	Read   string `json:"read"`
 	NonceW string `json:"nonce_w"`
@@ -272,14 +302,16 @@ func lockAD( label string , collection string , parent string ) []byte {
 }
 
 // lockSigned is what a lockbox's sig covers: where it belongs, which keys it
-// holds, and both wrapped halves.
+// holds and how new they are, and both wrapped halves.
 //
-//	"e2eedb/lock/sign" || 0 || c || 0 || parent || 0 || key_id (16) || nonce_r || read || nonce_w || write
-func lockSigned( collection string , parent string , key_id []byte , nonce_r []byte , read []byte , nonce_w []byte , write []byte ) []byte {
+//	"e2eedb/lock/sign" || 0 || c || 0 || parent || 0 || key_id (16) || epoch (8, big-endian) || nonce_r || read || nonce_w || write
+func lockSigned( collection string , parent string , key_id []byte , epoch uint64 , nonce_r []byte , read []byte , nonce_w []byte , write []byte ) []byte {
 	data := append( []byte( lockSignLabel ) , 0 )
 	data = append( append( data , collection... ) , 0 )
 	data = append( append( data , parent... ) , 0 )
-	for _ , part := range [][]byte{ key_id , nonce_r , read , nonce_w , write } {
+	data = append( data , key_id... )
+	data = binary.BigEndian.AppendUint64( data , epoch )
+	for _ , part := range [][]byte{ nonce_r , read , nonce_w , write } {
 		data = append( data , part... )
 	}
 	return data
@@ -302,6 +334,10 @@ func sealLockWith( key *CollectionKey , holder lockHolder , nonce_r []byte , non
 		err = ErrReadOnly
 		return
 	}
+	if key.epoch < 1 || key.epoch > maxEpoch {
+		err = fmt.Errorf( "%w: lockbox epoch %d" , ErrCorrupt , key.epoch )
+		return
+	}
 	parent := holder.lockParent()
 	read_aead , err := chacha20poly1305.NewX( holder.wrapRead() )
 	if err != nil { return }
@@ -310,10 +346,10 @@ func sealLockWith( key *CollectionKey , holder lockHolder , nonce_r []byte , non
 	read := read_aead.Seal( nil , nonce_r , append( append( []byte{} , key.read[ : ]... ) , key.verify... ) , lockAD( lockReadLabel , key.collection , parent ) )
 	write := write_aead.Seal( nil , nonce_w , key.sign.Seed() , lockAD( lockWriteLabel , key.collection , parent ) )
 	box := lockbox{
-		Parent: parent , By: holder.ID() , KeyID: key.ID() ,
+		Parent: parent , By: holder.ID() , KeyID: key.ID() , Epoch: key.epoch ,
 		NonceR: b64.EncodeToString( nonce_r ) , Read: b64.EncodeToString( read ) ,
 		NonceW: b64.EncodeToString( nonce_w ) , Write: b64.EncodeToString( write ) ,
-		Sig: b64.EncodeToString( ed25519.Sign( holder.lockSigner() , lockSigned( key.collection , parent , key.id[ : ] , nonce_r , read , nonce_w , write ) ) ) ,
+		Sig: b64.EncodeToString( ed25519.Sign( holder.lockSigner() , lockSigned( key.collection , parent , key.id[ : ] , key.epoch , nonce_r , read , nonce_w , write ) ) ) ,
 		Own: own ,
 	}
 	encoded , err := json.Marshal( box )
@@ -339,6 +375,10 @@ func openLock( text string , collection string , holder lockHolder ) ( key *Coll
 		err = ErrWrongKey
 		return
 	}
+	if box.Epoch < 1 || box.Epoch > maxEpoch {
+		err = fmt.Errorf( "%w: lockbox epoch" , ErrCorrupt )
+		return
+	}
 	nonce_r , nonce_r_err := b64.DecodeString( box.NonceR )
 	read , read_err := b64.DecodeString( box.Read )
 	if errors.Join( nonce_r_err , read_err ) != nil || len( nonce_r ) != nonceSize {
@@ -350,7 +390,7 @@ func openLock( text string , collection string , holder lockHolder ) ( key *Coll
 	write , write_err := b64.DecodeString( box.Write )
 	sig , sig_err := b64.DecodeString( box.Sig )
 	if errors.Join( id_err , nonce_w_err , write_err , sig_err ) != nil || len( sig ) != signatureLen ||
-		ed25519.Verify( holder.lockVerifier() , lockSigned( collection , parent , key_id , nonce_r , read , nonce_w , write ) , sig ) == false {
+		ed25519.Verify( holder.lockVerifier() , lockSigned( collection , parent , key_id , box.Epoch , nonce_r , read , nonce_w , write ) , sig ) == false {
 		err = fmt.Errorf( "%w: lockbox signature" , ErrCorrupt )
 		return
 	}
@@ -377,6 +417,9 @@ func openLock( text string , collection string , holder lockHolder ) ( key *Coll
 	key , err = newCollectionKey( collection , opened[ :32 ] , opened[ 32: ] , seed )
 	if err == nil && key.ID() != box.KeyID {
 		key , err = nil , ErrCorrupt
+	}
+	if err == nil {
+		key.epoch = box.Epoch
 	}
 	return
 }

@@ -13,11 +13,13 @@
   "verify_key": "F0VTtFbd38aQjsqxwQH+arIeK6oGF3lbfUOmNIKZP9U=",
   "read_key_id": "6PMw60+eIZVCFr5iE0pblQ==",
   "envelope_collection": "AujzMOtPniGVQha+YhNKW5UkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCSKuvBpsOc1qtxII5g593I3l/i+FhqXKSyWPEYjBN+I1VZAjjF6GTLSNkdLEsrAB/ZeITuVHtXsAZH58c29Qo+BbA01AeHsWA8tRyJbp/LnAM45J3uXUNJCkJB3+daP01NHQLMI9ekM",
-  "lockbox": "{\"parent\":\"\",\"by\":\"liUxYR0TBiYiNNYfDYre8A==\",\"key_id\":\"6PMw60+eIZVCFr5iE0pblQ==\",\"nonce_r\":\"JCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk\",\"read\":\"YxKaEosyyfC35BydJYTzPpAhgOakvDGX1GLuvVuWKorhEnx4qnt+tUwf2qouCbowSlR/lmjBl8WqZCO5DdfDgSQrQTgReC/OiCdsl4+y92E=\",\"nonce_w\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC\",\"write\":\"stL0rOdrZpFrkGcUVe+3R13VksBEldWq8U8ePmfnvUKMyxAnIGqsj67Ek/44T5MW\",\"sig\":\"mBQmCfD8ABEy2e18zOplY12YeEkt7wPbPa3W5+B0jRJKuF5pjmGNllVGPzKfzEjaO/FzLI9VQp/9A826hjfuCQ==\",\"own\":\"Ei0Kz0XB+ENPEOA0qgkhq/L50H7hrok299CoOUnbGW0=\"}",
+  "lockbox": "{\"parent\":\"\",\"by\":\"liUxYR0TBiYiNNYfDYre8A==\",\"key_id\":\"6PMw60+eIZVCFr5iE0pblQ==\",\"epoch\":1793000000,\"nonce_r\":\"JCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk\",\"read\":\"YxKaEosyyfC35BydJYTzPpAhgOakvDGX1GLuvVuWKorhEnx4qnt+tUwf2qouCbowSlR/lmjBl8WqZCO5DdfDgSQrQTgReC/OiCdsl4+y92E=\",\"nonce_w\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC\",\"write\":\"stL0rOdrZpFrkGcUVe+3R13VksBEldWq8U8ePmfnvUKMyxAnIGqsj67Ek/44T5MW\",\"sig\":\"wjzgbT7jRibOmVkmVJaj921p9TMXcRozpjSUBQ2fYvGwTw3CWTVNM2X8o5AERQW5BWl0CQptzfqC7IoHGhOpBw==\",\"own\":\"Ei0Kz0XB+ENPEOA0qgkhq/L50H7hrok299CoOUnbGW0=\"}",
   "child": "notes-2024",
   "child_read_key": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8=",
   "child_write_key": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8=",
-  "child_lockbox": "{\"parent\":\"notes\",\"by\":\"6PMw60+eIZVCFr5iE0pblQ==\",\"key_id\":\"4K/lHHV51LlEpRvllSxcbg==\",\"nonce_r\":\"JCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk\",\"read\":\"ukTVWpQSVG/QFc/hGoQxI5xRTAYRGPlyueQ2fr2fnkPk63nzjjS7vCq7qzJ9crhU8Zh91jjl3btiP4KM58/lrqkF0gQx7Itc4Ad5lknY/6I=\",\"nonce_w\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC\",\"write\":\"yg1QGeVOaYJDK4VdhN8T3/Qhsdw1Hywr2Js5PJ5wCtn9I3jhg5SJvYmlWCr+nXIK\",\"sig\":\"idGc3VJvGVPFtfqv2DggaIDJCJ6UwlmNWWjsbbyhR2nC7aUwZZClqpbQvQzG1sVzZvsiaSQ88Oyl0eSsQwbRAA==\",\"own\":\"gKHnU7B1FsiKUKBCOZghBAMiXXC6xpcyh5UUYUFwyt4=\"}",
+  "child_lockbox": "{\"parent\":\"notes\",\"by\":\"6PMw60+eIZVCFr5iE0pblQ==\",\"key_id\":\"4K/lHHV51LlEpRvllSxcbg==\",\"epoch\":4294967297,\"nonce_r\":\"JCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk\",\"read\":\"ukTVWpQSVG/QFc/hGoQxI5xRTAYRGPlyueQ2fr2fnkPk63nzjjS7vCq7qzJ9crhU8Zh91jjl3btiP4KM58/lrqkF0gQx7Itc4Ad5lknY/6I=\",\"nonce_w\":\"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJC\",\"write\":\"yg1QGeVOaYJDK4VdhN8T3/Qhsdw1Hywr2Js5PJ5wCtn9I3jhg5SJvYmlWCr+nXIK\",\"sig\":\"x0HcCFHFcXAImIzhpAnpEnfdnm3VhLiUDq+FjRALgL4hmxX9wyDARSRmvePB67MLJr4hr+y9nZPeEONgC9kGAA==\",\"own\":\"gKHnU7B1FsiKUKBCOZghBAMiXXC6xpcyh5UUYUFwyt4=\"}",
+  "epoch": 1793000000,
+  "child_epoch": 4294967297,
   "api_key": "kid.secret",
   "access_token_read_only": "e2eedb-ck.eyJrIjoia2lkLnNlY3JldCIsImMiOiJub3RlcyIsInIiOiJRRUZDUTBSRlJrZElTVXBMVEUxT1QxQlJVbE5VVlZaWFdGbGFXMXhkWGw4PSIsInYiOiJGMFZUdEZiZDM4YVFqc3F4d1FIK2FySWVLNm9HRjNsYmZVT21OSUtaUDlVPSJ9"
 }

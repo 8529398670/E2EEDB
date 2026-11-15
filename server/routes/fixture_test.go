@@ -40,7 +40,7 @@ type browser struct {
 	cookie  string
 }
 
-func newAuthFixture( t *testing.T ) ( fixture *authFixture ) {
+func newAuthFixture( t testing.TB ) ( fixture *authFixture ) {
 	t.Helper()
 	cfg := &config.Config{
 		ProjectName:      "Test",
@@ -66,7 +66,9 @@ func newAuthFixture( t *testing.T ) ( fixture *authFixture ) {
 	t.Cleanup( func() { docs.Close() } )
 	handlers.Docs = docs
 	app := fiber.New()
-	app.Use( checkReplies( t ) )
+	// A fuzz target builds one fixture for many runs, so only a plain test
+	// checks replies against the spec.
+	if plain , ok := t.( *testing.T ); ok { app.Use( checkReplies( plain ) ) }
 	handlers.Register( app )
 	fixture = &authFixture{ app: app , store: store , cfg: cfg , owner: owner , alice: alice , handlers: handlers }
 	return
@@ -126,7 +128,7 @@ func ( client *browser ) signedIn( t *testing.T ) ( result bool ) {
 
 // withKey calls a route the way a script does: an API key in the
 // Authorization header, no cookie and no csrf token.
-func ( fixture *authFixture ) withKey( t *testing.T , key string , method string , path string , body fiber.Map ) ( status int , reply map[ string ]any ) {
+func ( fixture *authFixture ) withKey( t testing.TB , key string , method string , path string , body fiber.Map ) ( status int , reply map[ string ]any ) {
 	t.Helper()
 	raw , _ := json.Marshal( body )
 	request , _ := http.NewRequest( method , path , strings.NewReader( string( raw ) ) )
